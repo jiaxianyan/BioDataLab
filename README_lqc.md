@@ -13,4 +13,4 @@
 自动化生成python代码和description的脚本，输入配置在tool_builder.yml中，运行时cd到此子文件夹直接运行./tool_generate即可
 
 ### 更新./tool_agent/tool_generate_wrap.py
-将tool生成自动化脚本封装为每个外部工具整体封装为一个tool函数，运行方式仍然是更改tool_builder.yml中的配置，直接在此子文件夹下运行python3 ./tool_generate，增加bash脚本生成：在dependencies.md中要求llm给出安装对应工具的bash脚本
+将tool生成自动化脚本封装为每个外部工具整体封装为一个tool函数，运行方式仍然是更改tool_builder.yml中的配置，直接在此子文件夹下运行python3 ./tool_generate_wrap，增加bash脚本生成：在dependencies.md中要求llm给出安装对应工具的bash脚本
