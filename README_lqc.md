@@ -21,3 +21,4 @@
 2. InterProScan 依赖java环境，可参考 https://www.jianshu.com/p/1e6da8a5ead3
 3. annovar wget链接不稳定，可能需要从官网手动下载安装包并解压
 4. 其余脚本直接运行，已确认无问题
+5. 解压完成后annovar, arts, bowtie2, fastqc, InterProScan, mash, sra_toolkit, Trimmomatic 需要在代码中更新默认地址参数（也可以在说明文档中标明让agent自己传入此参数）
