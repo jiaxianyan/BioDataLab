@@ -18,7 +18,7 @@ echo "[INFO] Extracting..."
 unzip -o "bowtie2-${VERSION}.zip" -d "${CUR_DIR}"
 
 # 添加执行权限
-chmod +x "${INSTALL_DIR}/bowtie2" "${INSTALL_DIR}/bowtie2-*"
+# chmod +x "${INSTALL_DIR}/bowtie2" "${INSTALL_DIR}/bowtie2-*"
 
 echo "[INFO] Installed to ${INSTALL_DIR}"
 echo "[SUCCESS] Example usage:"

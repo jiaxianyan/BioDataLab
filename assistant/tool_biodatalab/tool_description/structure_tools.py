@@ -2,12 +2,12 @@ description = [
     {
         "description": "Import FASTQ data via a QIIME 2 manifest, optionally join paired-end reads, "
                        "trim adapters, perform quality-score filtering, and generate demux summary.",
-        "name": "q2_ingest_and_qc",
+        "name": "q2_ingest_and_qc_api",
         "optional_parameters": [
             {"default": None, "description": "Sample metadata TSV for later visualizations/analyses", "name": "sample_metadata_tsv", "type": "str"},
             {"default": True, "description": "Whether reads are paired-end", "name": "paired_end", "type": "bool"},
             {"default": False, "description": "If paired_end, join pairs using VSEARCH", "name": "join_paired", "type": "bool"},
-            {"default": None, "description": "Extra cutadapt parameters string (e.g. '--p-front-f ACTG --p-front-r ACTG')", "name": "cutadapt_params", "type": "str"},
+            {"default": None, "description": "Extra cutadapt parameters dict (e.g. {'p_front_f': 'ACTG'})", "name": "cutadapt_params", "type": "dict"},
             {"default": False, "description": "Enable quality-filter q-score", "name": "qscore_filter", "type": "bool"},
             {"default": None, "description": "Forward truncation length hint (recorded in provenance)", "name": "trunc_len_f", "type": "int"},
             {"default": None, "description": "Reverse truncation length hint (recorded in provenance)", "name": "trunc_len_r", "type": "int"},
@@ -17,13 +17,12 @@ description = [
         "required_parameters": [
             {"default": None, "description": "Path to QIIME 2 manifest CSV (single or paired)", "name": "manifest_csv", "type": "str"},
             {"default": "./q2_ingest_and_qc_out", "description": "Directory to save outputs", "name": "output_dir", "type": "str"},
-            {"default": None, "description": "Absolute path to the 'qiime' executable", "name": "qiime_bin", "type": "str"},
         ],
     },
     {
         "description": "Denoise reads (Deblur or DADA2), generate feature table and representative sequences, "
                        "and optionally filter samples by minimal reads.",
-        "name": "q2_denoise_and_feature_table",
+        "name": "q2_denoise_and_feature_table_api",
         "optional_parameters": [
             {"default": "deblur", "description": "Denoising method: 'deblur' or 'dada2'", "name": "method", "type": "str"},
             {"default": 250, "description": "Trim length for Deblur (ignored for DADA2)", "name": "trim_length", "type": "int"},
@@ -36,62 +35,72 @@ description = [
         "required_parameters": [
             {"default": None, "description": "Path to demultiplexed sequences artifact (.qza)", "name": "demux_qza", "type": "str"},
             {"default": "./q2_denoise_out", "description": "Directory to save outputs", "name": "output_dir", "type": "str"},
-            {"default": None, "description": "Absolute path to the 'qiime' executable", "name": "qiime_bin", "type": "str"},
         ],
     },
     {
-        "description": "Assign taxonomy using a pretrained classifier or reference reads+taxonomy (sklearn or vsearch), "
-                       "then produce taxa barplot.",
-        "name": "q2_taxonomy",
+        "description": "Assign taxonomy using a pretrained classifier (preferred) or by training from reference, "
+                       "then generate taxa barplot visualization.",
+        "name": "q2_taxonomy_api",
         "optional_parameters": [
-            {"default": None, "description": "Sample metadata TSV for taxa barplot grouping", "name": "metadata_tsv", "type": "str"},
-            {"default": None, "description": "Pretrained classifier artifact (.qza)", "name": "pretrained_classifier_qza", "type": "str"},
-            {"default": None, "description": "Reference reads artifact (.qza) for training or vsearch", "name": "ref_seqs_qza", "type": "str"},
-            {"default": None, "description": "Reference taxonomy artifact (.qza) for training or vsearch", "name": "ref_taxonomy_qza", "type": "str"},
-            {"default": "sklearn", "description": "Classification method: 'sklearn' or 'vsearch'", "name": "method", "type": "str"},
-            {"default": 0.97, "description": "Identity threshold for vsearch consensus", "name": "perc_identity", "type": "float"},
+            {"default": None, "description": "Sample metadata TSV for taxa barplot", "name": "metadata_tsv", "type": "str"},
+            {"default": None, "description": "Path to pretrained classifier artifact (.qza)", "name": "pretrained_classifier_qza", "type": "str"},
+            {"default": None, "description": "Reference sequences artifact (.qza) if training classifier", "name": "ref_seqs_qza", "type": "str"},
+            {"default": None, "description": "Reference taxonomy artifact (.qza) if training classifier", "name": "ref_taxonomy_qza", "type": "str"},
+            {"default": "sklearn", "description": "Taxonomy assignment method: 'sklearn' or 'vsearch'", "name": "method", "type": "str"},
+            {"default": 0.97, "description": "Percent identity threshold for vsearch", "name": "perc_identity", "type": "float"},
             {"default": False, "description": "Re-run even if outputs exist", "name": "force", "type": "bool"},
         ],
         "required_parameters": [
             {"default": None, "description": "Feature table artifact (.qza)", "name": "table_qza", "type": "str"},
             {"default": None, "description": "Representative sequences artifact (.qza)", "name": "rep_seqs_qza", "type": "str"},
             {"default": "./q2_taxonomy_out", "description": "Directory to save outputs", "name": "output_dir", "type": "str"},
-            {"default": None, "description": "Absolute path to the 'qiime' executable", "name": "qiime_bin", "type": "str"},
         ],
     },
     {
-        "description": "Build multiple sequence alignment and phylogenetic tree, then run core-metrics-phylogenetic "
-                       "to compute alpha/beta diversity, PCoA, and Emperor visualizations.",
-        "name": "q2_phylogeny_and_core_diversity",
+        "description": "Build multiple sequence alignment, mask hypervariable regions, "
+                       "construct phylogenetic trees, and compute core diversity metrics (alpha, beta, PCoA, Emperor).",
+        "name": "q2_phylogeny_and_core_diversity_api",
         "optional_parameters": [
-            {"default": 1000, "description": "Rarefaction depth for core metrics", "name": "sampling_depth", "type": "int"},
-            {"default": True, "description": "Use midpoint root instead of explicit rooting", "name": "use_midpoint_root", "type": "bool"},
+            {"default": 1000, "description": "Sampling depth for diversity analysis", "name": "sampling_depth", "type": "int"},
+            {"default": True, "description": "Use midpoint rooting (if False, use default rooting)", "name": "use_midpoint_root", "type": "bool"},
             {"default": False, "description": "Re-run even if outputs exist", "name": "force", "type": "bool"},
         ],
         "required_parameters": [
             {"default": None, "description": "Feature table artifact (.qza)", "name": "table_qza", "type": "str"},
             {"default": None, "description": "Representative sequences artifact (.qza)", "name": "rep_seqs_qza", "type": "str"},
-            {"default": "./q2_diversity_out", "description": "Directory to save outputs", "name": "output_dir", "type": "str"},
-            {"default": None, "description": "Absolute path to the 'qiime' executable", "name": "qiime_bin", "type": "str"},
+            {"default": "./q2_phylogeny_out", "description": "Directory to save outputs", "name": "output_dir", "type": "str"},
         ],
     },
     {
-        "description": "Run common differential abundance placeholders (ANCOM/ALDEx2/Songbird notes) and export tables. "
-                       "Exports BIOM and taxonomy TSV; records guidance for dataset-specific steps.",
-        "name": "q2_stats_and_export",
+        "description": "Run common differential abundance analyses (ANCOM, ALDEx2, Songbird placeholders), "
+                       "and export feature table and taxonomy artifacts to BIOM and TSV.",
+        "name": "q2_stats_and_export_api",
         "optional_parameters": [
-            {"default": None, "description": "Sample metadata TSV (required for most differential tests)", "name": "metadata_tsv", "type": "str"},
-            {"default": ["ancom"], "description": "Requested methods: any of ['ancom','aldex2','songbird']", "name": "methods", "type": "list[str]"},
-            {"default": True, "description": "Export feature table as BIOM", "name": "export_biom", "type": "bool"},
-            {"default": True, "description": "Export taxonomy as TSV", "name": "export_tsv", "type": "bool"},
-            {"default": True, "description": "Record instructions to unpack .qzv visualizations", "name": "unpack_qzv", "type": "bool"},
+            {"default": None, "description": "Sample metadata TSV (required for ANCOM)", "name": "metadata_tsv", "type": "str"},
+            {"default": ("ancom",), "description": "Differential abundance methods to attempt", "name": "methods", "type": "tuple"},
+            {"default": True, "description": "Export feature table to BIOM format", "name": "export_biom", "type": "bool"},
+            {"default": True, "description": "Export taxonomy to TSV format", "name": "export_tsv", "type": "bool"},
+            {"default": True, "description": "Unpack .qzv visualizations", "name": "unpack_qzv", "type": "bool"},
             {"default": False, "description": "Re-run even if outputs exist", "name": "force", "type": "bool"},
         ],
         "required_parameters": [
             {"default": None, "description": "Feature table artifact (.qza)", "name": "table_qza", "type": "str"},
             {"default": None, "description": "Taxonomy artifact (.qza)", "name": "taxonomy_qza", "type": "str"},
-            {"default": "./q2_export_out", "description": "Directory to save outputs", "name": "output_dir", "type": "str"},
-            {"default": None, "description": "Absolute path to the 'qiime' executable", "name": "qiime_bin", "type": "str"},
+            {"default": "./q2_stats_export_out", "description": "Directory to save outputs", "name": "output_dir", "type": "str"},
+        ],
+    },
+    {
+        "description": "Run Cactus whole-genome multiple sequence alignment, "
+                       "generating hierarchical alignment (HAL) output.",
+        "name": "run_cactus",
+        "optional_parameters": [
+            {"default": "cactus", "description": "Cactus executable name (defaults to 'cactus' in conda env)", "name": "cactus_exe", "type": "str"},
+            {"default": None, "description": "Extra arguments to pass to Cactus (e.g., ['--maxCores', '8'])", "name": "extra_args", "type": "list[str]"},
+        ],
+        "required_parameters": [
+            {"default": None, "description": "Job store directory (Cactus intermediate files)", "name": "job_store", "type": "str"},
+            {"default": None, "description": "Seqfile describing genomes for alignment", "name": "seqfile", "type": "str"},
+            {"default": None, "description": "Output HAL file path", "name": "out_hal", "type": "str"},
         ],
     },
     
@@ -131,30 +140,18 @@ description = [
         ],
     },
     {
-        "description": "Run Exonerate to align query sequences to a target database with a specified model.",
+        "description": "Run Exonerate alignment between query and target FASTA sequences using a specified model, "
+                    "saving results to an output file.",
         "name": "run_exonerate",
         "optional_parameters": [
-            {"default": None, "description": "Extra Exonerate arguments", "name": "extra_args", "type": "list[str]"}
+            {"default": "exonerate", "description": "Exonerate executable name (defaults to 'exonerate' in conda env)", "name": "exonerate_exe", "type": "str"},
+            {"default": None, "description": "Extra arguments to pass to Exonerate (e.g., ['--showalignment', 'yes'])", "name": "extra_args", "type": "list[str]"},
         ],
         "required_parameters": [
-            {"default": None, "description": "Path to Exonerate executable", "name": "exonerate_path", "type": "str"},
-            {"default": None, "description": "Query FASTA file", "name": "query_fasta", "type": "str"},
-            {"default": None, "description": "Target FASTA file", "name": "target_fasta", "type": "str"},
-            {"default": "protein2genome", "description": "Exonerate model (e.g. protein2genome)", "name": "model", "type": "str"},
-            {"default": "exonerate_out.txt", "description": "Output alignment file", "name": "out_file", "type": "str"},
-        ],
-    },
-    {
-        "description": "Run Cactus for multiple genome alignment, producing a HAL alignment file.",
-        "name": "run_cactus",
-        "optional_parameters": [
-            {"default": None, "description": "Extra Cactus arguments", "name": "extra_args", "type": "list[str]"}
-        ],
-        "required_parameters": [
-            {"default": None, "description": "Path to Cactus executable", "name": "cactus_path", "type": "str"},
-            {"default": None, "description": "Job store identifier (e.g. ./jobStore)", "name": "job_store", "type": "str"},
-            {"default": None, "description": "Seqfile describing genomes and relationships", "name": "seqfile", "type": "str"},
-            {"default": "out.hal", "description": "Output HAL alignment file", "name": "out_hal", "type": "str"},
+            {"default": None, "description": "Path to query FASTA file", "name": "query_fasta", "type": "str"},
+            {"default": None, "description": "Path to target FASTA file", "name": "target_fasta", "type": "str"},
+            {"default": None, "description": "Alignment model (e.g., 'protein2genome', 'dna2dna')", "name": "model", "type": "str"},
+            {"default": None, "description": "Path to output result file", "name": "out_file", "type": "str"},
         ],
     },
     {
@@ -187,22 +184,25 @@ description = [
         ],
     },
     {
-        "description": "Use NCBI 'datasets' CLI to download genomic data or metadata.",
+        "description": "Run NCBI Datasets CLI command to download genomes, genes, proteins, or other biological data.",
         "name": "run_ncbi_datasets",
-        "optional_parameters": [],
+        "optional_parameters": [
+            {"default": "datasets", "description": "NCBI Datasets executable (defaults to 'datasets' in conda env)", "name": "datasets_exe", "type": "str"},
+        ],
         "required_parameters": [
-            {"default": None, "description": "Path to 'datasets' executable", "name": "datasets_exec", "type": "str"},
-            {"default": None, "description": "Subcommand list (e.g. ['download','genome','accession','--input-file','acc.txt'])", "name": "subcommand", "type": "list[str]"},
-            {"default": "./ncbi_datasets_out", "description": "Output directory", "name": "out_dir", "type": "str"},
+            {"default": None, "description": "List of subcommands and arguments, e.g. ['download','genome','accession','--input-file','acc.txt','--filename','dl.zip']", "name": "subcommand", "type": "list[str]"},
+            {"default": "./ncbi_datasets_out", "description": "Output directory for downloaded files", "name": "out_dir", "type": "str"},
         ],
     },
     {
-        "description": "Use NCBI 'dataformat' CLI to convert datasets JSONL to TSV or other formats.",
+        "description": "Run NCBI Dataformat CLI command to convert datasets output (JSONL) into TSV or other formats.",
         "name": "run_ncbi_dataformat",
-        "optional_parameters": [],
+        "optional_parameters": [
+            {"default": "dataformat", "description": "NCBI Dataformat executable (defaults to 'dataformat' in conda env)", "name": "dataformat_exe", "type": "str"},
+            {"default": None, "description": "Working directory to run the command in", "name": "workdir", "type": "str"},
+        ],
         "required_parameters": [
-            {"default": None, "description": "Path to 'dataformat' executable", "name": "dataformat_exec", "type": "str"},
-            {"default": None, "description": "Subcommand list (e.g. ['tsv','genome','--fields','accession'])", "name": "subcommand", "type": "list[str]"},
+            {"default": None, "description": "List of subcommands and arguments, e.g. ['tsv','genome','--fields','accession,organism-name','--inputfile','data.jsonl']", "name": "subcommand", "type": "list[str]"},
         ],
     },
     {

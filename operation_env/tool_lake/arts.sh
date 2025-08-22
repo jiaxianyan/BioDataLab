@@ -1,25 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 版本号（可以在官网或 GitHub Releases 查看最新）
-VERSION="2.0"
+# 下载链接
+TARBALL_URL="https://www.niehs.nih.gov/sites/default/files/2024-02/artbinmountrainier2016.06.05linux64.tgz"
+TARBALL_NAME=$(basename "$TARBALL_URL")
 
-# 当前目录
-CUR_DIR=$(pwd)
-INSTALL_DIR="${CUR_DIR}/arts-${VERSION}"
+echo "[INFO] Installation directory: $(pwd)"
 
-# 下载地址（GitHub Release，假设有 jar 包或 zip 包）
-URL="https://github.com/miguelinux314/arts/releases/download/v${VERSION}/arts-${VERSION}.zip"
+# 下载（如果文件不存在）
+if [ ! -f "$TARBALL_NAME" ]; then
+    echo "[INFO] Downloading $TARBALL_NAME ..."
+    curl -L -o "$TARBALL_NAME" "$TARBALL_URL"
+else
+    echo "[INFO] $TARBALL_NAME already exists, skipping download."
+fi
 
-echo "[INFO] Downloading ARTS v${VERSION}..."
-wget -nc "${URL}" -O "arts-${VERSION}.zip"
+# 解压
+echo "[INFO] Extracting $TARBALL_NAME ..."
+tar xzvf "$TARBALL_NAME"
 
-echo "[INFO] Extracting..."
-unzip -o "arts-${VERSION}.zip" -d "${CUR_DIR}"
-
-# 赋予执行权限（假设有启动脚本或 jar）
-chmod +x "${INSTALL_DIR}/arts.sh" || true
-
-echo "[INFO] Installed ARTS to ${INSTALL_DIR}"
-echo "[SUCCESS] Example usage:"
-echo "  java -jar ${INSTALL_DIR}/arts.jar -i input.fasta -o results/"
+echo "[INFO] Installation complete."
+echo "Executables are available under: $(pwd)/art_bin_MountRainier"

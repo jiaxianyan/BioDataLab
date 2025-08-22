@@ -1,65 +1,103 @@
 import subprocess
 import os
-from typing import Optional
+from typing import List, Optional, Dict
 
-def annotate_asv_with_qiime2(
-    asv_fasta: str,
-    qiime2_bin: str,
-    ezbio_db: str,
-    output_tsv: str,
-    identity_threshold: float = 0.97
-) -> None:
-    """Annotates ASV sequences using QIIME2's classify-consensus-vsearch method against the EzBioCloud database.
+
+def run_fastqc(
+    fastqc_executable: str,
+    input_files: List[str],
+    output_dir: str,
+    threads: int = 1,
+    extra_args: Optional[List[str]] = None
+) -> Dict:
+    """Runs FastQC on the given input files and returns the execution results.
 
     Args:
-        asv_fasta: Path to the ASV sequences in FASTA format.
-        qiime2_bin: Path to the QIIME2 binary (e.g., /opt/qiime2-2023.9/bin/qiime).
-        ezbio_db: Path to the EzBioCloud reference database (e.g., a directory containing the .qza).
-        output_tsv: Path to the output taxonomy TSV file.
-        identity_threshold: Minimum identity threshold for classification (default: 0.97).
+        fastqc_executable: The full path to the FastQC executable.
+        input_files: A list of input FASTQ or BAM files.
+        output_dir: The directory where FastQC output will be written.
+        threads: The number of threads to use.
+        extra_args: A list of additional arguments to pass to FastQC.
 
     Returns:
-        None. Writes the taxonomy to the specified output_tsv file.
+        A dictionary containing the return code, stdout, stderr, and output file paths.
 
     Raises:
-        FileNotFoundError: If the ASV FASTA file, QIIME2 binary, or EzBioCloud database are not found.
-        ValueError: If the identity threshold is not between 0 and 1.
-        subprocess.CalledProcessError: If the QIIME2 command fails.
+        FileNotFoundError: If the FastQC executable or any input file does not exist.
+        OSError: If the output directory cannot be created or is not writable.
+        ValueError: If the number of threads is not a positive integer.
 
     Examples:
-        annotate_asv_with_qiime2(
-            asv_fasta="asv_sequences.fasta",
-            qiime2_bin="/opt/qiime2-2023.9/bin/qiime",
-            ezbio_db="/path/to/ezbio_db",
-            output_tsv="taxonomy.tsv",
-            identity_threshold=0.97
-        )
+        >>> result = run_fastqc(
+        ...     fastqc_executable='/path/to/fastqc',
+        ...     input_files=['/path/to/input1.fastq', '/path/to/input2.fastq'],
+        ...     output_dir='/path/to/output',
+        ...     threads=4
+        ... )
+        >>> print(result['returncode'])
+        0
+        >>> print(result['stdout'])
+        'FastQC completed successfully...'
     """
 
-    if not os.path.isfile(asv_fasta):
-        raise FileNotFoundError(f"ASV FASTA file not found: {asv_fasta}")
-    if not os.path.isfile(qiime2_bin):
-        raise FileNotFoundError(f"QIIME2 binary not found: {qiime2_bin}")
-    if not os.path.exists(ezbio_db):
-        raise FileNotFoundError(f"EzBioCloud database not found: {ezbio_db}")
+    # Preflight validations
+    if not os.path.exists(fastqc_executable) or not os.access(fastqc_executable, os.X_OK):
+        raise FileNotFoundError(f"FastQC executable not found or not executable: {fastqc_executable}")
 
-    if not 0 <= identity_threshold <= 1:
-        raise ValueError("Identity threshold must be between 0 and 1.")
+    for input_file in input_files:
+        if not os.path.exists(input_file):
+            raise FileNotFoundError(f"Input file not found: {input_file}")
 
-    cmd = [
-        qiime2_bin,
-        "feature-classifier",
-        "classify-consensus-vsearch",
-        "--query-sequences", asv_fasta,
-        "--reference-taxonomy", os.path.join(ezbio_db, "taxonomy.qza") if os.path.isdir(ezbio_db) else ezbio_db + '/taxonomy.qza' if os.path.isfile(ezbio_db + '/taxonomy.qza') else ezbio_db,
-        "--reference-sequences", os.path.join(ezbio_db, "sequences.qza") if os.path.isdir(ezbio_db) else ezbio_db + '/sequences.qza' if os.path.isfile(ezbio_db + '/sequences.qza') else ezbio_db,
-        "--output-taxonomy", output_tsv,
-        "--min-id", str(identity_threshold),
-        "--threads", "1", # Ensure deterministic behavior
-        "--verbose"
+    if not os.path.exists(output_dir):
+        try:
+            os.makedirs(output_dir, exist_ok=True)
+        except OSError as e:
+            raise OSError(f"Cannot create output directory: {output_dir} - {e}")
+
+    if not os.access(output_dir, os.W_OK):
+        raise OSError(f"Output directory not writable: {output_dir}")
+
+    if not isinstance(threads, int) or threads <= 0:
+        raise ValueError("Number of threads must be a positive integer.")
+
+    # Build command
+    command = [
+        fastqc_executable,
+        "--threads",
+        str(threads),
+        "--outdir",
+        output_dir,
+        *input_files,
     ]
 
+    if extra_args:
+        command.extend(extra_args)
+
+    # Execute command
     try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
-    except subprocess.CalledProcessError as e:
-        raise subprocess.CalledProcessError(e.returncode, e.cmd, e.stdout, e.stderr)
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            check=False  # Do not raise exceptions on non-zero return codes
+        )
+
+        # Determine output files (assuming FastQC names them predictably)
+        outputs = {}
+        for input_file in input_files:
+            base_name = os.path.basename(input_file)
+            outputs[input_file] = os.path.join(output_dir, f"{os.path.splitext(base_name)[0]}_fastqc.html")
+
+        return {
+            "returncode": result.returncode,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "outputs": outputs
+        }
+    except Exception as e:
+        return {
+            "returncode": 1,
+            "stdout": "",
+            "stderr": str(e),
+            "outputs": {}
+        }

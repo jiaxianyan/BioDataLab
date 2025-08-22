@@ -7,6 +7,25 @@ from typing import Optional, Dict, Any, List, Tuple, Sequence, Union
 import tempfile
 import shutil
 
+import qiime2
+
+# QIIME 2 插件
+from qiime2.plugins import (
+    tools,
+    demux,
+    vsearch,
+    cutadapt,
+    quality_filter,
+    deblur,
+    dada2,
+    feature_table,
+    feature_classifier,
+    taxa,
+    alignment,
+    phylogeny,
+    diversity,
+    c
+)
 
 def _ensure_file(path: str, desc: str):
     if not os.path.isfile(path):
@@ -65,333 +84,309 @@ def _provenance(output_dir: str, info: Dict[str, Any]) -> None:
         f.write(json.dumps({"ts": datetime.datetime.now().isoformat(), **info}, ensure_ascii=False) + "\n")
 
 # 1) 数据导入与初步质控
-def q2_ingest_and_qc(
+def q2_ingest_and_qc_api(
     manifest_csv: str,
     output_dir: str,
-    qiime_bin: str = "./operation_env/tool_lake/qiime",
-    sample_metadata_tsv: Optional[str] = None,
+    sample_metadata_tsv: str = None,
     paired_end: bool = True,
     join_paired: bool = False,
-    cutadapt_params: Optional[str] = None,
+    cutadapt_params: dict = None,   # 改成 dict 传参，例如 {"p_front_f": "ACTG"}
     qscore_filter: bool = False,
-    trunc_len_f: Optional[int] = None,
-    trunc_len_r: Optional[int] = None,
+    trunc_len_f: int = None,
+    trunc_len_r: int = None,
     phred_offset: int = 33,
     force: bool = False,
-) -> Dict[str, str]:
+):
     """
-    Import FASTQ via manifest, optionally join paired reads, trim adapters, perform q-score filtering,
-    and summarize demultiplexed data. Returns demux artifact and visualization paths.
+    Python API 版：导入 FASTQ（manifest），可选 join-pairs, cutadapt 修剪, q-score 过滤。
+    返回 demux.qza 和 demux.qzv 的 Artifact 对象。
     """
-    manifest_csv = _require_file(manifest_csv, "manifest_csv")
-    if sample_metadata_tsv:
-        _require_file(sample_metadata_tsv, "sample_metadata_tsv")
-    qiime = _require_file(qiime_bin, "qiime_bin")
-    out = _ensure_dir(output_dir)
-    log_path = os.path.join(out, "run.log")
+    os.makedirs(output_dir, exist_ok=True)
 
-    fmt = "PairedEndFastqManifestPhred{}V2".format(phred_offset) if paired_end else "SingleEndFastqManifestPhred{}V2".format(phred_offset)
-    demux_qza = os.path.join(out, "demux.qza")
-    demux_qzv = os.path.join(out, "demux.qzv")
+    fmt = ("PairedEndFastqManifestPhred{}V2" if paired_end else "SingleEndFastqManifestPhred{}V2").format(phred_offset)
 
-    if force or not os.path.exists(demux_qza):
-        _run_qiime([qiime, "tools", "import",
-              "--type", "SampleData[PairedEndSequencesWithQuality]" if paired_end else "SampleData[SequencesWithQuality]",
-              "--input-path", manifest_csv,
-              "--input-format", fmt,
-              "--output-path", demux_qza], log_file=log_path)
+    # 导入数据
+    demux_art = tools.import_(
+        type="SampleData[PairedEndSequencesWithQuality]" if paired_end else "SampleData[SequencesWithQuality]",
+        input_path=manifest_csv,
+        input_format=fmt
+    ).result
 
-    work_qza = demux_qza
+    work_art = demux_art
 
+    # join-pairs
     if paired_end and join_paired:
-        joined_qza = os.path.join(out, "joined.qza")
-        joined_qzv = os.path.join(out, "joined.qzv")
-        if force or not os.path.exists(joined_qza):
-            _run_qiime([qiime, "vsearch", "join-pairs",
-                  "--i-demultiplexed-seqs", demux_qza,
-                  "--o-joined-sequences", joined_qza,
-                  "--o-join-summary", joined_qzv], log_file=log_path)
-        work_qza = joined_qza
+        joined = vsearch.join_pairs(i_demultiplexed_seqs=work_art)
+        work_art = joined.o_joined_sequences
 
+    # cutadapt 修剪
     if cutadapt_params:
-        trimmed_qza = os.path.join(out, "trimmed.qza")
-        # user passes raw parameters string for cutadapt (e.g., "--p-front-f ACTG --p-front-r ACTG")
-        if force or not os.path.exists(trimmed_qza):
-            cmd = [qiime, "cutadapt", "trim-paired" if paired_end else "trim-single",
-                   "--i-demultiplexed-sequences", work_qza,
-                   "--o-trimmed-sequences", trimmed_qza]
-            cmd.extend(shlex.split(cutadapt_params))
-            _run_qiime(cmd, log_file=log_path)
-        work_qza = trimmed_qza
+        if paired_end:
+            trimmed = cutadapt.trim_paired(i_demultiplexed_sequences=work_art, **cutadapt_params)
+        else:
+            trimmed = cutadapt.trim_single(i_demultiplexed_sequences=work_art, **cutadapt_params)
+        work_art = trimmed.o_trimmed_sequences
 
+    # q-score filter
     if qscore_filter:
-        filt_qza = os.path.join(out, "qscore_filtered.qza")
-        filt_stats_qzv = os.path.join(out, "qscore_stats.qzv")
-        if force or not os.path.exists(filt_qza):
-            _run_qiime([qiime, "quality-filter", "q-score-joined" if (paired_end and join_paired) else "q-score",
-                  "--i-demux", work_qza,
-                  "--o-filtered-sequences", filt_qza,
-                  "--o-filter-stats", filt_stats_qzv], log_file=log_path)
-        work_qza = filt_qza
+        if paired_end and join_paired:
+            filt = quality_filter.q_score_joined(i_demux=work_art)
+        else:
+            filt = quality_filter.q_score(i_demux=work_art)
+        work_art = filt.o_filtered_sequences
 
-    if paired_end and (trunc_len_f or trunc_len_r):
-        # Optional truncation via dada2 pre-truncation is generally applied inside denoise;
-        # here we just record intent in provenance to keep interface simple.
-        _provenance(out, {"note": "Truncation parameters recorded; actual truncation should be done in denoise step.",
-                          "trunc_len_f": trunc_len_f, "trunc_len_r": trunc_len_r})
+    # summarize
+    summary = demux.summarize(i_data=work_art)
 
-    if force or not os.path.exists(demux_qzv) or not _is_fresh(demux_qzv, [work_qza]):
-        _run_qiime([qiime, "demux", "summarize",
-              "--i-data", work_qza,
-              "--o-visualization", demux_qzv], log_file=log_path)
+    # 保存输出
+    demux_qza = os.path.join(output_dir, "demux.qza")
+    demux_qzv = os.path.join(output_dir, "demux.qzv")
+    work_art.save(demux_qza)
+    summary.visualization.save(demux_qzv)
 
-    _provenance(out, {"stage": "ingest_and_qc", "manifest": os.path.abspath(manifest_csv), "paired_end": paired_end,
-                      "join_paired": join_paired, "qscore_filter": qscore_filter, "cutadapt_params": cutadapt_params})
-
-    return {"demux_qza": os.path.abspath(work_qza), "demux_qzv": os.path.abspath(demux_qzv)}
+    return {"demux_qza": demux_qza, "demux_qzv": demux_qzv}
 
 # 2) 去噪与特征表
-def q2_denoise_and_feature_table(
+def q2_denoise_and_feature_table_api(
     demux_qza: str,
     output_dir: str,
-    qiime_bin: str = "./operation_env/tool_lake/qiime",
-    method: str = "deblur",  # 'deblur' or 'dada2'
-    trim_length: Optional[int] = 250,  # for deblur
-    trunc_len_f: Optional[int] = None,  # for dada2 paired
-    trunc_len_r: Optional[int] = None,  # for dada2 paired
-    min_reads_per_sample: Optional[int] = None,
+    method: str = "deblur",   # 'deblur' or 'dada2'
+    trim_length: int = 250,   # for deblur
+    trunc_len_f: int = None,  # for dada2 paired
+    trunc_len_r: int = None,  # for dada2 paired
+    min_reads_per_sample: int = None,
     threads: int = 0,
     force: bool = False,
-) -> Dict[str, str]:
+):
     """
-    Denoise reads (Deblur or DADA2), generate feature table and representative sequences,
-    and optionally filter samples by minimal reads.
+    Python API 版：用 Deblur 或 DADA2 去噪，生成特征表和代表序列，
+    可选过滤低丰度样本。
     """
-    demux_qza = _require_file(demux_qza, "demux_qza")
-    qiime = _require_file(qiime_bin, "qiime_bin")
-    out = _ensure_dir(output_dir)
-    log_path = os.path.join(out, "run.log")
+    os.makedirs(output_dir, exist_ok=True)
 
-    table_qza = os.path.join(out, "table.qza")
-    rep_qza = os.path.join(out, "rep-seqs.qza")
-    stats_qzv = os.path.join(out, f"{method}_stats.qzv")
+    # 加载输入 artifact
+    demux_art = qiime2.Artifact.load(demux_qza)
 
+    # 输出文件
+    table_qza = os.path.join(output_dir, "table.qza")
+    rep_qza   = os.path.join(output_dir, "rep-seqs.qza")
+    stats_qzv = os.path.join(output_dir, f"{method}_stats.qzv")
+
+    # ------------------- 去噪 -------------------
     if method.lower() == "deblur":
-        if force or not os.path.exists(table_qza) or not os.path.exists(rep_qza):
-            cmd = [qiime, "deblur", "denoise-16S",
-                   "--i-demultiplexed-seqs", demux_qza,
-                   "--o-representative-sequences", rep_qza,
-                   "--o-table", table_qza,
-                   "--o-stats", stats_qzv]
-            if trim_length:
-                cmd += ["--p-trim-length", str(trim_length)]
-            if threads and threads > 0:
-                cmd += ["--p-jobs-to-start", str(threads)]
-            _run_qiime(cmd, log_file=log_path)
+        result = deblur.denoise_16S(
+            i_demultiplexed_seqs=demux_art,
+            p_trim_length=trim_length,
+            p_jobs_to_start=threads if threads > 0 else None
+        )
+        rep_seqs = result.o_representative_sequences
+        table    = result.o_table
+        stats    = result.o_stats
+
     elif method.lower() == "dada2":
-        # Detect single vs paired via filename convention is unreliable; expect user to choose trunc params accordingly.
         if trunc_len_f is None and trunc_len_r is None:
-            # Assume single-end
-            if force or not os.path.exists(table_qza) or not os.path.exists(rep_qza):
-                cmd = [qiime, "dada2", "denoise-single",
-                       "--i-demultiplexed-seqs", demux_qza,
-                       "--o-representative-sequences", rep_qza,
-                       "--o-table", table_qza,
-                       "--o-denoising-stats", stats_qzv]
-                if trunc_len_f:
-                    cmd += ["--p-trunc-len", str(trunc_len_f)]
-                if threads and threads > 0:
-                    cmd += ["--p-n-threads", str(threads)]
-                _run_qiime(cmd, log_file=log_path)
+            # single-end
+            result = dada2.denoise_single(
+                i_demultiplexed_seqs=demux_art,
+                p_trunc_len=trunc_len_f if trunc_len_f else 0,
+                p_n_threads=threads if threads > 0 else 0
+            )
         else:
-            # Paired-end
-            if force or not os.path.exists(table_qza) or not os.path.exists(rep_qza):
-                cmd = [qiime, "dada2", "denoise-paired",
-                       "--i-demultiplexed-seqs", demux_qza,
-                       "--o-representative-sequences", rep_qza,
-                       "--o-table", table_qza,
-                       "--o-denoising-stats", stats_qzv]
-                if trunc_len_f:
-                    cmd += ["--p-trunc-len-f", str(trunc_len_f)]
-                if trunc_len_r:
-                    cmd += ["--p-trunc-len-r", str(trunc_len_r)]
-                if threads and threads > 0:
-                    cmd += ["--p-n-threads", str(threads)]
-                _run_qiime(cmd, log_file=log_path)
+            # paired-end
+            result = dada2.denoise_paired(
+                i_demultiplexed_seqs=demux_art,
+                p_trunc_len_f=trunc_len_f if trunc_len_f else 0,
+                p_trunc_len_r=trunc_len_r if trunc_len_r else 0,
+                p_n_threads=threads if threads > 0 else 0
+            )
+        rep_seqs = result.o_representative_sequences
+        table    = result.o_table
+        stats    = result.o_denoising_stats
+
     else:
         raise ValueError("method must be 'deblur' or 'dada2'.")
 
+    # 保存主要结果
+    rep_seqs.save(rep_qza)
+    table.save(table_qza)
+    stats.visualization.save(stats_qzv)
+
+    # ------------------- 可选：过滤低丰度样本 -------------------
     filtered_table_qza = ""
     if min_reads_per_sample and min_reads_per_sample > 0:
-        filtered_table_qza = os.path.join(out, f"table_min{min_reads_per_sample}.qza")
-        if force or not os.path.exists(filtered_table_qza) or not _is_fresh(filtered_table_qza, [table_qza]):
-            _run_qiime([qiime, "feature-table", "filter-samples",
-                  "--i-table", table_qza,
-                  "--p-min-frequency", str(min_reads_per_sample),
-                  "--o-filtered-table", filtered_table_qza], log_file=log_path)
+        filtered_table = feature_table.filter_samples(
+            i_table=table,
+            p_min_frequency=min_reads_per_sample
+        ).o_filtered_table
+        filtered_table_qza = os.path.join(output_dir, f"table_min{min_reads_per_sample}.qza")
+        filtered_table.save(filtered_table_qza)
 
-    _provenance(out, {"stage": "denoise_and_feature_table", "method": method,
-                      "trim_length": trim_length, "trunc_len_f": trunc_len_f, "trunc_len_r": trunc_len_r,
-                      "min_reads_per_sample": min_reads_per_sample})
-
-    result = {
+    # ------------------- 返回结果 -------------------
+    result_paths = {
         "table_qza": os.path.abspath(filtered_table_qza or table_qza),
         "rep_seqs_qza": os.path.abspath(rep_qza),
         "denoise_stats_qzv": os.path.abspath(stats_qzv),
     }
     if filtered_table_qza:
-        result["table_filtered_qza"] = os.path.abspath(filtered_table_qza)
-    return result
+        result_paths["table_filtered_qza"] = os.path.abspath(filtered_table_qza)
+
+    return result_paths
 
 # 3) 分类学注释
-def q2_taxonomy(
+def q2_taxonomy_api(
     table_qza: str,
     rep_seqs_qza: str,
     output_dir: str,
-    qiime_bin: str = "./operation_env/tool_lake/qiime",
-    metadata_tsv: Optional[str] = None,
-    pretrained_classifier_qza: Optional[str] = None,
-    ref_seqs_qza: Optional[str] = None,
-    ref_taxonomy_qza: Optional[str] = None,
-    method: str = "sklearn",  # 'sklearn' or 'vsearch'
+    metadata_tsv: str = None,
+    pretrained_classifier_qza: str = None,
+    ref_seqs_qza: str = None,
+    ref_taxonomy_qza: str = None,
+    method: str = "sklearn",   # 'sklearn' or 'vsearch'
     perc_identity: float = 0.97,
     force: bool = False,
-) -> Dict[str, str]:
+):
     """
-    Assign taxonomy using a pretrained classifier (preferred) or by training from reference,
-    then generate taxa barplot.
+    Python API 版：使用预训练分类器或参考数据库进行分类学注释，
+    然后生成 taxa barplot。
     """
-    table_qza = _require_file(table_qza, "table_qza")
-    rep_seqs_qza = _require_file(rep_seqs_qza, "rep_seqs_qza")
-    qiime = _require_file(qiime_bin, "qiime_bin")
-    if metadata_tsv:
-        _require_file(metadata_tsv, "metadata_tsv")
-    out = _ensure_dir(output_dir)
-    log_path = os.path.join(out, "run.log")
+    os.makedirs(output_dir, exist_ok=True)
 
-    taxonomy_qza = os.path.join(out, "taxonomy.qza")
-    taxonomy_qzv = os.path.join(out, "taxonomy.qzv")
+    # 加载输入
+    table_art = qiime2.Artifact.load(table_qza)
+    rep_seqs_art = qiime2.Artifact.load(rep_seqs_qza)
+    metadata = qiime2.Metadata.load(metadata_tsv) if metadata_tsv else None
 
-    classifier_qza = None
+    taxonomy_qza = os.path.join(output_dir, "taxonomy.qza")
+    taxonomy_qzv = os.path.join(output_dir, "taxonomy.qzv")
+    taxa_barplot_qzv = os.path.join(output_dir, "taxa-barplot.qzv")
+
+    classifier_art = None
+
+    # ------------------- 选择分类器 -------------------
     if pretrained_classifier_qza:
-        classifier_qza = _require_file(pretrained_classifier_qza, "pretrained_classifier_qza")
+        classifier_art = qiime2.Artifact.load(pretrained_classifier_qza)
     else:
-        # Need to train classifier if using sklearn without pretrained, or prepare for vsearch consensus
         if not (ref_seqs_qza and ref_taxonomy_qza):
             raise ValueError("Either provide 'pretrained_classifier_qza' OR both 'ref_seqs_qza' and 'ref_taxonomy_qza'.")
-        ref_seqs_qza = _require_file(ref_seqs_qza, "ref_seqs_qza")
-        ref_taxonomy_qza = _require_file(ref_taxonomy_qza, "ref_taxonomy_qza")
-        if method == "sklearn":
-            classifier_qza = os.path.join(out, "trained_classifier.qza")
-            if force or not os.path.exists(classifier_qza):
-                _run_qiime([qiime, "feature-classifier", "fit-classifier-naive-bayes",
-                      "--i-reference-reads", ref_seqs_qza,
-                      "--i-reference-taxonomy", ref_taxonomy_qza,
-                      "--o-classifier", classifier_qza], log_file=log_path)
+        ref_seqs_art = qiime2.Artifact.load(ref_seqs_qza)
+        ref_tax_art  = qiime2.Artifact.load(ref_taxonomy_qza)
 
+        if method == "sklearn":
+            # 训练 Naive Bayes 分类器
+            classifier_art = feature_classifier.fit_classifier_naive_bayes(
+                i_reference_reads=ref_seqs_art,
+                i_reference_taxonomy=ref_tax_art
+            ).o_classifier
+            classifier_art.save(os.path.join(output_dir, "trained_classifier.qza"))
+
+    # ------------------- 分类学注释 -------------------
     if method == "sklearn":
-        if force or not os.path.exists(taxonomy_qza):
-            _run_qiime([qiime, "feature-classifier", "classify-sklearn",
-                  "--i-classifier", classifier_qza,
-                  "--i-reads", rep_seqs_qza,
-                  "--o-classification", taxonomy_qza], log_file=log_path)
+        result = feature_classifier.classify_sklearn(
+            i_classifier=classifier_art,
+            i_reads=rep_seqs_art
+        )
+        taxonomy = result.o_classification
+
     elif method == "vsearch":
-        if force or not os.path.exists(taxonomy_qza):
-            if not (ref_seqs_qza and ref_taxonomy_qza):
-                raise ValueError("VSEARCH method requires 'ref_seqs_qza' and 'ref_taxonomy_qza'.")
-            _run_qiime([qiime, "feature-classifier", "classify-consensus-vsearch",
-                  "--i-query", rep_seqs_qza,
-                  "--i-reference-reads", ref_seqs_qza,
-                  "--i-reference-taxonomy", ref_taxonomy_qza,
-                  "--p-perc-identity", str(perc_identity),
-                  "--o-classification", taxonomy_qza], log_file=log_path)
+        if not (ref_seqs_qza and ref_taxonomy_qza):
+            raise ValueError("VSEARCH method requires 'ref_seqs_qza' and 'ref_taxonomy_qza'.")
+        ref_seqs_art = qiime2.Artifact.load(ref_seqs_qza)
+        ref_tax_art  = qiime2.Artifact.load(ref_taxonomy_qza)
+
+        result = feature_classifier.classify_consensus_vsearch(
+            i_query=rep_seqs_art,
+            i_reference_reads=ref_seqs_art,
+            i_reference_taxonomy=ref_tax_art,
+            p_perc_identity=perc_identity
+        )
+        taxonomy = result.o_classification
+
     else:
         raise ValueError("method must be 'sklearn' or 'vsearch'.")
 
-    taxa_barplot_qzv = os.path.join(out, "taxa-barplot.qzv")
-    if force or not os.path.exists(taxa_barplot_qzv):
-        cmd = [qiime, "taxa", "barplot",
-               "--i-table", table_qza,
-               "--i-taxonomy", taxonomy_qza,
-               "--o-visualization", taxa_barplot_qzv]
-        if metadata_tsv:
-            cmd += ["--m-metadata-file", metadata_tsv]
-        _run_qiime(cmd, log_file=log_path)
+    taxonomy.save(taxonomy_qza)
 
-    _provenance(out, {"stage": "taxonomy", "method": method, "perc_identity": perc_identity,
-                      "used_pretrained": bool(pretrained_classifier_qza)})
+    # ------------------- 生成 barplot -------------------
+    barplot = taxa.barplot(
+        i_table=table_art,
+        i_taxonomy=taxonomy,
+        m_metadata_file=metadata
+    )
+    barplot.visualization.save(taxa_barplot_qzv)
 
-    result = {
+    # 保存 taxonomy 可视化
+    taxonomy.visualization = feature_classifier.classify_sklearn(  # trick: reuse for viz
+        i_classifier=classifier_art, i_reads=rep_seqs_art
+    ).o_classification.view(qiime2.Metadata)
+
+    # ------------------- 返回结果 -------------------
+    result_paths = {
         "taxonomy_qza": os.path.abspath(taxonomy_qza),
         "taxonomy_qzv": os.path.abspath(taxonomy_qzv),
         "taxa_barplot_qzv": os.path.abspath(taxa_barplot_qzv),
     }
     if pretrained_classifier_qza is None and method == "sklearn":
-        result["trained_classifier_qza"] = os.path.abspath(classifier_qza)
-    return result
+        result_paths["trained_classifier_qza"] = os.path.abspath(
+            os.path.join(output_dir, "trained_classifier.qza")
+        )
+
+    return result_paths
 
 # 4) 系统发育与核心多样性
-def q2_phylogeny_and_core_diversity(
+def q2_phylogeny_and_core_diversity_api(
     table_qza: str,
     rep_seqs_qza: str,
     output_dir: str,
-    qiime_bin: str = "./operation_env/tool_lake/qiime",
     sampling_depth: int = 1000,
     use_midpoint_root: bool = True,
     force: bool = False,
-) -> Dict[str, str]:
+):
     """
-    Build alignment and phylogenetic tree, then run core-metrics-phylogenetic to compute
-    alpha/beta diversity, PCoA, and Emperor visualizations.
+    Python API 版：构建系统发育树，并运行 core-metrics-phylogenetic。
+    返回比对、树和多样性分析结果路径。
     """
-    table_qza = _require_file(table_qza, "table_qza")
-    rep_seqs_qza = _require_file(rep_seqs_qza, "rep_seqs_qza")
-    qiime = _require_file(qiime_bin, "qiime_bin")
-    out = _ensure_dir(output_dir)
-    log_path = os.path.join(out, "run.log")
+    os.makedirs(output_dir, exist_ok=True)
 
-    aligned_qza = os.path.join(out, "aligned-rep-seqs.qza")
-    masked_qza = os.path.join(out, "masked-alignment.qza")
-    tree_qza = os.path.join(out, "unrooted-tree.qza")
-    rooted_tree_qza = os.path.join(out, "rooted-tree.qza")
+    # 加载输入
+    table_art = qiime2.Artifact.load(table_qza)
+    rep_seqs_art = qiime2.Artifact.load(rep_seqs_qza)
 
-    if force or not os.path.exists(aligned_qza):
-        _run_qiime([qiime, "alignment", "mafft",
-              "--i-sequences", rep_seqs_qza,
-              "--o-alignment", aligned_qza], log_file=log_path)
+    # 输出文件路径
+    aligned_qza     = os.path.join(output_dir, "aligned-rep-seqs.qza")
+    masked_qza      = os.path.join(output_dir, "masked-alignment.qza")
+    tree_qza        = os.path.join(output_dir, "unrooted-tree.qza")
+    rooted_tree_qza = os.path.join(output_dir, "rooted-tree.qza")
+    core_dir        = os.path.join(output_dir, "core-metrics")
+    os.makedirs(core_dir, exist_ok=True)
 
-    if force or not os.path.exists(masked_qza):
-        _run_qiime([qiime, "alignment", "mask",
-              "--i-alignment", aligned_qza,
-              "--o-masked-alignment", masked_qza], log_file=log_path)
+    # ------------------- 比对 -------------------
+    aligned = alignment.mafft(i_sequences=rep_seqs_art).o_alignment
+    aligned.save(aligned_qza)
 
-    if force or not os.path.exists(tree_qza):
-        _run_qiime([qiime, "phylogeny", "fasttree",
-              "--i-alignment", masked_qza,
-              "--o-tree", tree_qza], log_file=log_path)
+    # ------------------- 掩码 -------------------
+    masked = alignment.mask(i_alignment=aligned).o_masked_alignment
+    masked.save(masked_qza)
 
-    if force or not os.path.exists(rooted_tree_qza):
-        if use_midpoint_root:
-            _run_qiime([qiime, "phylogeny", "midpoint-root",
-                  "--i-tree", tree_qza,
-                  "--o-rooted-tree", rooted_tree_qza], log_file=log_path)
-        else:
-            _run_qiime([qiime, "phylogeny", "root",
-                  "--i-tree", tree_qza,
-                  "--o-rooted-tree", rooted_tree_qza], log_file=log_path)
+    # ------------------- 构树 -------------------
+    tree = phylogeny.fasttree(i_alignment=masked).o_tree
+    tree.save(tree_qza)
 
-    core_dir = os.path.join(out, "core-metrics")
-    _ensure_dir(core_dir)
-    # core-metrics-phylogenetic will create a directory with multiple outputs
-    if force or not os.path.exists(os.path.join(core_dir, "unweighted_unifrac_pcoa_results.qza")):
-        _run_qiime([qiime, "diversity", "core-metrics-phylogenetic",
-              "--i-phylogeny", rooted_tree_qza,
-              "--i-table", table_qza,
-              "--p-sampling-depth", str(sampling_depth),
-              "--output-dir", core_dir], log_file=log_path)
+    # ------------------- 加根 -------------------
+    if use_midpoint_root:
+        rooted = phylogeny.midpoint_root(i_tree=tree).o_rooted_tree
+    else:
+        rooted = phylogeny.root(i_tree=tree).o_rooted_tree
+    rooted.save(rooted_tree_qza)
 
-    _provenance(out, {"stage": "phylogeny_and_core_diversity", "sampling_depth": sampling_depth})
+    # ------------------- 核心多样性指标 -------------------
+    core = diversity.core_metrics_phylogenetic(
+        i_table=table_art,
+        i_phylogeny=rooted,
+        p_sampling_depth=sampling_depth,
+        output_dir=core_dir
+    )
 
+    # ------------------- 返回结果 -------------------
     return {
         "aligned_rep_seqs_qza": os.path.abspath(aligned_qza),
         "masked_alignment_qza": os.path.abspath(masked_qza),
@@ -401,96 +396,75 @@ def q2_phylogeny_and_core_diversity(
     }
 
 # 5) 统计与导出
-def q2_stats_and_export(
+def q2_stats_and_export_api(
     table_qza: str,
     taxonomy_qza: str,
     output_dir: str,
-    qiime_bin: str,
-    metadata_tsv: Optional[str] = None,
-    methods: Tuple[str, ...] = ("ancom",),  # e.g., ('ancom', 'aldex2', 'songbird')
+    metadata_tsv: str = None,
+    methods: tuple = ("ancom",),  # e.g., ('ancom', 'aldex2', 'songbird')
     export_biom: bool = True,
     export_tsv: bool = True,
     unpack_qzv: bool = True,
     force: bool = False,
-) -> Dict[str, str]:
+):
     """
-    Run common differential abundance methods (if available), and export feature table and taxonomy
-    to BIOM/TSV. Optionally unpack .qzv to static HTML assets for sharing.
+    Python API 版：执行常见差异丰度分析（如 ANCOM），并导出 feature table 与 taxonomy。
+    返回结果文件路径。
     """
-    table_qza = _require_file(table_qza, "table_qza")
-    taxonomy_qza = _require_file(taxonomy_qza, "taxonomy_qza")
-    qiime = _require_file(qiime_bin, "qiime_bin")
-    if metadata_tsv:
-        _require_file(metadata_tsv, "metadata_tsv")
-    out = _ensure_dir(output_dir)
-    log_path = os.path.join(out, "run.log")
+    os.makedirs(output_dir, exist_ok=True)
 
-    results: Dict[str, str] = {}
+    # 加载输入
+    table_art = qiime2.Artifact.load(table_qza)
+    taxonomy_art = qiime2.Artifact.load(taxonomy_qza)
+    metadata = qiime2.Metadata.load(metadata_tsv) if metadata_tsv else None
 
-    # ANCOM (composition)
+    results = {}
+
+    # ------------------- ANCOM -------------------
     if "ancom" in methods:
-        comp_dir = os.path.join(out, "composition_ancom")
-        _ensure_dir(comp_dir)
+        comp_dir = os.path.join(output_dir, "composition_ancom")
+        os.makedirs(comp_dir, exist_ok=True)
+
         comp_table_qza = os.path.join(comp_dir, "comp_table.qza")
         if force or not os.path.exists(comp_table_qza):
-            _run_qiime([qiime, "composition", "add-pseudocount",
-                  "--i-table", table_qza,
-                  "--o-composition-table", comp_table_qza], log_file=log_path)
-        if metadata_tsv:
-            ancom_qzv = os.path.join(comp_dir, "ancom.qzv")
-            # Require a metadata column name; we use a generic example 'Group' here,
-            # caller should provide a metadata with a 'Group' column or adapt as needed.
-            # To keep this wrapper generic, we record a note instead of guessing column.
-            _provenance(comp_dir, {"note": "Run ANCOM via QIIME 2 manually specifying --m-metadata-column in downstream usage if needed."})
-            results["ancom_composition_table_qza"] = os.path.abspath(comp_table_qza)
-            results["ancom_qzv_placeholder"] = "Provide metadata column to run 'qiime composition ancom' manually."
-        else:
-            results["ancom_skipped"] = "No metadata_tsv provided."
+            comp_table = composition.add_pseudocount(i_table=table_art).o_composition_table
+            comp_table.save(comp_table_qza)
 
-    # ALDEx2 (if plugin installed)
+        results["ancom_composition_table_qza"] = os.path.abspath(comp_table_qza)
+        results["ancom_note"] = (
+            "要运行 ANCOM 需指定 metadata column，请在调用 composition.ancom 时传入 --m-metadata-column"
+        )
+
+    # ------------------- ALDEx2 占位 -------------------
     if "aldex2" in methods:
-        ald_dir = os.path.join(out, "aldex2")
-        _ensure_dir(ald_dir)
-        _provenance(ald_dir, {"note": "Requires q2-aldex2 plugin; run specific commands outside or extend wrapper with column params."})
-        results["aldex2_note"] = "q2-aldex2 not executed: column/conditions are dataset-specific."
+        ald_dir = os.path.join(output_dir, "aldex2")
+        os.makedirs(ald_dir, exist_ok=True)
+        results["aldex2_note"] = "需要 q2-aldex2 插件；请根据数据集具体设计参数。"
 
-    # Songbird (if plugin installed)
+    # ------------------- Songbird 占位 -------------------
     if "songbird" in methods:
-        sb_dir = os.path.join(out, "songbird")
-        _ensure_dir(sb_dir)
-        _provenance(sb_dir, {"note": "Requires q2-songbird; design formula and parameters are dataset-specific."})
-        results["songbird_note"] = "q2-songbird not executed: design formula required."
+        sb_dir = os.path.join(output_dir, "songbird")
+        os.makedirs(sb_dir, exist_ok=True)
+        results["songbird_note"] = "需要 q2-songbird 插件；请根据数据集具体设计公式。"
 
-    # Export BIOM/TSV
+    # ------------------- 导出 BIOM -------------------
     if export_biom:
-        export_biom_dir = os.path.join(out, "export_biom")
-        _ensure_dir(export_biom_dir)
-        if force or not os.path.exists(os.path.join(export_biom_dir, "feature-table.biom")):
-            _run_qiime([qiime, "tools", "export",
-                  "--input-path", table_qza,
-                  "--output-path", export_biom_dir], log_file=log_path)
-        biom_path = os.path.join(export_biom_dir, "feature-table.biom")
-        results["biom_path"] = os.path.abspath(biom_path)
+        export_biom_dir = os.path.join(output_dir, "export_biom")
+        os.makedirs(export_biom_dir, exist_ok=True)
+        tools.export_(input=table_art, output_path=export_biom_dir)
+        results["biom_path"] = os.path.abspath(os.path.join(export_biom_dir, "feature-table.biom"))
 
+    # ------------------- 导出 taxonomy TSV -------------------
     if export_tsv:
-        # Convert taxonomy to TSV
-        tax_tsv_dir = os.path.join(out, "export_taxonomy")
-        _ensure_dir(tax_tsv_dir)
-        if force or not os.path.exists(os.path.join(tax_tsv_dir, "taxonomy.tsv")):
-            _run_qiime([qiime, "tools", "export",
-                  "--input-path", taxonomy_qza,
-                  "--output-path", tax_tsv_dir], log_file=log_path)
-        results["taxonomy_tsv"] = os.path.abspath(os.path.join(tax_tsv_dir, "taxonomy.tsv"))
+        export_tax_dir = os.path.join(output_dir, "export_taxonomy")
+        os.makedirs(export_tax_dir, exist_ok=True)
+        tools.export_(input=taxonomy_art, output_path=export_tax_dir)
+        results["taxonomy_tsv"] = os.path.abspath(os.path.join(export_tax_dir, "taxonomy.tsv"))
 
-        # Summarize feature table to a TSV using 'feature-table summarize' (qzv) + manual unpack is needed.
-        # Here we export raw BIOM above; TSV conversion can be done with biom-format CLI (external),
-        # so we record a note to keep stdlib-only constraint.
-        _provenance(out, {"note": "For TSV feature table, convert BIOM via 'biom convert' (external) or Pandas in Python."})
-
+    # ------------------- unpack .qzv 占位 -------------------
     if unpack_qzv:
-        _provenance(out, {"note": "To unpack .qzv visualizations, use 'qiime tools export' on each .qzv as needed."})
+        results["unpack_note"] = "要解包 .qzv 可用 tools.export_ 输入 visualization artifact。"
 
-    _provenance(out, {"stage": "stats_and_export", "methods": methods})
     return results
 
 
@@ -739,39 +713,92 @@ def run_arts(input_fasta: str, output_dir: str, arts_exec: str = "./operation_en
 
 # 2) Exonerate
 def run_exonerate(query_fasta: str, target_fasta: str,
-                  model: str, out_file: str, exonerate_path: str = "./operation_env/tool_lake/exonerate", extra_args: Optional[List[str]] = None) -> str:
+                  model: str, out_file: str,
+                  exonerate_exe: str = "exonerate",
+                  extra_args: Optional[List[str]] = None) -> str:
     """
     运行 Exonerate 比对。
+
+    Args:
+        query_fasta (str): 查询序列 FASTA 文件路径。
+        target_fasta (str): 目标序列 FASTA 文件路径。
+        model (str): 比对模型 (例如 "protein2genome", "dna2dna")。
+        out_file (str): 输出结果文件路径。
+        exonerate_exe (str): Exonerate 可执行文件 (默认 'exonerate'，即 conda 安装环境中)。
+        extra_args (List[str], optional): 额外命令行参数，例如 ["--showalignment", "yes"]。
+
+    Returns:
+        str: 结果文件路径。
+
+    Raises:
+        FileNotFoundError: 如果 query 或 target 文件不存在。
+        RuntimeError: 如果 Exonerate 执行失败。
     """
-    _ensure_file(exonerate_path, "Exonerate executable")
-    _ensure_file(query_fasta, "Query FASTA")
-    _ensure_file(target_fasta, "Target FASTA")
-    out_dir = os.path.dirname(out_file) or "."
-    _ensure_dir(out_dir, "Output dir")
-    cmd = [exonerate_path, f"--model={model}", query_fasta, target_fasta]
+    if not os.path.isfile(query_fasta):
+        raise FileNotFoundError(f"Query FASTA not found: {query_fasta}")
+    if not os.path.isfile(target_fasta):
+        raise FileNotFoundError(f"Target FASTA not found: {target_fasta}")
+
+    os.makedirs(os.path.dirname(out_file) or ".", exist_ok=True)
+
+    cmd = [exonerate_exe, f"--model={model}", query_fasta, target_fasta]
     if extra_args:
-        cmd += extra_args
-    res = _run(cmd)
+        cmd.extend(extra_args)
+
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"Exonerate failed with exit code {proc.returncode}\n"
+            f"CMD: {' '.join(shlex.quote(c) for c in cmd)}\n"
+            f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+        )
+
     with open(out_file, "w", encoding="utf-8") as f:
-        f.write(res.stdout)
-    return out_file
+        f.write(proc.stdout)
+
+    return os.path.abspath(out_file)
 
 # 3) Cactus（多基因组比对）
-def run_cactus(job_store: str, seqfile: str, out_hal: str, cactus_path: str = "./operation_env/tool_lake/cactus", 
+def run_cactus(job_store: str, seqfile: str, out_hal: str,
+               cactus_exe: str = "cactus",  # 默认直接用 conda 环境里的 cactus
                extra_args: Optional[List[str]] = None) -> str:
     """
     运行 Cactus 主流程。
+
+    Args:
+        job_store (str): Cactus 作业存储目录（必须是新目录或可重启目录）。
+        seqfile (str): 输入的序列描述文件（seqFile.txt）。
+        out_hal (str): 输出 HAL 文件路径。
+        cactus_exe (str): Cactus 可执行文件名或路径（默认使用 conda 安装的 "cactus"）。
+        extra_args (List[str], optional): 额外命令行参数，例如 ["--maxCores", "8"]。
+
+    Returns:
+        str: 生成的 HAL 文件的绝对路径。
+
+    Raises:
+        FileNotFoundError: 如果 seqfile 不存在。
+        RuntimeError: 如果 Cactus 运行失败或没有生成 HAL 文件。
     """
-    _ensure_file(cactus_path, "Cactus executable")
-    _ensure_file(seqfile, "Cactus seqfile")
-    _ensure_dir(os.path.dirname(out_hal) or ".", "Output dir")
-    cmd = [cactus_path, job_store, seqfile, out_hal]
+    if not os.path.isfile(seqfile):
+        raise FileNotFoundError(f"Seqfile not found: {seqfile}")
+    os.makedirs(os.path.dirname(out_hal) or ".", exist_ok=True)
+
+    cmd = [cactus_exe, job_store, seqfile, out_hal]
     if extra_args:
-        cmd += extra_args
-    _run(cmd)
+        cmd.extend(extra_args)
+
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"Cactus failed with exit code {proc.returncode}\n"
+            f"CMD: {' '.join(shlex.quote(c) for c in cmd)}\n"
+            f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+        )
+
     if not os.path.isfile(out_hal):
         raise RuntimeError(f"Cactus expected output not found: {out_hal}")
-    return out_hal
+
+    return os.path.abspath(out_hal)
 
 # 4) FastQC（测序质控）
 def run_fastqc(inputs: List[str], out_dir: str, threads: int = 1, fastqc_path: str = "./operation_env/tool_lake/fastqc", 
@@ -828,25 +855,61 @@ def run_trimmomatic(mode: str,
     return [o for o in outputs if o]
 
 # 6) NCBI datasets（命令行）
-def run_ncbi_datasets(subcommand: List[str], out_dir: str, datasets_exec: str = "./operation_env/tool_lake/ncbidatasets", ) -> str:
+def run_ncbi_datasets(subcommand: List[str], out_dir: str,
+                      datasets_exe: str = "datasets") -> str:
     """
-    通用封装：例如下载基因组
-    subcommand 例：["download", "genome", "accession", "--input-file", "acc.txt", "--filename", "dl.zip"]
-    """
-    _ensure_file(datasets_exec, "datasets executable")
-    _ensure_dir(out_dir, "Output directory")
-    cmd = [datasets_exec] + subcommand
-    _run(cmd, cwd=out_dir)
-    return out_dir
+    Run NCBI Datasets CLI command.
 
-# 7) NCBI dataformat（命令行）
-def run_ncbi_dataformat(subcommand: List[str], dataformat_exec: str = "./operation_env/tool_lake/dataformat", workdir: Optional[str] = None) -> subprocess.CompletedProcess:
+    Args:
+        subcommand (List[str]): 子命令，例如:
+            ["download", "genome", "accession", "--input-file", "acc.txt", "--filename", "dl.zip"]
+        out_dir (str): 输出目录。
+        datasets_exe (str): 可执行程序名，默认 "datasets"（来自 conda 安装）。
+
+    Returns:
+        str: 输出目录的绝对路径。
+
+    Raises:
+        RuntimeError: 如果执行失败。
     """
-    通用封装：将 datasets 的 JSONL 转 TSV 等
-    subcommand 例：["tsv", "genome", "--fields", "accession,organism-name", "--inputfile", "data.jsonl"]
+    os.makedirs(out_dir, exist_ok=True)
+
+    cmd = [datasets_exe] + subcommand
+    proc = subprocess.run(cmd, cwd=out_dir, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"NCBI datasets failed with exit code {proc.returncode}\n"
+            f"CMD: {' '.join(shlex.quote(c) for c in cmd)}\n"
+            f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+        )
+
+    return os.path.abspath(out_dir)
+
+
+def run_ncbi_dataformat(subcommand: List[str],
+                        dataformat_exe: str = "dataformat",
+                        workdir: Optional[str] = None) -> subprocess.CompletedProcess:
     """
-    _ensure_file(dataformat_exec, "dataformat executable")
-    return _run([dataformat_exec] + subcommand, cwd=workdir)
+    Run NCBI Dataformat CLI command.
+
+    Args:
+        subcommand (List[str]): 子命令，例如:
+            ["tsv", "genome", "--fields", "accession,organism-name", "--inputfile", "data.jsonl"]
+        dataformat_exe (str): 可执行程序名，默认 "dataformat"（来自 conda 安装）。
+        workdir (str, optional): 运行目录。
+
+    Returns:
+        subprocess.CompletedProcess: 进程结果对象，包含 stdout/stderr。
+    """
+    cmd = [dataformat_exe] + subcommand
+    proc = subprocess.run(cmd, cwd=workdir, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"NCBI dataformat failed with exit code {proc.returncode}\n"
+            f"CMD: {' '.join(shlex.quote(c) for c in cmd)}\n"
+            f"STDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}"
+        )
+    return proc
 
 # 8) InterProScan
 def run_interproscan(input_fasta: str, out_dir: str,
