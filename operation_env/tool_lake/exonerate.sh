@@ -1,1 +1,0 @@
-# conda install -c bioconda exonerate 即可

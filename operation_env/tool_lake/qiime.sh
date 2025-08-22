@@ -1,1 +1,0 @@
-# conda install qiime2 即可
