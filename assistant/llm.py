@@ -45,10 +45,20 @@ def get_llm(
         llm_with_stop = llm.bind(stop=stop_sequences)
         return llm_with_stop
 
-
-    return ChatOpenAI(model=model, 
-                      base_url="https://aihubmix.com/v1",
-                      openai_api_key="sk-dlrre7E4eIX60dKU1eFdDb54F82b42AeB28c04716d211651",
-                      temperature=temperature, 
-                      max_tokens=8192,
-                      stop_sequences=stop_sequences)
+    if model.startswith('gpt'):
+        return ChatOpenAI(model=model, 
+                        base_url="https://aihubmix.com/v1",
+                        openai_api_key="sk-dlrre7E4eIX60dKU1eFdDb54F82b42AeB28c04716d211651",
+                        temperature=temperature, 
+                        max_tokens=8192,
+                        stop_sequences=stop_sequences)
+    else:
+        llm = ChatOpenAI(model=model, 
+                        base_url="https://aihubmix.com/v1",
+                        openai_api_key="sk-dlrre7E4eIX60dKU1eFdDb54F82b42AeB28c04716d211651",
+                        temperature=temperature, 
+                        max_tokens=8192,
+                        stop_sequences=stop_sequences)
+                        
+        llm_with_stop = llm.bind(stop=stop_sequences)
+        return llm_with_stop

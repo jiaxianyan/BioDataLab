@@ -5,7 +5,7 @@ This is the offical implement of "BioDataLab: Towards a Generalist Agent for Bio
 
 ### Installation
 Our software environment is massive and we provide a single setup.sh script to setup.
-Follow this [file](biomni_env/README.md) to setup the env first.
+Follow this [file](install_scripts/README.md) to setup the env first.
 
 Then activate the environment E1:
 

@@ -43,7 +43,7 @@ class AgentState(TypedDict):
 class A1:
     def __init__(
         self,
-        path="./data",
+        path="./operation_env",
         llm="claude-sonnet-4-20250514",
         source: SourceType | None = None,
         use_tool_retriever=True,
@@ -67,19 +67,19 @@ class A1:
         self.path = path
         self.debug = debug
 
-        if not os.path.exists(path):
-            os.makedirs(path)
-            print(f"Created directory: {path}")
+        # if not os.path.exists(path):
+            # os.makedirs(path)
+            # print(f"Created directory: {path}")
 
         # --- Begin custom folder/file checks ---
-        benchmark_dir = os.path.join(path, "biodatalab_data", "benchmark")
-        data_lake_dir = os.path.join(path, "biodatalab_data", "data_lake")
+        # benchmark_dir = os.path.join(path, "biodatalab_data", "benchmark")
+        # data_lake_dir = os.path.join(path, "biodatalab_data", "data_lake")
 
         # Create the biodatalab_data directory structure
-        os.makedirs(benchmark_dir, exist_ok=True)
-        os.makedirs(data_lake_dir, exist_ok=True)
+        # os.makedirs(benchmark_dir, exist_ok=True)
+        # os.makedirs(data_lake_dir, exist_ok=True)
 
-        expected_data_lake_files = list(data_lake_dict.keys())
+        # expected_data_lake_files = list(data_lake_dict.keys())
 
         # # Check and download missing data lake files
         # print("Checking and downloading missing data lake files...")
@@ -106,7 +106,7 @@ class A1:
         #         folder="benchmark",
         #     )
 
-        self.path = os.path.join(path, "biodatalab_data")
+        # self.path = os.path.join(path, "biodatalab_data")
         module2api = read_biodatalab_module2api()
 
         self.llm = get_llm(
@@ -1102,7 +1102,7 @@ Each library is listed with its description to help you understand its functiona
             "function_intro": function_intro,
             "tool_desc": textify_api_dict(tool_desc) if isinstance(tool_desc, dict) else tool_desc,
             "import_instruction": import_instruction,
-            "data_lake_path": self.path + "/data_lake",
+            "data_lake_path": self.path + "/database_lake",
             "data_lake_intro": data_lake_intro,
             "data_lake_content": data_lake_content_formatted,
             "library_intro": library_intro,
@@ -1133,7 +1133,7 @@ Each library is listed with its description to help you understand its functiona
         self.self_critic = self_critic
 
         # Get data lake content
-        data_lake_path = self.path + "/data_lake"
+        data_lake_path = self.path + "/database_lake"
         data_lake_content = glob.glob(data_lake_path + "/*")
         data_lake_items = [x.split("/")[-1] for x in data_lake_content]
 
@@ -1287,6 +1287,8 @@ Each library is listed with its description to help you understand its functiona
                     or code.strip().startswith("# R script")
                 ):
                     # Remove the R marker and run as R code
+                    print('----------------- excute R step -----------------')
+
                     r_code = re.sub(r"^#!R|^# R code|^# R script", "", code, 1).strip()  # noqa: B034
                     result = run_with_timeout(run_r_code, [r_code], timeout=timeout)
                 # Check if the code is a Bash script or CLI command
@@ -1295,6 +1297,7 @@ Each library is listed with its description to help you understand its functiona
                     or code.strip().startswith("# Bash script")
                     or code.strip().startswith("#!CLI")
                 ):
+                    print('----------------- excute bash/cli step -----------------')
                     # Handle both Bash scripts and CLI commands with the same function
                     if code.strip().startswith("#!CLI"):
                         # For CLI commands, extract the command and run it as a simple bash script
@@ -1432,7 +1435,7 @@ Each library is listed with its description to help you understand its functiona
             all_tools = self.tool_registry.tools if hasattr(self, "tool_registry") else []
 
             # 2. Data lake items with descriptions
-            data_lake_path = self.path + "/data_lake"
+            data_lake_path = self.path + "/database_lake"
             data_lake_content = glob.glob(data_lake_path + "/*")
             data_lake_items = [x.split("/")[-1] for x in data_lake_content]
 
