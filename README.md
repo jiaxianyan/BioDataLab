@@ -20,28 +20,43 @@ pip install biomni --upgrade
 ```
 
 ### Basic Usage of BioDataLab
+
+```bash
+export PYTHONPATH=./
+python run_evaluate_case.py
+```
+
 ```python
-# test task 
-# "Filter sequences with 16-2700 residues in the uniprot_sprot.fasta 
-# and save to data/biodatalab_data/benchmark/results/1/uniprot_sprot_16_2700.fasta"
+
+# download SRR runs of NCBI GEO samples.
 import os, yaml
 from assistant.agent import A1
-from data.biodatalab_data.benchmark.eval_tools.eval import eval_1
+from data.biodatalab_data.benchmark.eval_tools.eval_interface import eval_tool_dict
 
-agent = A1(path='./data', llm='gpt-4.1', debug=False)
-task_dir = 'data/biodatalab_data/benchmark/tasks'
-benchmark_task_files = os.listdir(task_dir)
-task = '1.yaml'
-# for task in benchmark_task_files:
-
-with open(os.path.join(task_dir, task), 'r') as f:
+agent = A1(path='./operation_env', llm='gpt-4.1', debug=False)
+t_yaml = 'data/biodatalab_data/benchmark/tasks/ASMdb/3.yaml'
+with open(t_yaml, 'r') as f:
     task_config = yaml.safe_load(f)
+
 print(task_config)
-agent.go(task_config['Task_description'])
-eval_res = eval_1(task_config['Output_data'], task_config['Ref_data'])
-if eval_res:
-    print('task 1 successes!')
+
+if len(task_config['Input_data']) == 0:
+    input_data_des = ''
 else:
-    print('task 1 fails!')
+    input_files = ','.join(task_config['Input_data'])
+    input_data_des = f'The input files to this task are: {input_files}\n'
+
+print('============================== Task description ==============================')
+print(input_data_des + task_config['Task_description'])
+agent.go(input_data_des + task_config['Task_description'])
+
+eval_func = eval_tool_dict[task_config['Evaluate_tool']]
+
+eval_res = eval_func(task_config['Output_data'], task_config['Ref_data'])
+
+if eval_res:
+    print(f'task {t_yaml} successes!')
+else:
+    print(f'task {t_yaml} fails!')
 ```
 
