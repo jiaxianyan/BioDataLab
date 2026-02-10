@@ -1,0 +1,1120 @@
+
+Perform a differential expression analysis for 6 DRX experiments in `benchmark/dataset/MetazExp/count`. 
+
+The basic information of the 6 DRX experiments is provided in `benchmark/dataset/MetazExp/sample_info.tsv`, which includes sample annotations specifying biological conditions (e.g., tissue, developmental stage) and study or batch identifiers.
+
+You must explicitly correct for study-specific batch effects by including the batch variable in the design formula (e.g., design = ~ batch + condition).
+
+Identify genes that are significantly differentially expressed in the target condition compared to all other conditions combined.
+
+Output the top 50 most significantly differentially expressed genes (ranked by adjusted p-value) to `/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/metazexp_annotate.tsv`.
+
+Output Format (Only for Reference):
+gene_id	baseMean	log2FoldChange	lfcSE	stat	pvalue	padj
+FBgnxxxx	1254.66665476386	-2.87772911936465	0.87905045247991	-27.2422049305457	2.05567383473253e-163	3.25310384346423e-159
+FBgnyyyy	52136.516872705251	-4.730648430188	0.676023255336235	-24.3843527676287	2.50655533940541e-131	1.98331191230453e-127
+
+All temp data should be save in `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/metazexp_annotate`.
+
+<execute>#!BASH
+set -euo pipefail
+
+echo "Research log: MetazExp DRX differential expression (DESeq2) with batch correction"
+
+# 1) Define paths
+COUNT_DIR="benchmark/dataset/MetazExp/count"
+SAMPLE_INFO="benchmark/dataset/MetazExp/sample_info.tsv"
+OUT_DIR="/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/metazexp_annotate"
+OUT_FILE="/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/metazexp_annotate.tsv"
+
+mkdir -p "$OUT_DIR"
+mkdir -p "$(dirname "$OUT_FILE")"
+
+echo "COUNT_DIR=$COUNT_DIR"
+echo "SAMPLE_INFO=$SAMPLE_INFO"
+echo "OUT_DIR=$OUT_DIR"
+echo "OUT_FILE=$OUT_FILE"
+
+# 2) Inspect input
+echo "Step 2: Inspect sample_info.tsv head and columns"
+head -n 5 "$SAMPLE_INFO" | sed 's/\t/ [TAB] /g'
+echo "Columns:"
+python - <<'PY'
+import pandas as pd
+df=pd.read_csv("benchmark/dataset/MetazExp/sample_info.tsv", sep="\t")
+print(df.columns.tolist())
+print("n_samples:", df.shape[0])
+print(df.head(3))
+PY
+
+echo "Step 2b: List count files (first 20)"
+ls -1 "$COUNT_DIR" | head -n 20
+
+# 3) Run DESeq2 for each DRX experiment (identified by study/accession-like column)
+# We'll determine key columns automatically: batch (study), condition (biological condition), sample (file mapping)
+echo "Step 3: Run DESeq2 in R; auto-detect metadata columns and perform one-vs-rest within each DRX experiment."
+
+Rscript - <<'RS'
+suppressPackageStartupMessages({
+  library(data.table)
+  library(DESeq2)
+})
+
+count_dir <- "benchmark/dataset/MetazExp/count"
+sample_info_path <- "benchmark/dataset/MetazExp/sample_info.tsv"
+out_dir <- "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/metazexp_annotate"
+
+dir.create(out_dir, recursive=TRUE, showWarnings=FALSE)
+
+# Load sample info
+si <- fread(sample_info_path)
+cat("Loaded sample_info:", nrow(si), "rows x", ncol(si), "cols\n")
+
+# Heuristics to find columns
+colnames_lower <- tolower(names(si))
+
+pick_col <- function(candidates) {
+  idx <- which(colnames_lower %in% candidates)
+  if (length(idx)>0) return(names(si)[idx[1]])
+  # partial match
+  for (cand in candidates) {
+    idx2 <- grep(cand, colnames_lower, fixed=TRUE)
+    if (length(idx2)>0) return(names(si)[idx2[1]])
+  }
+  return(NA_character_)
+}
+
+sample_col <- pick_col(c("sample","sample_id","run","srr","filename","file","library","lib"))
+batch_col  <- pick_col(c("batch","study","project","bioproject","sra_study","gse","series","experiment","drx","srx"))
+cond_col   <- pick_col(c("condition","tissue","stage","developmental_stage","celltype","group","annotation"))
+
+cat("Detected columns:\n")
+cat("  sample_col:", sample_col, "\n")
+cat("  batch_col :", batch_col, "\n")
+cat("  cond_col  :", cond_col, "\n")
+
+if (is.na(sample_col)) stop("Could not detect sample identifier column in sample_info.tsv")
+if (is.na(batch_col)) stop("Could not detect batch/study column in sample_info.tsv")
+if (is.na(cond_col)) stop("Could not detect condition column in sample_info.tsv")
+
+# Identify DRX experiments: if there is a 'drx' column use it; else group by batch_col as "experiment"
+drx_col <- pick_col(c("drx","experiment_accession","experiment","srx","run_experiment"))
+if (is.na(drx_col)) drx_col <- batch_col
+cat("Using experiment identifier column:", drx_col, "\n")
+
+# Map count files to samples: attempt direct match by basename without extension
+count_files <- list.files(count_dir, full.names=TRUE)
+bn <- basename(count_files)
+bn_noext <- sub("\\.[^.]*$", "", bn)
+
+# Build a lookup table of files
+file_dt <- data.table(file_path=count_files, base=bn_noext, file_name=bn)
+
+# Create sample_id match key
+si[, sample_key := as.character(get(sample_col))]
+# also allow matching to basename if sample_key includes path/ext
+si[, sample_key2 := sub("\\.[^.]*$", "", basename(sample_key))]
+
+# Join by sample_key2 to file_dt$base; fallback join by exact file_name
+m1 <- merge(si, file_dt, by.x="sample_key2", by.y="base", all.x=TRUE)
+missing <- m1[is.na(file_path), .N]
+cat("Samples with missing count file after basename match:", missing, "\n")
+if (missing>0) {
+  m2 <- merge(m1[is.na(file_path)], file_dt, by.x="sample_key", by.y="file_name", all.x=TRUE, suffixes=c("","_y"))
+  m1[is.na(file_path), file_path := m2$file_path]
+}
+missing2 <- m1[is.na(file_path), .N]
+cat("Samples with missing count file after fallback:", missing2, "\n")
+if (missing2>0) {
+  cat("Example missing samples:\n")
+  print(head(m1[is.na(file_path), .(sample_key, sample_key2)], 10))
+  stop("Could not map some samples to count files. Please check naming.")
+}
+
+# Subset to experiments with DRX-like identifiers: those starting with 'DRX' or exactly 6 unique
+exp_ids <- unique(m1[[drx_col]])
+drx_like <- exp_ids[grepl("^DRX", exp_ids)]
+if (length(drx_like) == 6) {
+  exp_use <- drx_like
+} else {
+  # If not DRX-prefixed, use first 6 unique experiment ids
+  exp_use <- head(exp_ids, 6)
+}
+cat("Experiments selected (n=", length(exp_use), "):\n", paste(exp_use, collapse=", "), "\n")
+
+# Helper to read counts from one file (assume two columns: gene + count, or tab-delimited with gene_id)
+read_count <- function(fp) {
+  dt <- fread(fp)
+  # gene id column
+  gcol <- which(tolower(names(dt)) %in% c("gene","gene_id","geneid","id"))
+  if (length(gcol)==0) gcol <- 1
+  ccol <- setdiff(seq_len(ncol(dt)), gcol)[1]
+  if (is.na(ccol)) stop("Count file has no count column: ", fp)
+  dt <- dt[, .(gene_id=as.character(dt[[gcol]]), count=as.integer(round(as.numeric(dt[[ccol]]))))]
+  return(dt)
+}
+
+all_results <- list()
+
+for (exp_id in exp_use) {
+  cat("\n--- Processing experiment:", exp_id, "---\n")
+  s_exp <- m1[get(drx_col)==exp_id]
+  cat("Samples in experiment:", nrow(s_exp), "\n")
+  # Ensure multiple batches exist for correction; if single batch, still include batch in design (will be non-estimable but DESeq2 handles via rank)
+  s_exp[, batch := as.factor(as.character(get(batch_col)))]
+  s_exp[, condition := as.factor(as.character(get(cond_col)))]
+  
+  # Read and combine counts
+  count_list <- lapply(s_exp$file_path, read_count)
+  genes <- Reduce(intersect, lapply(count_list, \(x) x$gene_id))
+  cat("Common genes across samples:", length(genes), "\n")
+  count_mat <- do.call(cbind, lapply(count_list, \(x) x[match(genes, x$gene_id), count]))
+  rownames(count_mat) <- genes
+  colnames(count_mat) <- s_exp$sample_key2
+  
+  coldata <- data.frame(
+    row.names = colnames(count_mat),
+    batch = s_exp$batch,
+    condition = s_exp$condition
+  )
+  
+  # For each condition level: target vs rest
+  for (target in levels(coldata$condition)) {
+    coldata$group <- factor(ifelse(coldata$condition==target, target, "other"),
+                            levels=c("other", target))
+    if (sum(coldata$group==target) < 2 || sum(coldata$group=="other") < 2) {
+      cat("Skip target", target, "(insufficient replicates):",
+          sum(coldata$group==target), "vs", sum(coldata$group=="other"), "\n")
+      next
+    }
+    dds <- DESeqDataSetFromMatrix(countData = count_mat,
+                                  colData = coldata,
+                                  design = ~ batch + group)
+    dds <- dds[rowSums(counts(dds)) > 5,]
+    dds <- DESeq(dds, quiet=TRUE)
+    res <- results(dds, contrast=c("group", target, "other"))
+    res_dt <- as.data.table(res, keep.rownames="gene_id")
+    setnames(res_dt, c("baseMean","log2FoldChange","lfcSE","stat","pvalue","padj"),
+             c("baseMean","log2FoldChange","lfcSE","stat","pvalue","padj"))
+    res_dt[, experiment := exp_id]
+    res_dt[, target_condition := target]
+    res_dt <- res_dt[!is.na(padj)]
+    setorder(res_dt, padj, pvalue)
+    top50 <- head(res_dt, 50)
+    out_fp <- file.path(out_dir, paste0(gsub("[^A-Za-z0-9._-]","_", exp_id), "__", 
+                                        gsub("[^A-Za-z0-9._-]","_", target), "__top50.tsv"))
+    fwrite(top50[, .(gene_id, baseMean, log2FoldChange, lfcSE, stat, pvalue, padj)], out_fp, sep="\t")
+    cat("Wrote:", out_fp, " (n=", nrow(top50), ")\n")
+    all_results[[paste0(exp_id,"|",target)]] <- top50
+  }
+}
+
+# Choose one "target condition" to report: most significant across all experiments/targets
+if (length(all_results)==0) stop("No comparisons produced (replicates may be insufficient).")
+best_key <- names(which.min(sapply(all_results, \(dt) min(dt$padj, na.rm=TRUE))))
+best <- all_results[[best_key]]
+cat("\nSelected best comparison:", best_key, "\n")
+cat("Best min padj:", min(best$padj, na.rm=TRUE), "\n")
+
+# Save as the required final file (top 50)
+final_path <- "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/metazexp_annotate.tsv"
+fwrite(best[, .(gene_id, baseMean, log2FoldChange, lfcSE, stat, pvalue, padj)], final_path, sep="\t")
+cat("FINAL written:", final_path, "\n")
+RS
+
+echo "Step 4: Show final output head"
+head -n 5 "$OUT_FILE" | sed 's/\t/ [TAB] /g'
+
+echo "Done."</execute>
+<observation>Error running Bash script (exit code 1):
+Error in library(DESeq2) : there is no package called ‘DESeq2’
+Calls: suppressPackageStartupMessages -> withCallingHandlers -> library
+In addition: Warning message:
+package ‘data.table’ was built under R version 4.4.3 
+Execution halted
+</observation>
+<execute>#!BASH
+set -euo pipefail
+
+echo "Thinking/reasoning:"
+echo "- DESeq2 is not available in this environment, and we must not install packages."
+echo "- We'll switch to limma-voom (available) to perform DE with an explicit batch term: ~ batch + group."
+echo "- We'll run one-vs-rest for each condition within each of 6 DRX experiments, then pick the most significant comparison overall and write its top50 to the required output."
+echo ""
+
+# Plan (checklist)
+cat <<'PLAN'
+1. [ ] Inspect sample_info.tsv and count files; detect key columns and map samples to count files
+2. [ ] Implement limma-voom DE with explicit batch correction (~ batch + group) for each DRX experiment and each target condition (target vs others)
+3. [ ] Select the most significant target-condition comparison and write top 50 genes to the required output path
+4. [ ] Save all intermediate outputs to the specified tmp directory and print a short run summary
+PLAN
+
+COUNT_DIR="benchmark/dataset/MetazExp/count"
+SAMPLE_INFO="benchmark/dataset/MetazExp/sample_info.tsv"
+TMP_DIR="/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/metazexp_annotate"
+OUT_FILE="/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/metazexp_annotate.tsv"
+mkdir -p "$TMP_DIR" "$(dirname "$OUT_FILE")"
+
+echo ""
+echo "Step 1: Inspect sample_info.tsv and count directory"
+head -n 5 "$SAMPLE_INFO" | sed 's/\t/ [TAB] /g'
+echo "Count files (first 10):"
+ls -1 "$COUNT_DIR" | head -n 10
+
+cat <<'PLAN'
+1. [✓] Inspect sample_info.tsv and count files; detect key columns and map samples to count files
+2. [ ] Implement limma-voom DE with explicit batch correction (~ batch + group) for each DRX experiment and each target condition (target vs others)
+3. [ ] Select the most significant target-condition comparison and write top 50 genes to the required output path
+4. [ ] Save all intermediate outputs to the specified tmp directory and print a short run summary
+PLAN
+
+echo ""
+echo "Step 2-4: Run limma-voom DE in R with batch correction and write outputs"
+
+Rscript - <<'RS'
+suppressPackageStartupMessages({
+  library(data.table)
+  library(limma)
+  library(edgeR)
+})
+
+count_dir <- "benchmark/dataset/MetazExp/count"
+sample_info_path <- "benchmark/dataset/MetazExp/sample_info.tsv"
+tmp_dir <- "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/metazexp_annotate"
+final_out <- "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/metazexp_annotate.tsv"
+dir.create(tmp_dir, recursive=TRUE, showWarnings=FALSE)
+dir.create(dirname(final_out), recursive=TRUE, showWarnings=FALSE)
+
+si <- fread(sample_info_path)
+cat("Loaded sample_info:", nrow(si), "rows x", ncol(si), "cols\n")
+
+cn_low <- tolower(names(si))
+pick_col <- function(cands){
+  idx <- which(cn_low %in% cands)
+  if (length(idx)>0) return(names(si)[idx[1]])
+  for (cand in cands){
+    idx2 <- grep(cand, cn_low, fixed=TRUE)
+    if (length(idx2)>0) return(names(si)[idx2[1]])
+  }
+  NA_character_
+}
+
+sample_col <- pick_col(c("sample","sample_id","run","srr","filename","file","library","lib"))
+batch_col  <- pick_col(c("batch","study","project","bioproject","sra_study","gse","series"))
+cond_col   <- pick_col(c("condition","tissue","stage","developmental_stage","celltype","group","annotation"))
+drx_col    <- pick_col(c("drx","experiment_accession","experiment","srx"))
+
+cat("Detected columns:\n",
+    " sample_col=", sample_col, "\n",
+    " batch_col =", batch_col,  "\n",
+    " cond_col  =", cond_col,   "\n",
+    " drx_col   =", drx_col,    "\n", sep="")
+
+if (is.na(sample_col)) stop("Could not detect sample identifier column.")
+if (is.na(batch_col)) stop("Could not detect batch/study column.")
+if (is.na(cond_col)) stop("Could not detect condition column.")
+if (is.na(drx_col)) drx_col <- batch_col
+
+count_files <- list.files(count_dir, full.names=TRUE)
+bn <- basename(count_files)
+bn_noext <- sub("\\.[^.]*$", "", bn)
+file_dt <- data.table(file_path=count_files, base=bn_noext, file_name=bn)
+
+si[, sample_key := as.character(get(sample_col))]
+si[, sample_key2 := sub("\\.[^.]*$", "", basename(sample_key))]
+m1 <- merge(si, file_dt, by.x="sample_key2", by.y="base", all.x=TRUE)
+
+if (m1[is.na(file_path), .N] > 0) {
+  miss <- m1[is.na(file_path)]
+  m2 <- merge(miss, file_dt, by.x="sample_key", by.y="file_name", all.x=TRUE)
+  m1[is.na(file_path), file_path := m2$file_path]
+}
+if (m1[is.na(file_path), .N] > 0) {
+  cat("Unmapped samples example:\n")
+  print(head(m1[is.na(file_path), .(sample_key, sample_key2)], 10))
+  stop("Failed to map some samples to count files.")
+}
+
+exp_ids <- unique(m1[[drx_col]])
+drx_like <- exp_ids[grepl("^DRX", exp_ids)]
+exp_use <- if (length(drx_like) >= 6) head(drx_like, 6) else head(exp_ids, 6)
+cat("Selected experiments (n=", length(exp_use), "): ", paste(exp_use, collapse=", "), "\n", sep="")
+
+read_count <- function(fp){
+  dt <- fread(fp)
+  gcol <- which(tolower(names(dt)) %in% c("gene","gene_id","geneid","id"))
+  if (length(gcol)==0) gcol <- 1
+  ccol <- setdiff(seq_len(ncol(dt)), gcol)[1]
+  if (is.na(ccol)) stop("No count column in: ", fp)
+  dt <- dt[, .(gene_id=as.character(dt[[gcol]]),
+               count=as.numeric(dt[[ccol]]))]
+  dt[is.na(count), count := 0]
+  dt[, count := as.integer(round(count))]
+  dt
+}
+
+all_top50 <- list()
+all_minpadj <- data.table(key=character(), min_padj=numeric())
+
+for (exp_id in exp_use) {
+  cat("\n--- Experiment:", exp_id, "---\n")
+  s_exp <- m1[get(drx_col)==exp_id]
+  cat("Samples:", nrow(s_exp), "\n")
+  s_exp[, batch := factor(as.character(get(batch_col)))]
+  s_exp[, condition := factor(as.character(get(cond_col)))]
+
+  cl <- lapply(s_exp$file_path, read_count)
+  genes <- Reduce(intersect, lapply(cl, \(x) x$gene_id))
+  cat("Common genes:", length(genes), "\n")
+  if (length(genes) < 1000) cat("WARNING: low number of intersected genes; check count file formats.\n")
+
+  count_mat <- do.call(cbind, lapply(cl, \(x) x[match(genes, x$gene_id), count]))
+  rownames(count_mat) <- genes
+  colnames(count_mat) <- s_exp$sample_key2
+
+  coldata <- data.frame(row.names=colnames(count_mat),
+                        batch=s_exp$batch,
+                        condition=s_exp$condition)
+
+  for (target in levels(coldata$condition)) {
+    group <- factor(ifelse(coldata$condition==target, target, "other"),
+                    levels=c("other", target))
+    n_t <- sum(group==target); n_o <- sum(group=="other")
+    if (n_t < 2 || n_o < 2) {
+      cat("Skip target=", target, " (replicates: ", n_t, " vs ", n_o, ")\n", sep="")
+      next
+    }
+
+    dge <- DGEList(counts=count_mat)
+    keep <- filterByExpr(dge, group=group)
+    dge <- dge[keep,, keep.lib.sizes=FALSE]
+    dge <- calcNormFactors(dge)
+
+    design <- model.matrix(~ batch + group, data=data.frame(batch=coldata$batch, group=group))
+    v <- voom(dge, design, plot=FALSE)
+    fit <- lmFit(v, design)
+    fit <- eBayes(fit)
+
+    coef_name <- paste0("group", target)
+    if (!(coef_name %in% colnames(design))) {
+      # fallback: use last coefficient
+      coef_name <- colnames(design)[ncol(design)]
+    }
+    tt <- topTable(fit, coef=coef_name, number=Inf, sort.by="P")
+
+    # limma columns: logFC, AveExpr, t, P.Value, adj.P.Val, B
+    # Map to required output format as closely as possible:
+    # baseMean ~ 2^(AveExpr) (approx on log2-CPM scale); stat ~ t
+    res <- data.table(
+      gene_id = rownames(tt),
+      baseMean = 2^(tt$AveExpr),
+      log2FoldChange = tt$logFC,
+      lfcSE = NA_real_,
+      stat = tt$t,
+      pvalue = tt$P.Value,
+      padj = tt$adj.P.Val
+    )
+    res <- res[!is.na(padj)]
+    setorder(res, padj, pvalue)
+
+    top50 <- head(res, 50)
+    key <- paste0(exp_id, "|", target)
+    all_top50[[key]] <- top50
+    all_minpadj <- rbind(all_minpadj, data.table(key=key, min_padj=min(top50$padj, na.rm=TRUE)))
+
+    out_fp <- file.path(tmp_dir, paste0(gsub("[^A-Za-z0-9._-]","_", exp_id),
+                                        "__", gsub("[^A-Za-z0-9._-]","_", target),
+                                        "__top50_voom.tsv"))
+    fwrite(top50, out_fp, sep="\t")
+    cat("Wrote tmp:", out_fp, " n=", nrow(top50), " minpadj=", min(top50$padj, na.rm=TRUE), "\n", sep="")
+  }
+}
+
+if (nrow(all_minpadj)==0) stop("No valid comparisons produced (likely insufficient replicates).")
+best_key <- all_minpadj[which.min(min_padj), key]
+cat("\nSelected best comparison:", best_key, " with min padj=", all_minpadj[key==best_key, min_padj], "\n", sep="")
+best <- all_top50[[best_key]]
+
+fwrite(best, final_out, sep="\t")
+cat("FINAL written:", final_out, " (n=", nrow(best), ")\n", sep="")
+
+# also save summary
+fwrite(all_minpadj[order(min_padj)], file.path(tmp_dir, "comparison_min_padj_summary.tsv"), sep="\t")
+RS
+
+echo ""
+echo "Updated plan:"
+cat <<'PLAN'
+1. [✓] Inspect sample_info.tsv and count files; detect key columns and map samples to count files
+2. [✓] Implement limma-voom DE with explicit batch correction (~ batch + group) for each DRX experiment and each target condition (target vs others)
+3. [✓] Select the most significant target-condition comparison and write top 50 genes to the required output path
+4. [✓] Save all intermediate outputs to the specified tmp directory and print a short run summary
+PLAN
+
+echo ""
+echo "Final output preview:"
+head -n 5 "$OUT_FILE" | sed 's/\t/ [TAB] /g'
+echo ""
+echo "Tmp directory contents (first 10):"
+ls -1 "$TMP_DIR" | head -n 10
+</execute>
+<observation>Error running Bash script (exit code 1):
+Error in library(limma) : there is no package called ‘limma’
+Calls: suppressPackageStartupMessages -> withCallingHandlers -> library
+In addition: Warning message:
+package ‘data.table’ was built under R version 4.4.3 
+Execution halted
+</observation>
+<execute>#!BASH
+set -euo pipefail
+
+echo "Thinking/reasoning:"
+echo "- R/Bioconductor packages (DESeq2, limma) are unavailable and we must not install anything."
+echo "- We'll implement differential expression directly in Python using a per-gene negative binomial GLM:"
+echo "    log(mu) = intercept + batch + group(target vs other)"
+echo "- We'll explicitly include batch in the design matrix to correct study-specific effects."
+echo "- We'll run one-vs-rest per condition within each of 6 DRX experiments, then pick the comparison with the smallest adjusted p-value and write its top 50."
+echo ""
+
+# Plan (checklist)
+cat <<'PLAN'
+1. [ ] Inspect sample_info.tsv and count files; detect key columns and map samples to count files
+2. [ ] For each of 6 DRX experiments, run per-gene NB-GLM with design = batch + group (target vs rest); compute BH-adjusted p-values
+3. [ ] Select the most significant target-condition comparison and write top 50 genes to the required output path; save all intermediate outputs in tmp dir
+PLAN
+
+COUNT_DIR="benchmark/dataset/MetazExp/count"
+SAMPLE_INFO="benchmark/dataset/MetazExp/sample_info.tsv"
+TMP_DIR="/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/metazexp_annotate"
+OUT_FILE="/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/metazexp_annotate.tsv"
+mkdir -p "$TMP_DIR" "$(dirname "$OUT_FILE")"
+
+echo ""
+echo "Step 1: Inspect inputs"
+head -n 5 "$SAMPLE_INFO" | sed 's/\t/ [TAB] /g'
+echo "Count files (first 10):"
+ls -1 "$COUNT_DIR" | head -n 10
+
+cat <<'PLAN'
+1. [✓] Inspect sample_info.tsv and count files; detect key columns and map samples to count files
+2. [ ] For each of 6 DRX experiments, run per-gene NB-GLM with design = batch + group (target vs rest); compute BH-adjusted p-values
+3. [ ] Select the most significant target-condition comparison and write top 50 genes to the required output path; save all intermediate outputs in tmp dir
+PLAN
+
+echo ""
+echo "Step 2-3: Run Python NB-GLM DE with explicit batch correction"
+python - <<'PY'
+import os, re, glob
+import numpy as np
+import pandas as pd
+
+COUNT_DIR="benchmark/dataset/MetazExp/count"
+SAMPLE_INFO="benchmark/dataset/MetazExp/sample_info.tsv"
+TMP_DIR="/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/metazexp_annotate"
+OUT_FILE="/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/metazexp_annotate.tsv"
+os.makedirs(TMP_DIR, exist_ok=True)
+os.makedirs(os.path.dirname(OUT_FILE), exist_ok=True)
+
+print("Research log: Python NB-GLM DE (batch-corrected)")
+
+si = pd.read_csv(SAMPLE_INFO, sep="\t")
+cols = list(si.columns)
+cols_low = [c.lower() for c in cols]
+print("sample_info columns:", cols)
+
+def pick(cands):
+    for c in cands:
+        if c in cols_low:
+            return cols[cols_low.index(c)]
+    for c in cands:
+        for i,cl in enumerate(cols_low):
+            if c in cl:
+                return cols[i]
+    return None
+
+sample_col = pick(["sample","sample_id","run","srr","filename","file","library","lib"])
+batch_col  = pick(["batch","study","project","bioproject","sra_study","gse","series"])
+cond_col   = pick(["condition","tissue","stage","developmental_stage","celltype","group","annotation"])
+drx_col    = pick(["drx","experiment_accession","experiment","srx"])
+
+print("Detected:", {"sample_col":sample_col,"batch_col":batch_col,"cond_col":cond_col,"drx_col":drx_col})
+if sample_col is None: raise SystemExit("Could not detect sample identifier column.")
+if batch_col is None:  raise SystemExit("Could not detect batch/study column.")
+if cond_col is None:   raise SystemExit("Could not detect condition column.")
+if drx_col is None:    drx_col = batch_col
+
+# map count files
+files = sorted(glob.glob(os.path.join(COUNT_DIR, "*")))
+bn = [os.path.basename(f) for f in files]
+bn_noext = [re.sub(r"\.[^.]+$","",b) for b in bn]
+file_map = {b:f for b,f in zip(bn_noext, files)}
+file_map2 = {b:f for b,f in zip(bn, files)}
+
+def keyify(x):
+    x=str(x)
+    x2=os.path.basename(x)
+    x2=re.sub(r"\.[^.]+$","",x2)
+    return x2
+
+si["sample_key2"] = si[sample_col].map(keyify)
+si["file_path"] = si["sample_key2"].map(file_map)
+miss = si["file_path"].isna().sum()
+if miss:
+    # fallback exact filename
+    si.loc[si["file_path"].isna(), "file_path"] = si.loc[si["file_path"].isna(), sample_col].astype(str).map(lambda s: file_map2.get(os.path.basename(s), np.nan))
+miss2 = si["file_path"].isna().sum()
+print("Missing mapped count files:", miss2)
+if miss2:
+    print(si.loc[si["file_path"].isna(), [sample_col,"sample_key2"]].head(10))
+    raise SystemExit("Failed to map some samples to count files.")
+
+exp_ids = si[drx_col].astype(str).unique().tolist()
+drx_like = [e for e in exp_ids if e.startswith("DRX")]
+exp_use = drx_like[:6] if len(drx_like)>=6 else exp_ids[:6]
+print("Selected experiments:", exp_use)
+
+# lightweight NB-GLM using statsmodels if available; otherwise fallback to Poisson with robust SE
+try:
+    import statsmodels.api as sm
+    have_sm = True
+    print("statsmodels available: yes")
+except Exception as e:
+    have_sm = False
+    print("statsmodels available: no -> fallback Poisson; error:", e)
+
+def bh(p):
+    p=np.asarray(p, float)
+    n=p.size
+    o=np.argsort(p)
+    ro=np.empty(n,int); ro[o]=np.arange(n)
+    q=np.minimum.accumulate((p[o]*n)/(np.arange(n)+1)[::-1])[::-1]
+    q=np.clip(q,0,1)
+    return q[ro]
+
+def read_counts(fp):
+    df=pd.read_csv(fp, sep=None, engine="python")
+    # pick gene column
+    low=[c.lower() for c in df.columns]
+    gcol = next((c for c in df.columns if c.lower() in ("gene","gene_id","geneid","id")), df.columns[0])
+    # pick count column
+    other=[c for c in df.columns if c!=gcol]
+    if not other: raise ValueError(f"No count column in {fp}")
+    ccol=other[0]
+    out=df[[gcol, ccol]].copy()
+    out.columns=["gene_id","count"]
+    out["gene_id"]=out["gene_id"].astype(str)
+    out["count"]=pd.to_numeric(out["count"], errors="coerce").fillna(0).round().astype(int)
+    return out
+
+all_best = None
+all_best_key = None
+all_best_minpadj = np.inf
+summary_rows=[]
+
+for exp in exp_use:
+    sdf = si.loc[si[drx_col].astype(str)==str(exp)].copy()
+    print(f"\n--- Experiment {exp}: n_samples={len(sdf)} ---")
+    # load counts and intersect genes
+    count_list=[read_counts(fp) for fp in sdf["file_path"]]
+    genes=set(count_list[0]["gene_id"])
+    for d in count_list[1:]:
+        genes &= set(d["gene_id"])
+    genes=sorted(genes)
+    print("Common genes:", len(genes))
+    mat=np.vstack([d.set_index("gene_id").loc[genes,"count"].to_numpy() for d in count_list]).T  # genes x samples
+    sample_names=sdf["sample_key2"].tolist()
+
+    # covariates
+    batch = sdf[batch_col].astype(str).to_numpy()
+    cond  = sdf[cond_col].astype(str).to_numpy()
+    cond_levels = pd.unique(cond)
+
+    # size factors (median-of-ratios, DESeq-style)
+    gm = np.exp(np.mean(np.log(np.where(mat>0, mat, np.nan)), axis=1))
+    gm = np.where(np.isfinite(gm) & (gm>0), gm, np.nan)
+    ratios = mat / gm[:,None]
+    sf = np.nanmedian(ratios, axis=0)
+    sf = np.where(np.isfinite(sf) & (sf>0), sf, 1.0)
+    log_sf = np.log(sf)
+
+    # precompute batch dummies
+    batch_cat = pd.Categorical(batch)
+    B = pd.get_dummies(batch_cat, drop_first=True).to_numpy()
+    for target in cond_levels:
+        group = (cond==target).astype(int)  # 1 target, 0 other
+        n_t=group.sum(); n_o=len(group)-n_t
+        if n_t<2 or n_o<2:
+            continue
+
+        # design: intercept + batch_dummies + group
+        X = np.column_stack([np.ones(len(group)), B, group])
+        # coefficient index for group is last
+        beta_idx = X.shape[1]-1
+
+        # estimate gene-wise dispersion using method-of-moments on normalized counts
+        y = mat.astype(float)
+        norm = y / sf[None,:]
+        mu = norm.mean(axis=1)
+        var = norm.var(axis=1, ddof=1)
+        alpha = np.maximum((var - mu) / np.maximum(mu**2, 1e-8), 1e-8)  # NB2 dispersion
+        # cap extreme
+        alpha = np.minimum(alpha, 100.0)
+
+        # fit per gene
+        pvals=np.ones(len(genes), float)
+        lfc=np.zeros(len(genes), float)
+        lfcse=np.full(len(genes), np.nan)
+        stat=np.full(len(genes), np.nan)
+        baseMean = (y.mean(axis=1)).astype(float)
+
+        if have_sm:
+            for i in range(len(genes)):
+                yi = y[i,:]
+                try:
+                    model = sm.GLM(yi, X, family=sm.families.NegativeBinomial(alpha=alpha[i]), offset=log_sf)
+                    res = model.fit(maxiter=100, disp=0)
+                    b = res.params[beta_idx]
+                    se = res.bse[beta_idx]
+                    z = b/se if se>0 else np.nan
+                    p = res.pvalues[beta_idx]
+                    lfc[i] = b/np.log(2)
+                    lfcse[i]= se/np.log(2)
+                    stat[i]= z
+                    pvals[i]= p
+                except Exception:
+                    pvals[i]=1.0
+        else:
+            # Poisson fallback with robust SE
+            import numpy.linalg as la
+            for i in range(len(genes)):
+                yi=y[i,:]
+                # IRLS for poisson
+                eta = np.log(np.maximum(yi,0.1)) - log_sf
+                for _ in range(25):
+                    mu_i = np.exp(eta + log_sf)
+                    W = mu_i
+                    z = eta + (yi - mu_i)/np.maximum(mu_i,1e-8)
+                    XtW = X.T * W
+                    H = XtW @ X
+                    g = XtW @ (z - log_sf)
+                    try:
+                        eta_new = X @ la.solve(H, g)
+                    except Exception:
+                        break
+                    if np.max(np.abs(eta_new-eta))<1e-6:
+                        eta=eta_new; break
+                    eta=eta_new
+                mu_i = np.exp(eta + log_sf)
+                # sandwich var
+                W = mu_i
+                XtW = X.T * W
+                H = XtW @ X
+                try:
+                    Hinv = la.inv(H)
+                    resid = yi - mu_i
+                    meat = (X.T * (resid**2)) @ X
+                    V = Hinv @ meat @ Hinv
+                    se = np.sqrt(max(V[beta_idx,beta_idx], 1e-12))
+                    b = eta[beta_idx]
+                    z = b/se
+                    from math import erf, sqrt
+                    # normal approx
+                    p = 2*(1-0.5*(1+erf(abs(z)/sqrt(2))))
+                    lfc[i]=b/np.log(2); lfcse[i]=se/np.log(2); stat[i]=z; pvals[i]=p
+                except Exception:
+                    pvals[i]=1.0
+
+        padj = bh(pvals)
+        res = pd.DataFrame({
+            "gene_id": genes,
+            "baseMean": baseMean,
+            "log2FoldChange": lfc,
+            "lfcSE": lfcse,
+            "stat": stat,
+            "pvalue": pvals,
+            "padj": padj
+        }).sort_values(["padj","pvalue"], ascending=[True,True])
+
+        top50 = res.head(50).copy()
+        safe_exp=re.sub(r"[^A-Za-z0-9._-]","_",str(exp))
+        safe_tar=re.sub(r"[^A-Za-z0-9._-]","_",str(target))
+        out_tmp=os.path.join(TMP_DIR, f"{safe_exp}__{safe_tar}__top50_nbglm.tsv")
+        top50.to_csv(out_tmp, sep="\t", index=False)
+
+        minpadj = float(top50["padj"].min()) if len(top50) else 1.0
+        key=f"{exp}|{target}"
+        summary_rows.append((key,minpadj,len(sdf),int(n_t),int(n_o)))
+        if minpadj < all_best_minpadj:
+            all_best_minpadj = minpadj
+            all_best = top50
+            all_best_key = key
+
+# write summary + final
+summary=pd.DataFrame(summary_rows, columns=["comparison","min_padj_in_top50","n_samples","n_target","n_other"]).sort_values("min_padj_in_top50")
+summary.to_csv(os.path.join(TMP_DIR,"comparison_min_padj_summary.tsv"), sep="\t", index=False)
+
+if all_best is None:
+    raise SystemExit("No valid comparisons produced (likely insufficient replicates).")
+print("\nSelected best comparison:", all_best_key, "min_padj_in_top50=", all_best_minpadj)
+
+all_best.to_csv(OUT_FILE, sep="\t", index=False)
+print("FINAL written:", OUT_FILE, "n=", len(all_best))
+
+PY
+
+cat <<'PLAN'
+1. [✓] Inspect sample_info.tsv and count files; detect key columns and map samples to count files
+2. [✓] For each of 6 DRX experiments, run per-gene NB-GLM with design = batch + group (target vs rest); compute BH-adjusted p-values
+3. [✓] Select the most significant target-condition comparison and write top 50 genes to the required output path; save all intermediate outputs in tmp dir
+PLAN
+
+echo ""
+echo "Final output preview:"
+head -n 5 "$OUT_FILE" | sed 's/\t/ [TAB] /g'
+echo ""
+echo "Tmp directory contents (first 10):"
+ls -1 "$TMP_DIR" | head -n 10
+</execute>
+<observation>Error running Bash script (exit code 1):
+Could not detect sample identifier column.
+</observation>
+<execute>#!BASH
+set -euo pipefail
+
+echo "Thinking/reasoning:"
+echo "- The metadata column names in sample_info.tsv don't match our heuristics."
+echo "- We'll inspect the header to see exact column names, then update detection logic accordingly."
+echo ""
+
+cat <<'PLAN'
+1. [ ] Inspect sample_info.tsv header and example rows to identify the correct sample, batch, condition, and experiment/DRX columns
+2. [ ] Update the Python DE script to use the correct columns and rerun NB-GLM with design = batch + group
+3. [ ] Write final top50 table to the required output and save intermediate results in tmp dir
+PLAN
+
+echo ""
+echo "Step 1: Inspect sample_info.tsv structure"
+echo "Header:"
+head -n 1 benchmark/dataset/MetazExp/sample_info.tsv | sed 's/\t/\n/g' | nl -ba
+echo ""
+echo "First 3 rows (raw):"
+head -n 4 benchmark/dataset/MetazExp/sample_info.tsv | sed -n '2,4p' | sed 's/\t/ [TAB] /g'
+echo ""
+echo "First 3 rows (split columns):"
+python - <<'PY'
+import pandas as pd
+df=pd.read_csv("benchmark/dataset/MetazExp/sample_info.tsv", sep="\t")
+print("Columns:", df.columns.tolist())
+print("dtypes:\n", df.dtypes)
+print("\nHead(3):")
+print(df.head(3).to_string(index=False))
+PY
+
+cat <<'PLAN'
+1. [✓] Inspect sample_info.tsv header and example rows to identify the correct sample, batch, condition, and experiment/DRX columns
+2. [ ] Update the Python DE script to use the correct columns and rerun NB-GLM with design = batch + group
+3. [ ] Write final top50 table to the required output and save intermediate results in tmp dir
+PLAN
+</execute>
+<observation>Thinking/reasoning:
+- The metadata column names in sample_info.tsv don't match our heuristics.
+- We'll inspect the header to see exact column names, then update detection logic accordingly.
+
+1. [ ] Inspect sample_info.tsv header and example rows to identify the correct sample, batch, condition, and experiment/DRX columns
+2. [ ] Update the Python DE script to use the correct columns and rerun NB-GLM with design = batch + group
+3. [ ] Write final top50 table to the required output and save intermediate results in tmp dir
+
+Step 1: Inspect sample_info.tsv structure
+Header:
+     1	
+
+First 3 rows (raw):
+Study [TAB] Experiment [TAB] Source [TAB] Strain [TAB] Genotype [TAB] DevelopmentDevelopment [TAB] Tissue [TAB] TreatmentTreatment [TAB] Mapped Bases [TAB] SeqLen
+DRP006530 [TAB] DRX198149 [TAB] PMID:32865275 [TAB] / [TAB] UAS-bub3IR...UAS-bub3IR/en-GAL4 UAS-GFP;UAS-p35/+ [TAB] L3 [TAB] hemocyte [TAB] cancer-bearing [TAB] 22.50GB [TAB] PE150 [TAB]  [TAB]  [TAB]  [TAB] 
+DRP006530 [TAB] DRX198150 [TAB] PMID:32865275 [TAB] / [TAB] UAS-bub3IR...UAS-bub3IR/en-GAL4 UAS-GFP;UAS-p35/+ [TAB] L3 [TAB] hemocyte [TAB] cancer-bearing [TAB] 23.76GB [TAB] PE150 [TAB]  [TAB]  [TAB]  [TAB] 
+
+First 3 rows (split columns):
+Columns: ['Study', 'Experiment', 'Source', 'Strain', 'Genotype', 'DevelopmentDevelopment', 'Tissue', 'TreatmentTreatment', 'Mapped Bases', 'SeqLen']
+dtypes:
+ Study                      object
+Experiment                 object
+Source                     object
+Strain                     object
+Genotype                   object
+DevelopmentDevelopment     object
+Tissue                    float64
+TreatmentTreatment        float64
+Mapped Bases              float64
+SeqLen                    float64
+dtype: object
+
+Head(3):
+                                            Study Experiment   Source         Strain Genotype DevelopmentDevelopment  Tissue  TreatmentTreatment  Mapped Bases  SeqLen
+UAS-bub3IR...UAS-bub3IR/en-GAL4 UAS-GFP;UAS-p35/+         L3 hemocyte cancer-bearing  22.50GB                  PE150     NaN                 NaN           NaN     NaN
+UAS-bub3IR...UAS-bub3IR/en-GAL4 UAS-GFP;UAS-p35/+         L3 hemocyte cancer-bearing  23.76GB                  PE150     NaN                 NaN           NaN     NaN
+UAS-bub3IR...UAS-bub3IR/en-GAL4 UAS-GFP;UAS-p35/+         L3 hemocyte cancer-bearing  24.17GB                  PE150     NaN                 NaN           NaN     NaN
+1. [✓] Inspect sample_info.tsv header and example rows to identify the correct sample, batch, condition, and experiment/DRX columns
+2. [ ] Update the Python DE script to use the correct columns and rerun NB-GLM with design = batch + group
+3. [ ] Write final top50 table to the required output and save intermediate results in tmp dir
+</observation>
+<execute>#!BASH
+set -euo pipefail
+
+echo "Thinking/reasoning:"
+echo "- sample_info.tsv appears malformed for pandas: header line is blank in the file view, and rows have more fields than header."
+echo "- We'll robustly parse it with python csv, auto-detect delimiter, and recover the first non-empty header."
+echo "- Then rerun NB-GLM using: sample=Experiment (DRX), batch=Study, condition=combined(Tissue, DevelopmentDevelopment, TreatmentTreatment if present)."
+echo ""
+
+cat <<'PLAN'
+1. [ ] Robustly re-parse sample_info.tsv to a clean TSV with correct header/rows (and save to tmp)
+2. [ ] Map Experiment (DRX) to count files; build per-experiment datasets
+3. [ ] Run Python NB-GLM DE with explicit batch correction (~ batch + group) and write final top50 + intermediates
+PLAN
+
+python - <<'PY'
+import os, re, csv
+import pandas as pd
+
+inp="benchmark/dataset/MetazExp/sample_info.tsv"
+tmp_dir="/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/metazexp_annotate"
+os.makedirs(tmp_dir, exist_ok=True)
+clean_out=os.path.join(tmp_dir,"sample_info.cleaned.tsv")
+
+# read raw lines
+with open(inp, "r", encoding="utf-8", errors="replace") as f:
+    lines=f.read().splitlines()
+
+# find first non-empty line that looks like header (contains tabs and 'Study' and 'Experiment')
+hdr_idx=None
+for i,l in enumerate(lines[:50]):
+    if l.strip()=="":
+        continue
+    if ("Study" in l and "Experiment" in l and ("\t" in l or "," in l)):
+        hdr_idx=i
+        break
+if hdr_idx is None:
+    # fallback: first non-empty line
+    for i,l in enumerate(lines):
+        if l.strip():
+            hdr_idx=i
+            break
+header_line=lines[hdr_idx]
+delim="\t" if header_line.count("\t")>=header_line.count(",") else ","
+header=[h.strip() for h in header_line.split(delim)]
+header=[h if h!="" else f"col{j+1}" for j,h in enumerate(header)]
+
+rows=[]
+bad=0
+for l in lines[hdr_idx+1:]:
+    if not l.strip(): 
+        continue
+    parts=l.split(delim)
+    # pad or trim to header length
+    if len(parts)<len(header):
+        parts = parts + [""]*(len(header)-len(parts))
+    elif len(parts)>len(header):
+        # if extra columns, keep them by extending header once
+        if len(rows)==0:
+            extra=len(parts)-len(header)
+            header = header + [f"extra{j+1}" for j in range(extra)]
+        else:
+            parts=parts[:len(header)]
+            bad += 1
+    rows.append(parts)
+
+df=pd.DataFrame(rows, columns=header)
+# strip whitespace
+for c in df.columns:
+    df[c]=df[c].astype(str).str.strip()
+# drop obvious all-empty columns
+empty_cols=[c for c in df.columns if (df[c].replace({"nan":"","None":""})=="").all()]
+df=df.drop(columns=empty_cols)
+
+df.to_csv(clean_out, sep="\t", index=False)
+print("Wrote cleaned sample info:", clean_out)
+print("Cleaned shape:", df.shape)
+print("Columns:", df.columns.tolist())
+print("Head(3):")
+print(df.head(3).to_string(index=False))
+print("Bad trimmed rows due to too many fields:", bad)
+PY
+
+cat <<'PLAN'
+1. [✓] Robustly re-parse sample_info.tsv to a clean TSV with correct header/rows (and save to tmp)
+2. [ ] Map Experiment (DRX) to count files; build per-experiment datasets
+3. [ ] Run Python NB-GLM DE with explicit batch correction (~ batch + group) and write final top50 + intermediates
+PLAN
+</execute>
+<observation>Thinking/reasoning:
+- sample_info.tsv appears malformed for pandas: header line is blank in the file view, and rows have more fields than header.
+- We'll robustly parse it with python csv, auto-detect delimiter, and recover the first non-empty header.
+- Then rerun NB-GLM using: sample=Experiment (DRX), batch=Study, condition=combined(Tissue, DevelopmentDevelopment, TreatmentTreatment if present).
+
+1. [ ] Robustly re-parse sample_info.tsv to a clean TSV with correct header/rows (and save to tmp)
+2. [ ] Map Experiment (DRX) to count files; build per-experiment datasets
+3. [ ] Run Python NB-GLM DE with explicit batch correction (~ batch + group) and write final top50 + intermediates
+Wrote cleaned sample info: /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/metazexp_annotate/sample_info.cleaned.tsv
+Cleaned shape: (6, 10)
+Columns: ['Study', 'Experiment', 'Source', 'Strain', 'Genotype', 'DevelopmentDevelopment', 'Tissue', 'TreatmentTreatment', 'Mapped Bases', 'SeqLen']
+Head(3):
+    Study Experiment        Source Strain                                          Genotype DevelopmentDevelopment   Tissue TreatmentTreatment Mapped Bases SeqLen
+DRP006530  DRX198149 PMID:32865275      / UAS-bub3IR...UAS-bub3IR/en-GAL4 UAS-GFP;UAS-p35/+                     L3 hemocyte     cancer-bearing      22.50GB  PE150
+DRP006530  DRX198150 PMID:32865275      / UAS-bub3IR...UAS-bub3IR/en-GAL4 UAS-GFP;UAS-p35/+                     L3 hemocyte     cancer-bearing      23.76GB  PE150
+DRP006530  DRX198151 PMID:32865275      / UAS-bub3IR...UAS-bub3IR/en-GAL4 UAS-GFP;UAS-p35/+                     L3 hemocyte     cancer-bearing      24.17GB  PE150
+Bad trimmed rows due to too many fields: 0
+1. [✓] Robustly re-parse sample_info.tsv to a clean TSV with correct header/rows (and save to tmp)
+2. [ ] Map Experiment (DRX) to count files; build per-experiment datasets
+3. [ ] Run Python NB-GLM DE with explicit batch correction (~ batch + group) and write final top50 + intermediates
+</observation>
+<execute>#!BASH
+set -euo pipefail
+
+echo "Thinking/reasoning:"
+echo "- Cleaned sample_info has exactly 6 rows (the 6 DRX experiments)."
+echo "- Likely 1 sample per DRX, so DE within each DRX is impossible (no replicates; and 'target vs others' within a DRX can't be formed)."
+echo "- We'll verify count file availability and sample-to-file mapping; if indeed 1 sample/experiment, we cannot run valid DE as requested."
+echo ""
+
+cat <<'PLAN'
+1. [ ] Verify mapping of the 6 DRX Experiment IDs to count files and check if there are replicates per biological condition within each DRX
+2. [ ] If replicates exist after mapping, run Python NB-GLM DE with design = ~ batch + group; otherwise, stop with a clear explanation of why DE cannot be performed
+3. [ ] If runnable, write top50 DE genes to the requested output path and save intermediates
+PLAN
+
+python - <<'PY'
+import os, re, glob
+import pandas as pd
+
+COUNT_DIR="benchmark/dataset/MetazExp/count"
+CLEAN_INFO="/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/metazexp_annotate/sample_info.cleaned.tsv"
+
+si=pd.read_csv(CLEAN_INFO, sep="\t")
+print("Clean sample_info shape:", si.shape)
+print(si[["Study","Experiment","DevelopmentDevelopment","Tissue","TreatmentTreatment"]])
+
+# map count files by basename
+files=sorted(glob.glob(os.path.join(COUNT_DIR,"*")))
+bn=[os.path.basename(f) for f in files]
+bn_noext=[re.sub(r"\.[^.]+$","",b) for b in bn]
+file_map={k:f for k,f in zip(bn_noext, files)}
+file_map2={k:f for k,f in zip(bn, files)}
+
+def map_file(exp):
+    exp=str(exp)
+    if exp in file_map: return file_map[exp]
+    if exp in file_map2: return file_map2[exp]
+    # try contains
+    for k,f in file_map.items():
+        if exp in k: return f
+    return None
+
+si["file_path"]=si["Experiment"].map(map_file)
+print("\nMapped count files:", si["file_path"].notna().sum(), "of", len(si))
+if si["file_path"].isna().any():
+    print("Unmapped experiments:", si.loc[si["file_path"].isna(),"Experiment"].tolist())
+
+# check replicates per experiment and per condition
+si["condition"] = (
+    si["Tissue"].astype(str).fillna("") + "|" +
+    si["DevelopmentDevelopment"].astype(str).fillna("") + "|" +
+    si["TreatmentTreatment"].astype(str).fillna("")
+)
+print("\nCounts per Experiment (should be >=2 for DE within experiment):")
+print(si.groupby("Experiment").size())
+print("\nCounts per condition across all samples:")
+print(si.groupby("condition").size().sort_values(ascending=False).head(20))
+
+# assess feasibility for requested analysis "for 6 DRX experiments"
+feasible = (si.groupby("Experiment").size()>=4).any()
+print("\nFeasibility check (need >=2 target and >=2 other within each experiment for one-vs-rest):")
+for exp, sdf in si.groupby("Experiment"):
+    n=len(sdf)
+    conds=sdf["condition"].unique()
+    print(f"  {exp}: n_samples={n}, n_conditions={len(conds)}")
+
+PY
+
+cat <<'PLAN'
+1. [✓] Verify mapping of the 6 DRX Experiment IDs to count files and check if there are replicates per biological condition within each DRX
+2. [ ] If replicates exist after mapping, run Python NB-GLM DE with design = ~ batch + group; otherwise, stop with a clear explanation of why DE cannot be performed
+3. [ ] If runnable, write top50 DE genes to the requested output path and save intermediates
+PLAN
+</execute>
+<observation>Thinking/reasoning:
+- Cleaned sample_info has exactly 6 rows (the 6 DRX experiments).
+- Likely 1 sample per DRX, so DE within each DRX is impossible (no replicates; and 'target vs others' within a DRX can't be formed).
+- We'll verify count file availability and sample-to-file mapping; if indeed 1 sample/experiment, we cannot run valid DE as requested.
+
+1. [ ] Verify mapping of the 6 DRX Experiment IDs to count files and check if there are replicates per biological condition within each DRX
+2. [ ] If replicates exist after mapping, run Python NB-GLM DE with design = ~ batch + group; otherwise, stop with a clear explanation of why DE cannot be performed
+3. [ ] If runnable, write top50 DE genes to the requested output path and save intermediates
+Clean sample_info shape: (6, 10)
+       Study Experiment DevelopmentDevelopment    Tissue  TreatmentTreatment
+0  DRP006530  DRX198149                     L3  hemocyte      cancer-bearing
+1  DRP006530  DRX198150                     L3  hemocyte      cancer-bearing
+2  DRP006530  DRX198151                     L3  hemocyte      cancer-bearing
+3  DRP006530  DRX198152                     L3  hemocyte  non-cancer control
+4  DRP006530  DRX198153                     L3  hemocyte  non-cancer control
+5  DRP006530  DRX198154                     L3  hemocyte  non-cancer control
+
+Mapped count files: 6 of 6
+
+Counts per Experiment (should be >=2 for DE within experiment):
+Experiment
+DRX198149    1
+DRX198150    1
+DRX198151    1
+DRX198152    1
+DRX198153    1
+DRX198154    1
+dtype: int64
+
+Counts per condition across all samples:
+condition
+hemocyte|L3|cancer-bearing        3
+hemocyte|L3|non-cancer control    3
+dtype: int64
+
+Feasibility check (need >=2 target and >=2 other within each experiment for one-vs-rest):
+  DRX198149: n_samples=1, n_conditions=1
+  DRX198150: n_samples=1, n_conditions=1
+  DRX198151: n_samples=1, n_conditions=1
+  DRX198152: n_samples=1, n_conditions=1
+  DRX198153: n_samples=1, n_conditions=1
+  DRX198154: n_samples=1, n_conditions=1
+1. [✓] Verify mapping of the 6 DRX Experiment IDs to count files and check if there are replicates per biological condition within each DRX
+2. [ ] If replicates exist after mapping, run Python NB-GLM DE with design = ~ batch + group; otherwise, stop with a clear explanation of why DE cannot be performed
+3. [ ] If runnable, write top50 DE genes to the requested output path and save intermediates
+</observation>
+<solution>
+Thinking/reasoning:
+- The cleaned metadata shows 6 samples total, one per DRX experiment (DRX198149–DRX198154).
+- The requested analysis is “for 6 DRX experiments” and “identify genes DE in the target condition compared to all other conditions combined” while correcting batch with design = ~ batch + condition.
+- However, within each DRX experiment there is only 1 sample, so a within-experiment “target vs others” comparison is impossible (no “others” and no replicates).
+- Additionally, all 6 samples come from a single Study (DRP006530), so there is no study/batch variation to correct; including batch in the design would be non-identifiable anyway (batch has only one level).
+
+Plan (updated checklist)
+1. [✓] Verify mapping of the 6 DRX Experiment IDs to count files and check if there are replicates per biological condition within each DRX
+2. [✗] If replicates exist after mapping, run DE with design = ~ batch + group (failed because each DRX has only 1 sample; and batch has only one level across all samples)
+3. [ ] If runnable, write top50 DE genes to the requested output path (not possible under the constraints)
+
+What I found (from sample_info.cleaned.tsv):
+- 6 DRX experiments each have exactly 1 sample:
+  - DRX198149 (cancer-bearing)
+  - DRX198150 (cancer-bearing)
+  - DRX198151 (cancer-bearing)
+  - DRX198152 (non-cancer control)
+  - DRX198153 (non-cancer control)
+  - DRX198154 (non-cancer control)
+- All belong to the same Study (DRP006530).
+- Count files for all 6 DRX IDs are present and mapped correctly.
+
+Why the requested DE can’t be performed as stated:
+- “Target condition vs all other conditions” requires at least 2 groups within the analyzed dataset. For each DRX experiment there is only one sample, so no contrast can be formed.
+- Batch correction via design = ~ batch + condition requires batch to have ≥2 levels; here Study has only one level.
+
+Next step needed to proceed:
+- Clarify whether DE should be performed across the 6 samples together (cancer-bearing vs non-cancer control) rather than “within each DRX experiment”. If so, DE is feasible (3 vs 3), but batch correction by Study is not possible with only one study; you would need ≥2 studies/batches (or a different batch variable) to satisfy the explicit batch-correction requirement.
+</solution>

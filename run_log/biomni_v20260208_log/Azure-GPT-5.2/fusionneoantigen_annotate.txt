@@ -1,0 +1,185 @@
+Extract a fusion junction peptide sequence. 
+
+Given a full-length fusion protein sequence in `benchmark/dataset/FusionNeoAntigen/full_fusion_protein.fasta` and a breakpoint coordinate in `benchmark/dataset/FusionNeoAntigen/breakpoint.txt`, extract a 27-amino-acid peptide centered on the breakpoint. 
+
+The peptide should consist of 13 amino acids upstream of the breakpoint, the breakpoint amino acid itself, and 13 amino acids downstream. 
+
+Save the resulting peptide sequence in FASTA format to `/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/fusionneoantigen_annotate.fasta`. 
+
+All intermediate files generated during the extraction process should be stored in `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/fusionneoantigen_annotate/`.
+
+<execute>
+import os
+from pathlib import Path
+from Bio import SeqIO
+
+print("Research log: Fusion junction peptide extraction (27aa centered on breakpoint)")
+
+# Paths
+fasta_path = Path("benchmark/dataset/FusionNeoAntigen/full_fusion_protein.fasta")
+breakpoint_path = Path("benchmark/dataset/FusionNeoAntigen/breakpoint.txt")
+
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/fusionneoantigen_annotate/")
+out_fasta = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/fusionneoantigen_annotate.fasta")
+
+tmp_dir.mkdir(parents=True, exist_ok=True)
+out_fasta.parent.mkdir(parents=True, exist_ok=True)
+
+plan = [
+    "Inspect input FASTA and breakpoint file; parse the breakpoint coordinate and sequence.",
+    "Compute the 27-aa peptide (13 upstream + breakpoint aa + 13 downstream), handling 1-based vs 0-based carefully.",
+    "Write intermediate artifacts (parsed inputs and computed indices) into tmp directory.",
+    "Save resulting peptide to the requested output FASTA."
+]
+
+def print_plan(status):
+    for i, step in enumerate(plan, 1):
+        mark = status.get(i, " ")
+        print(f"{i}. [{mark}] {step}")
+        
+status = {i:" " for i in range(1, len(plan)+1)}
+print("\nPlan checklist:")
+print_plan(status)
+
+# Step 1: read fasta and breakpoint
+print("\nStep 1: Reading inputs...")
+records = list(SeqIO.parse(str(fasta_path), "fasta"))
+if len(records) != 1:
+    raise ValueError(f"Expected exactly 1 FASTA record, found {len(records)}")
+rec = records[0]
+seq = str(rec.seq)
+seq_len = len(seq)
+
+bp_raw = breakpoint_path.read_text().strip()
+print(f"Breakpoint raw text: {bp_raw!r}")
+
+# Parse breakpoint: support "123", "breakpoint=123", "pos:123" etc.
+import re
+m = re.search(r"(-?\d+)", bp_raw)
+if not m:
+    raise ValueError("Could not find an integer breakpoint coordinate in breakpoint.txt")
+bp = int(m.group(1))
+
+# Write intermediate: inputs summary
+(tmp_dir / "inputs_summary.txt").write_text(
+    f"FASTA: {fasta_path}\n"
+    f"Record ID: {rec.id}\n"
+    f"Sequence length: {seq_len}\n"
+    f"Breakpoint raw: {bp_raw}\n"
+    f"Parsed breakpoint integer: {bp}\n"
+)
+print(f"FASTA record: {rec.id}, length={seq_len}")
+print(f"Parsed breakpoint coordinate: {bp}")
+
+status[1] = "✓"
+print("\nUpdated plan checklist:")
+print_plan(status)
+
+# Step 2: compute peptide with careful coordinate interpretation
+print("\nStep 2: Computing 27-aa peptide around breakpoint...")
+
+# Interpret breakpoint as 1-based amino-acid position unless evidence suggests 0-based.
+# We'll attempt both and choose the one that yields a valid centered 27 aa within bounds if possible.
+def extract_centered(seq, center_index_0based):
+    start = center_index_0based - 13
+    end = center_index_0based + 13
+    if start < 0 or end >= len(seq):
+        return None
+    return seq[start:end+1], start, end
+
+cand = []
+# Candidate A: bp is 1-based position of breakpoint aa
+center0_a = bp - 1
+res_a = extract_centered(seq, center0_a)
+cand.append(("1-based", center0_a, res_a))
+# Candidate B: bp is already 0-based
+center0_b = bp
+res_b = extract_centered(seq, center0_b)
+cand.append(("0-based", center0_b, res_b))
+
+print("Tried coordinate interpretations:")
+for label, c0, res in cand:
+    ok = res is not None
+    print(f" - {label}: center0={c0} -> {'OK' if ok else 'OUT_OF_BOUNDS'}")
+
+# Prefer 1-based if valid; else fallback to 0-based if valid; else allow edge-trim? but requirement says 27aa centered.
+chosen = None
+if res_a is not None:
+    chosen = ("1-based", center0_a, res_a)
+elif res_b is not None:
+    chosen = ("0-based", center0_b, res_b)
+else:
+    raise ValueError("Cannot extract full 27-aa window with either 1-based or 0-based breakpoint; breakpoint too close to ends.")
+
+label, center0, (pep, start0, end0) = chosen
+assert len(pep) == 27
+
+bp_aa = seq[center0]
+upstream = seq[start0:center0]
+downstream = seq[center0+1:end0+1]
+
+# Save intermediate details
+(tmp_dir / "extraction_details.txt").write_text(
+    f"Chosen interpretation: {label}\n"
+    f"Breakpoint input integer: {bp}\n"
+    f"Center index (0-based): {center0}\n"
+    f"Window start (0-based): {start0}\n"
+    f"Window end (0-based): {end0}\n"
+    f"Upstream(13): {upstream}\n"
+    f"Breakpoint AA: {bp_aa}\n"
+    f"Downstream(13): {downstream}\n"
+    f"Peptide(27): {pep}\n"
+)
+print(f"Chosen interpretation: {label}")
+print(f"Window [start0={start0}, center0={center0}, end0={end0}] (0-based)")
+print(f"Upstream(13): {upstream}")
+print(f"Breakpoint AA: {bp_aa}")
+print(f"Downstream(13): {downstream}")
+print(f"Peptide(27): {pep}")
+
+status[2] = "✓"
+print("\nUpdated plan checklist:")
+print_plan(status)
+
+# Step 3: store intermediate peptide fasta in tmp
+print("\nStep 3: Writing intermediate files...")
+tmp_fasta = tmp_dir / "fusion_junction_27aa.fasta"
+with open(tmp_fasta, "w") as f:
+    f.write(f">{rec.id}|breakpoint={bp}|interp={label}|center0={center0}|window0={start0}-{end0}\n")
+    f.write(pep + "\n")
+print(f"Wrote intermediate peptide FASTA: {tmp_fasta}")
+
+status[3] = "✓"
+print("\nUpdated plan checklist:")
+print_plan(status)
+
+# Step 4: write final output fasta
+print("\nStep 4: Writing final output FASTA...")
+with open(out_fasta, "w") as f:
+    f.write(f">{rec.id}|junction_27aa|breakpoint={bp}\n")
+    f.write(pep + "\n")
+print(f"Wrote final output FASTA: {out_fasta}")
+
+status[4] = "✓"
+print("\nFinal plan checklist:")
+print_plan(status)
+
+# Sanity check: read back
+back = list(SeqIO.parse(str(out_fasta), "fasta"))[0]
+print("\nSanity check:")
+print(f"Output record: {back.id}")
+print(f"Output peptide length: {len(back.seq)}")
+print(f"Output peptide: {back.seq}")
+</execute>
+<solution>
+1. [✓] Inspect input FASTA and breakpoint file; parse the breakpoint coordinate and sequence.  
+2. [✓] Compute the 27-aa peptide (13 upstream + breakpoint aa + 13 downstream), handling 1-based vs 0-based carefully.  
+3. [✓] Write intermediate artifacts (parsed inputs and computed indices) into tmp directory.  
+4. [✓] Save resulting peptide to the requested output FASTA.  
+
+Saved 27-aa fusion junction peptide FASTA to:  
+`/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/fusionneoantigen_annotate.fasta`
+
+Intermediate files written to:  
+`/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/fusionneoantigen_annotate/`
+</solution>

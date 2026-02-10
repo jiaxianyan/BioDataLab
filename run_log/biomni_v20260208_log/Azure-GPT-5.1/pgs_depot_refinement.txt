@@ -1,0 +1,356 @@
+Filter the provided SNP data in `benchmark/dataset/PGS-Depot/sample.vcf`. 
+
+The filtering criteria are: remove multi-allelic SNPs, remove SNPs with a minor allele frequency (MAF) less than 0.05, and remove SNPs with a genotype missing rate greater than 0.2. 
+
+Save the resulting filtered data as a VCF file named `/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.1/pgs_depot_refinement.vcf`.
+
+All intermediate steps should be saved in `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/pgs_depot_refinement` directory.
+
+<execute>
+#!BASH
+echo "Step 0: Initialize directories and variables"
+
+# Set variables
+INPUT_VCF="benchmark/dataset/PGS-Depot/sample.vcf"
+TMP_BASE="/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/pgs_depot_refinement"
+FINAL_VCF="/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.1/pgs_depot_refinement.vcf"
+
+# Create directories
+mkdir -p "$TMP_BASE"
+mkdir -p "$(dirname "$FINAL_VCF")"
+
+echo "Input VCF: $INPUT_VCF"
+echo "Temporary directory: $TMP_BASE"
+echo "Final VCF: $FINAL_VCF"
+
+cat << 'PLAN'
+1. [ ] Inspect the input VCF file to confirm format and content
+2. [ ] Remove multi-allelic SNPs and save as first intermediate VCF
+3. [ ] Compute per-SNP MAF and filter out SNPs with MAF < 0.05, saving as second intermediate VCF
+4. [ ] Compute per-SNP genotype missing rate and filter out SNPs with missing rate > 0.2, saving as third intermediate VCF
+5. [ ] Save the final filtered VCF to the requested output path and summarize results
+PLAN
+
+echo "Step 1: Inspect the input VCF file"
+echo "Showing first 20 non-header lines and basic header info"
+grep "^##" "$INPUT_VCF" | head -n 20 > "$TMP_BASE/header_preview.txt"
+grep -v "^##" "$INPUT_VCF" | head -n 20 > "$TMP_BASE/body_preview.txt"
+
+wc -l "$INPUT_VCF" > "$TMP_BASE/input_vcf_wc.txt"
+echo "Line count recorded in $TMP_BASE/input_vcf_wc.txt"
+
+echo "Updated plan after Step 1:"
+cat << 'PLAN'
+1. [✓] Inspect the input VCF file to confirm format and content (completed; header and body previews saved)
+2. [ ] Remove multi-allelic SNPs and save as first intermediate VCF
+3. [ ] Compute per-SNP MAF and filter out SNPs with MAF < 0.05, saving as second intermediate VCF
+4. [ ] Compute per-SNP genotype missing rate and filter out SNPs with missing rate > 0.2, saving as third intermediate VCF
+5. [ ] Save the final filtered VCF to the requested output path and summarize results
+PLAN
+
+echo "Step 2: Remove multi-allelic SNPs"
+# Multi-allelic variants have ALT containing comma; keep only those with no comma
+MULTI_FILTER_VCF="$TMP_BASE/step2_biallelic.vcf"
+
+{
+  # Print all header lines
+  grep '^#' "$INPUT_VCF"
+  # Filter non-header lines: keep lines where ALT field (5th column) does not contain a comma
+  grep -v '^#' "$INPUT_VCF" | awk 'BEGIN{FS=OFS="\t"} {if($5 !~ /,/) print $0}'
+} > "$MULTI_FILTER_VCF"
+
+echo "Step 2 output: $MULTI_FILTER_VCF"
+wc -l "$MULTI_FILTER_VCF" > "$TMP_BASE/step2_biallelic_wc.txt"
+
+echo "Updated plan after Step 2:"
+cat << 'PLAN'
+1. [✓] Inspect the input VCF file to confirm format and content (completed)
+2. [✓] Remove multi-allelic SNPs and save as first intermediate VCF (completed; step2_biallelic.vcf)
+3. [ ] Compute per-SNP MAF and filter out SNPs with MAF < 0.05, saving as second intermediate VCF
+4. [ ] Compute per-SNP genotype missing rate and filter out SNPs with missing rate > 0.2, saving as third intermediate VCF
+5. [ ] Save the final filtered VCF to the requested output path and summarize results
+PLAN
+
+echo "Step 3: Filter on MAF >= 0.05"
+MAF_FILTER_VCF="$TMP_BASE/step3_maf_ge_0.05.vcf"
+
+# Use an AWK script to compute MAF from GT field assuming diploid genotypes 0/0,0/1,1/0,1/1 or missing ./.
+# MAF = min(p_ref, p_alt); keep if MAF >= 0.05
+awk -v OFS="\t" '
+BEGIN{
+  FS="\t"
+}
+# Pass through headers
+/^#/ { print; next }
+{
+  # determine index of GT in FORMAT
+  n=split($9, fmt, ":")
+  gt_index=0
+  for(i=1;i<=n;i++){
+    if(fmt[i]=="GT"){ gt_index=i; break }
+  }
+  if(gt_index==0){
+    # No GT field; treat as missing for MAF and drop variant
+    next
+  }
+
+  # Iterate over samples
+  total_alleles=0
+  alt_alleles=0
+  missing_genos=0
+
+  for(i=10;i<=NF;i++){
+    split($i, f, ":")
+    gt=f[gt_index]
+    # treat missing GT (., ./. , .|.) as missing
+    if(gt=="." || gt=="./." || gt==".|.") {
+      missing_genos++
+      continue
+    }
+
+    # split phased or unphased
+    sep=index(gt,"/")
+    if(sep==0){ sep=index(gt,"|") }
+    if(sep==0){
+      # haploid or unexpected format; skip
+      continue
+    }
+    a1=substr(gt,1,sep-1)
+    a2=substr(gt,sep+1)
+
+    # count alleles only if both defined
+    if(a1 != "." && a2 != "."){
+      total_alleles += 2
+      if(a1=="1") alt_alleles++
+      if(a2=="1") alt_alleles++
+      # For multiallelic sites (should be already removed), alleles >1 would be present, but we filtered them earlier.
+    }
+  }
+
+  if(total_alleles==0){
+    # all missing; skip variant
+    next
+  }
+
+  p_alt = alt_alleles/total_alleles
+  p_ref = 1 - p_alt
+  maf = (p_alt < p_ref ? p_alt : p_ref)
+
+  if(maf >= 0.05){
+    print
+  }
+}
+' "$MULTI_FILTER_VCF" > "$MAF_FILTER_VCF"
+
+echo "Step 3 output: $MAF_FILTER_VCF"
+wc -l "$MAF_FILTER_VCF" > "$TMP_BASE/step3_maf_ge_0.05_wc.txt"
+
+echo "Updated plan after Step 3:"
+cat << 'PLAN'
+1. [✓] Inspect the input VCF file to confirm format and content (completed)
+2. [✓] Remove multi-allelic SNPs and save as first intermediate VCF (completed)
+3. [✓] Compute per-SNP MAF and filter out SNPs with MAF < 0.05, saving as second intermediate VCF (completed; step3_maf_ge_0.05.vcf)
+4. [ ] Compute per-SNP genotype missing rate and filter out SNPs with missing rate > 0.2, saving as third intermediate VCF
+5. [ ] Save the final filtered VCF to the requested output path and summarize results
+PLAN
+
+echo "Step 4: Filter on genotype missing rate <= 0.2"
+MISS_FILTER_VCF="$TMP_BASE/step4_missing_le_0.2.vcf"
+
+awk -v OFS="\t" '
+BEGIN{
+  FS="\t"
+}
+/^#/ { print; next }
+{
+  # determine index of GT in FORMAT
+  n=split($9, fmt, ":")
+  gt_index=0
+  for(i=1;i<=n;i++){
+    if(fmt[i]=="GT"){ gt_index=i; break }
+  }
+  if(gt_index==0){
+    # No GT field; treat variant as fully missing; drop it
+    next
+  }
+
+  total_genos=0
+  missing_genos=0
+
+  for(i=10;i<=NF;i++){
+    total_genos++
+    split($i, f, ":")
+    gt=f[gt_index]
+
+    if(gt=="." || gt=="./." || gt==".|."){
+      missing_genos++
+    }
+  }
+
+  if(total_genos==0){
+    next
+  }
+
+  miss_rate = missing_genos/total_genos
+  if(miss_rate <= 0.2){
+    print
+  }
+}
+' "$MAF_FILTER_VCF" > "$MISS_FILTER_VCF"
+
+echo "Step 4 output: $MISS_FILTER_VCF"
+wc -l "$MISS_FILTER_VCF" > "$TMP_BASE/step4_missing_le_0.2_wc.txt"
+
+echo "Updated plan after Step 4:"
+cat << 'PLAN'
+1. [✓] Inspect the input VCF file to confirm format and content (completed)
+2. [✓] Remove multi-allelic SNPs and save as first intermediate VCF (completed)
+3. [✓] Compute per-SNP MAF and filter out SNPs with MAF < 0.05, saving as second intermediate VCF (completed)
+4. [✓] Compute per-SNP genotype missing rate and filter out SNPs with missing rate > 0.2, saving as third intermediate VCF (completed; step4_missing_le_0.2.vcf)
+5. [ ] Save the final filtered VCF to the requested output path and summarize results
+PLAN
+
+echo "Step 5: Save final VCF and summarize results"
+
+cp "$MISS_FILTER_VCF" "$FINAL_VCF"
+
+echo "Final VCF saved to: $FINAL_VCF"
+
+# Summaries
+echo "Summary of line counts:" > "$TMP_BASE/summary_counts.txt"
+printf "Input VCF: " >> "$TMP_BASE/summary_counts.txt"
+wc -l "$INPUT_VCF" | awk "{print \$1}" >> "$TMP_BASE/summary_counts.txt"
+printf "After biallelic filter (step2): " >> "$TMP_BASE/summary_counts.txt"
+wc -l "$MULTI_FILTER_VCF" | awk "{print \$1}" >> "$TMP_BASE/summary_counts.txt"
+printf "After MAF >= 0.05 filter (step3): " >> "$TMP_BASE/summary_counts.txt"
+wc -l "$MAF_FILTER_VCF" | awk "{print \$1}" >> "$TMP_BASE/summary_counts.txt"
+printf "After missing rate <= 0.2 filter (step4/final): " >> "$TMP_BASE/summary_counts.txt"
+wc -l "$MISS_FILTER_VCF" | awk "{print \$1}" >> "$TMP_BASE/summary_counts.txt"
+
+echo "Summary counts written to $TMP_BASE/summary_counts.txt"
+
+echo "Updated plan after Step 5:"
+cat << 'PLAN'
+1. [✓] Inspect the input VCF file to confirm format and content (completed)
+2. [✓] Remove multi-allelic SNPs and save as first intermediate VCF (completed)
+3. [✓] Compute per-SNP MAF and filter out SNPs with MAF < 0.05, saving as second intermediate VCF (completed)
+4. [✓] Compute per-SNP genotype missing rate and filter out SNPs with missing rate > 0.2, saving as third intermediate VCF (completed)
+5. [✓] Save the final filtered VCF to the requested output path and summarize results (completed)
+PLAN
+
+echo "Key output files:"
+echo "  First intermediate (biallelic only): $MULTI_FILTER_VCF"
+echo "  Second intermediate (MAF >= 0.05):   $MAF_FILTER_VCF"
+echo "  Third intermediate (missing <= 0.2): $MISS_FILTER_VCF"
+echo "  Final VCF:                            $FINAL_VCF"
+echo "  Summary counts:                       $TMP_BASE/summary_counts.txt"
+</execute>
+<observation>Step 0: Initialize directories and variables
+Input VCF: benchmark/dataset/PGS-Depot/sample.vcf
+Temporary directory: /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/pgs_depot_refinement
+Final VCF: /root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.1/pgs_depot_refinement.vcf
+1. [ ] Inspect the input VCF file to confirm format and content
+2. [ ] Remove multi-allelic SNPs and save as first intermediate VCF
+3. [ ] Compute per-SNP MAF and filter out SNPs with MAF < 0.05, saving as second intermediate VCF
+4. [ ] Compute per-SNP genotype missing rate and filter out SNPs with missing rate > 0.2, saving as third intermediate VCF
+5. [ ] Save the final filtered VCF to the requested output path and summarize results
+Step 1: Inspect the input VCF file
+Showing first 20 non-header lines and basic header info
+Line count recorded in /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/pgs_depot_refinement/input_vcf_wc.txt
+Updated plan after Step 1:
+1. [✓] Inspect the input VCF file to confirm format and content (completed; header and body previews saved)
+2. [ ] Remove multi-allelic SNPs and save as first intermediate VCF
+3. [ ] Compute per-SNP MAF and filter out SNPs with MAF < 0.05, saving as second intermediate VCF
+4. [ ] Compute per-SNP genotype missing rate and filter out SNPs with missing rate > 0.2, saving as third intermediate VCF
+5. [ ] Save the final filtered VCF to the requested output path and summarize results
+Step 2: Remove multi-allelic SNPs
+Step 2 output: /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/pgs_depot_refinement/step2_biallelic.vcf
+Updated plan after Step 2:
+1. [✓] Inspect the input VCF file to confirm format and content (completed)
+2. [✓] Remove multi-allelic SNPs and save as first intermediate VCF (completed; step2_biallelic.vcf)
+3. [ ] Compute per-SNP MAF and filter out SNPs with MAF < 0.05, saving as second intermediate VCF
+4. [ ] Compute per-SNP genotype missing rate and filter out SNPs with missing rate > 0.2, saving as third intermediate VCF
+5. [ ] Save the final filtered VCF to the requested output path and summarize results
+Step 3: Filter on MAF >= 0.05
+Step 3 output: /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/pgs_depot_refinement/step3_maf_ge_0.05.vcf
+Updated plan after Step 3:
+1. [✓] Inspect the input VCF file to confirm format and content (completed)
+2. [✓] Remove multi-allelic SNPs and save as first intermediate VCF (completed)
+3. [✓] Compute per-SNP MAF and filter out SNPs with MAF < 0.05, saving as second intermediate VCF (completed; step3_maf_ge_0.05.vcf)
+4. [ ] Compute per-SNP genotype missing rate and filter out SNPs with missing rate > 0.2, saving as third intermediate VCF
+5. [ ] Save the final filtered VCF to the requested output path and summarize results
+Step 4: Filter on genotype missing rate <= 0.2
+Step 4 output: /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/pgs_depot_refinement/step4_missing_le_0.2.vcf
+Updated plan after Step 4:
+1. [✓] Inspect the input VCF file to confirm format and content (completed)
+2. [✓] Remove multi-allelic SNPs and save as first intermediate VCF (completed)
+3. [✓] Compute per-SNP MAF and filter out SNPs with MAF < 0.05, saving as second intermediate VCF (completed)
+4. [✓] Compute per-SNP genotype missing rate and filter out SNPs with missing rate > 0.2, saving as third intermediate VCF (completed; step4_missing_le_0.2.vcf)
+5. [ ] Save the final filtered VCF to the requested output path and summarize results
+Step 5: Save final VCF and summarize results
+Final VCF saved to: /root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.1/pgs_depot_refinement.vcf
+Summary counts written to /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/pgs_depot_refinement/summary_counts.txt
+Updated plan after Step 5:
+1. [✓] Inspect the input VCF file to confirm format and content (completed)
+2. [✓] Remove multi-allelic SNPs and save as first intermediate VCF (completed)
+3. [✓] Compute per-SNP MAF and filter out SNPs with MAF < 0.05, saving as second intermediate VCF (completed)
+4. [✓] Compute per-SNP genotype missing rate and filter out SNPs with missing rate > 0.2, saving as third intermediate VCF (completed)
+5. [✓] Save the final filtered VCF to the requested output path and summarize results (completed)
+Key output files:
+  First intermediate (biallelic only): /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/pgs_depot_refinement/step2_biallelic.vcf
+  Second intermediate (MAF >= 0.05):   /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/pgs_depot_refinement/step3_maf_ge_0.05.vcf
+  Third intermediate (missing <= 0.2): /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/pgs_depot_refinement/step4_missing_le_0.2.vcf
+  Final VCF:                            /root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.1/pgs_depot_refinement.vcf
+  Summary counts:                       /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/pgs_depot_refinement/summary_counts.txt
+</observation>
+<solution>
+1. [✓] Inspect the input VCF file to confirm format and content (completed; header and body previews saved in:
+   - `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/pgs_depot_refinement/header_preview.txt`
+   - `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/pgs_depot_refinement/body_preview.txt`
+   - Line count in `input_vcf_wc.txt`)
+
+2. [✓] Remove multi-allelic SNPs and save as first intermediate VCF (completed)
+   - Criterion: keep only records where the ALT field (5th column) does not contain a comma (i.e., biallelic variants).
+   - Output: `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/pgs_depot_refinement/step2_biallelic.vcf`
+   - Line count saved in `step2_biallelic_wc.txt`.
+
+3. [✓] Compute per-SNP MAF and filter out SNPs with MAF < 0.05, saving as second intermediate VCF (completed)
+   - Assumptions: diploid genotypes with `GT` field present (e.g. 0/0, 0/1, 1/1; missing as ./., . or .|.).
+   - For each variant:
+     - Identify `GT` position in `FORMAT`.
+     - Count non-missing alleles across samples (ignore missing and any non-0/1 alleles).
+     - Compute `p_alt = alt_alleles / total_alleles`, `p_ref = 1 - p_alt`, `MAF = min(p_alt, p_ref)`.
+     - Keep variant if `MAF >= 0.05`.
+   - Variants with no usable genotypes or without a `GT` field are dropped.
+   - Output: `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/pgs_depot_refinement/step3_maf_ge_0.05.vcf`
+   - Line count saved in `step3_maf_ge_0.05_wc.txt`.
+
+4. [✓] Compute per-SNP genotype missing rate and filter out SNPs with missing rate > 0.2, saving as third intermediate VCF (completed)
+   - For each variant:
+     - Identify `GT` index in `FORMAT`.
+     - For all samples (columns 10+):
+       - Count a genotype as missing if `GT` is `.`, `./.` or `. | .`.
+       - `missing_rate = missing_genos / total_genos`.
+     - Keep variant if `missing_rate <= 0.2`.
+   - Variants lacking `GT` are discarded as fully missing.
+   - Output: `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/pgs_depot_refinement/step4_missing_le_0.2.vcf`
+   - Line count saved in `step4_missing_le_0.2_wc.txt`.
+
+5. [✓] Save the final filtered VCF to the requested output path and summarize results (completed)
+   - Final VCF copied to:
+     - `/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.1/pgs_depot_refinement.vcf`
+   - Summary of line counts (input and after each filter) written to:
+     - `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/pgs_depot_refinement/summary_counts.txt`
+
+Key output files:
+- First intermediate (biallelic only):  
+  `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/pgs_depot_refinement/step2_biallelic.vcf`
+- Second intermediate (MAF ≥ 0.05):  
+  `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/pgs_depot_refinement/step3_maf_ge_0.05.vcf`
+- Third intermediate (missing rate ≤ 0.2):  
+  `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/pgs_depot_refinement/step4_missing_le_0.2.vcf`
+- Final filtered VCF:  
+  `/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.1/pgs_depot_refinement.vcf`
+- Summary of counts:  
+  `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/pgs_depot_refinement/summary_counts.txt`
+</solution>

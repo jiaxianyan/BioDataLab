@@ -1,0 +1,1567 @@
+
+Perform a differential expression analysis for 6 DRX experiments in `benchmark/dataset/MetazExp/count`. 
+
+The basic information of the 6 DRX experiments is provided in `benchmark/dataset/MetazExp/sample_info.tsv`, which includes sample annotations specifying biological conditions (e.g., tissue, developmental stage) and study or batch identifiers.
+
+You must explicitly correct for study-specific batch effects by including the batch variable in the design formula (e.g., design = ~ batch + condition).
+
+Identify genes that are significantly differentially expressed in the target condition compared to all other conditions combined.
+
+Output the top 50 most significantly differentially expressed genes (ranked by adjusted p-value) to `/root/autodl-tmp/biomni_v20260208_pred_results/doubao-seed-1-8/metazexp_annotate.tsv`.
+
+Output Format (Only for Reference):
+gene_id	baseMean	log2FoldChange	lfcSE	stat	pvalue	padj
+FBgnxxxx	1254.66665476386	-2.87772911936465	0.87905045247991	-27.2422049305457	2.05567383473253e-163	3.25310384346423e-159
+FBgnyyyy	52136.516872705251	-4.730648430188	0.676023255336235	-24.3843527676287	2.50655533940541e-131	1.98331191230453e-127
+
+All temp data should be save in `/root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/metazexp_annotate`.
+
+<execute>#!BASH
+# Create temp directory if it doesn't exist
+mkdir -p /root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/metazexp_annotate
+
+# Check the sample info file
+cat benchmark/dataset/MetazExp/sample_info.tsv
+</execute>
+<observation>
+Study	Experiment	Source	Strain	Genotype	DevelopmentDevelopment	Tissue	TreatmentTreatment	Mapped Bases	SeqLen
+DRP006530	DRX198149	PMID:32865275	/	UAS-bub3IR...UAS-bub3IR/en-GAL4 UAS-GFP;UAS-p35/+	L3	hemocyte	cancer-bearing	22.50GB	PE150				
+DRP006530	DRX198150	PMID:32865275	/	UAS-bub3IR...UAS-bub3IR/en-GAL4 UAS-GFP;UAS-p35/+	L3	hemocyte	cancer-bearing	23.76GB	PE150				
+DRP006530	DRX198151	PMID:32865275	/	UAS-bub3IR...UAS-bub3IR/en-GAL4 UAS-GFP;UAS-p35/+	L3	hemocyte	cancer-bearing	24.17GB	PE150				
+DRP006530	DRX198152	PMID:32865275	/	en-GAL4 UA...en-GAL4 UAS-GFP/+;+/+	L3	hemocyte	non-cancer control	23.81GB	PE150				
+DRP006530	DRX198153	PMID:32865275	/	en-GAL4 UA...en-GAL4 UAS-GFP/+;+/+	L3	hemocyte	non-cancer control	22.40GB	PE150				
+DRP006530	DRX198154	PMID:32865275	/	en-GAL4 UA...en-GAL4 UAS-GFP/+;+/+	L3	hemocyte	non-cancer control	24.13GB	PE150				</observation>
+<execute>#!BASH
+# Check count directory structure
+ls -la benchmark/dataset/MetazExp/count/
+</execute>
+<observation>total 4620
+drwxr-xr-x 2 root root   4096 Feb  7 15:40 .
+drwxr-xr-x 8 root root   4096 Feb  7 15:40 ..
+-rw-r--r-- 1 root root 788513 Feb  5 17:43 DRX198149.gene.expr.tsv
+-rw-r--r-- 1 root root 790126 Feb  5 17:43 DRX198150.gene.expr.tsv
+-rw-r--r-- 1 root root 789857 Feb  5 17:43 DRX198151.gene.expr.tsv
+-rw-r--r-- 1 root root 781085 Feb  5 17:43 DRX198152.gene.expr.tsv
+-rw-r--r-- 1 root root 779207 Feb  5 17:43 DRX198153.gene.expr.tsv
+-rw-r--r-- 1 root root 782338 Feb  5 17:43 DRX198154.gene.expr.tsv
+</observation>
+<execute>#!R
+# Load required libraries
+library(DESeq2)
+library(tidyverse)
+library(data.table)
+
+# Set directories
+count_dir <- "benchmark/dataset/MetazExp/count/"
+sample_info_path <- "benchmark/dataset/MetazExp/sample_info.tsv"
+tmp_dir <- "/root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/metazexp_annotate"
+output_path <- "/root/autodl-tmp/biomni_v20260208_pred_results/doubao-seed-1-8/metazexp_annotate.tsv"
+
+# Create tmp directory if not exists
+dir.create(tmp_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Read sample info
+sample_info <- fread(sample_info_path, header = TRUE, sep = "\t") %>%
+  rename(condition = TreatmentTreatment, batch = Study) %>%
+  mutate(condition = factor(condition, levels = c("non-cancer control", "cancer-bearing")))
+
+# Read all count files
+count_files <- list.files(count_dir, pattern = "\\.gene\\.expr\\.tsv$", full.names = TRUE)
+count_data <- map_dfc(count_files, function(file) {
+  sample_id <- str_extract(basename(file), "^DRX\\d+")
+  fread(file, header = FALSE, col.names = c("gene_id", sample_id)) %>%
+    column_to_rownames("gene_id")
+})
+
+# Ensure sample order matches
+count_data <- count_data[, sample_info$Experiment]
+
+# Create DESeq2 object
+dds <- DESeqDataSetFromMatrix(
+  countData = count_data,
+  colData = sample_info,
+  design = ~ batch + condition
+)
+
+# Pre-filter to remove low count genes
+dds <- dds[rowSums(counts(dds)) > 1, ]
+
+# Run DESeq2 analysis
+dds <- DESeq(dds)
+
+# Get results (comparing cancer-bearing vs non-cancer control)
+res <- results(dds, contrast = c("condition", "cancer-bearing", "non-cancer control"))
+
+# Sort by adjusted p-value
+res_sorted <- res %>%
+  as.data.frame() %>%
+  rownames_to_column("gene_id") %>%
+  arrange(padj) %>%
+  filter(!is.na(padj))
+
+# Save top 50 genes
+top50 <- head(res_sorted, 50)
+fwrite(top50, output_path, sep = "\t", row.names = FALSE)
+
+# Save intermediate results
+fwrite(res_sorted, file.path(tmp_dir, "all_results.tsv"), sep = "\t", row.names = FALSE)
+
+print(paste("Analysis completed. Top 50 genes saved to", output_path))
+print(paste("All results saved to", file.path(tmp_dir, "all_results.tsv")))
+</execute>
+<observation>Error running R code:
+Loading required package: S4Vectors
+Loading required package: stats4
+Loading required package: BiocGenerics
+
+Attaching package: ‘BiocGenerics’
+
+The following objects are masked from ‘package:stats’:
+
+    IQR, mad, sd, var, xtabs
+
+The following objects are masked from ‘package:base’:
+
+    anyDuplicated, aperm, append, as.data.frame, basename, cbind,
+    colnames, dirname, do.call, duplicated, eval, evalq, Filter, Find,
+    get, grep, grepl, intersect, is.unsorted, lapply, Map, mapply,
+    match, mget, order, paste, pmax, pmax.int, pmin, pmin.int,
+    Position, rank, rbind, Reduce, rownames, sapply, setdiff, sort,
+    table, tapply, union, unique, unsplit, which.max, which.min
+
+
+Attaching package: ‘S4Vectors’
+
+The following object is masked from ‘package:utils’:
+
+    findMatches
+
+The following objects are masked from ‘package:base’:
+
+    expand.grid, I, unname
+
+Loading required package: IRanges
+Loading required package: GenomicRanges
+Loading required package: GenomeInfoDb
+Loading required package: SummarizedExperiment
+Loading required package: MatrixGenerics
+Loading required package: matrixStats
+
+Attaching package: ‘MatrixGenerics’
+
+The following objects are masked from ‘package:matrixStats’:
+
+    colAlls, colAnyNAs, colAnys, colAvgsPerRowSet, colCollapse,
+    colCounts, colCummaxs, colCummins, colCumprods, colCumsums,
+    colDiffs, colIQRDiffs, colIQRs, colLogSumExps, colMadDiffs,
+    colMads, colMaxs, colMeans2, colMedians, colMins, colOrderStats,
+    colProds, colQuantiles, colRanges, colRanks, colSdDiffs, colSds,
+    colSums2, colTabulates, colVarDiffs, colVars, colWeightedMads,
+    colWeightedMeans, colWeightedMedians, colWeightedSds,
+    colWeightedVars, rowAlls, rowAnyNAs, rowAnys, rowAvgsPerColSet,
+    rowCollapse, rowCounts, rowCummaxs, rowCummins, rowCumprods,
+    rowCumsums, rowDiffs, rowIQRDiffs, rowIQRs, rowLogSumExps,
+    rowMadDiffs, rowMads, rowMaxs, rowMeans2, rowMedians, rowMins,
+    rowOrderStats, rowProds, rowQuantiles, rowRanges, rowRanks,
+    rowSdDiffs, rowSds, rowSums2, rowTabulates, rowVarDiffs, rowVars,
+    rowWeightedMads, rowWeightedMeans, rowWeightedMedians,
+    rowWeightedSds, rowWeightedVars
+
+Loading required package: Biobase
+Welcome to Bioconductor
+
+    Vignettes contain introductory material; view with
+    'browseVignettes()'. To cite Bioconductor, see
+    'citation("Biobase")', and for packages 'citation("pkgname")'.
+
+
+Attaching package: ‘Biobase’
+
+The following object is masked from ‘package:MatrixGenerics’:
+
+    rowMedians
+
+The following objects are masked from ‘package:matrixStats’:
+
+    anyMissing, rowMedians
+
+── Attaching core tidyverse packages ──────────────────────── tidyverse 2.0.0 ──
+✔ dplyr     1.1.4     ✔ readr     2.1.5
+✔ forcats   1.0.0     ✔ stringr   1.5.2
+✔ ggplot2   3.5.2     ✔ tibble    3.3.0
+✔ lubridate 1.9.4     ✔ tidyr     1.3.1
+✔ purrr     1.1.0     
+── Conflicts ────────────────────────────────────────── tidyverse_conflicts() ──
+✖ lubridate::%within%() masks IRanges::%within%()
+✖ dplyr::collapse()     masks IRanges::collapse()
+✖ dplyr::combine()      masks Biobase::combine(), BiocGenerics::combine()
+✖ dplyr::count()        masks matrixStats::count()
+✖ dplyr::desc()         masks IRanges::desc()
+✖ tidyr::expand()       masks S4Vectors::expand()
+✖ dplyr::filter()       masks stats::filter()
+✖ dplyr::first()        masks S4Vectors::first()
+✖ dplyr::lag()          masks stats::lag()
+✖ ggplot2::Position()   masks BiocGenerics::Position(), base::Position()
+✖ purrr::reduce()       masks GenomicRanges::reduce(), IRanges::reduce()
+✖ dplyr::rename()       masks S4Vectors::rename()
+✖ lubridate::second()   masks S4Vectors::second()
+✖ lubridate::second<-() masks S4Vectors::second<-()
+✖ dplyr::slice()        masks IRanges::slice()
+ℹ Use the conflicted package (<http://conflicted.r-lib.org/>) to force all conflicts to become errors
+Warning messages:
+1: package ‘tidyverse’ was built under R version 4.3.3 
+2: package ‘ggplot2’ was built under R version 4.3.3 
+3: package ‘tibble’ was built under R version 4.3.3 
+4: package ‘tidyr’ was built under R version 4.3.3 
+5: package ‘readr’ was built under R version 4.3.3 
+6: package ‘purrr’ was built under R version 4.3.3 
+7: package ‘dplyr’ was built under R version 4.3.3 
+8: package ‘stringr’ was built under R version 4.3.3 
+9: package ‘forcats’ was built under R version 4.3.3 
+10: package ‘lubridate’ was built under R version 4.3.3 
+
+Attaching package: ‘data.table’
+
+The following objects are masked from ‘package:lubridate’:
+
+    hour, isoweek, mday, minute, month, quarter, second, wday, week,
+    yday, year
+
+The following objects are masked from ‘package:dplyr’:
+
+    between, first, last
+
+The following object is masked from ‘package:purrr’:
+
+    transpose
+
+The following object is masked from ‘package:SummarizedExperiment’:
+
+    shift
+
+The following object is masked from ‘package:GenomicRanges’:
+
+    shift
+
+The following object is masked from ‘package:IRanges’:
+
+    shift
+
+The following objects are masked from ‘package:S4Vectors’:
+
+    first, second
+
+Warning message:
+package ‘data.table’ was built under R version 4.3.3 
+Error in `rename()`:
+! Can't rename columns that don't exist.
+✖ Column `TreatmentTreatment` doesn't exist.
+Backtrace:
+     ▆
+  1. ├─... %>% ...
+  2. ├─dplyr::mutate(...)
+  3. ├─dplyr::rename(., condition = TreatmentTreatment, batch = Study)
+  4. ├─dplyr:::rename.data.frame(., condition = TreatmentTreatment, batch = Study)
+  5. │ └─tidyselect::eval_rename(expr(c(...)), .data)
+  6. │   └─tidyselect:::rename_impl(...)
+  7. │     └─tidyselect:::eval_select_impl(...)
+  8. │       ├─tidyselect:::with_subscript_errors(...)
+  9. │       │ └─base::withCallingHandlers(...)
+ 10. │       └─tidyselect:::vars_select_eval(...)
+ 11. │         └─tidyselect:::walk_data_tree(expr, data_mask, context_mask)
+ 12. │           └─tidyselect:::eval_c(expr, data_mask, context_mask)
+ 13. │             └─tidyselect:::reduce_sels(node, data_mask, context_mask, init = init)
+ 14. │               └─tidyselect:::walk_data_tree(new, data_mask, context_mask)
+ 15. │                 └─tidyselect:::as_indices_sel_impl(...)
+ 16. │                   └─tidyselect:::as_indices_impl(...)
+ 17. │                     └─tidyselect:::chr_as_locations(x, vars, call = call, arg = arg)
+ 18. │                       └─vctrs::vec_as_location(...)
+ 19. └─vctrs (local) `<fn>`()
+ 20.   └─vctrs:::stop_subscript_oob(...)
+ 21.     └─vctrs:::stop_subscript(...)
+ 22.       └─rlang::abort(...)
+Execution halted
+</observation>
+<execute>#!BASH
+# Check actual column names in sample info file
+head -n 1 benchmark/dataset/MetazExp/sample_info.tsv | tr '\t' '\n'
+</execute>
+<observation>
+</observation>
+<execute>#!BASH
+# Check the first few lines with cat -A to see invisible characters
+cat -A benchmark/dataset/MetazExp/sample_info.tsv | head -n 2
+</execute>
+<observation>$
+Study^IExperiment^ISource^IStrain^IGenotype^IDevelopmentDevelopment^ITissue^ITreatmentTreatment^IMapped Bases^ISeqLen$
+</observation>
+<execute>#!R
+# Load required libraries
+library(DESeq2)
+library(tidyverse)
+library(data.table)
+
+# Set directories
+count_dir <- "benchmark/dataset/MetazExp/count/"
+sample_info_path <- "benchmark/dataset/MetazExp/sample_info.tsv"
+tmp_dir <- "/root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/metazexp_annotate"
+output_path <- "/root/autodl-tmp/biomni_v20260208_pred_results/doubao-seed-1-8/metazexp_annotate.tsv"
+
+# Create tmp directory if not exists
+dir.create(tmp_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Read sample info with correct separator
+sample_info <- fread(sample_info_path, header = TRUE, sep = "\t") %>%
+  rename(condition = `TreatmentTreatment`, batch = Study) %>%
+  mutate(condition = factor(condition, levels = c("non-cancer control", "cancer-bearing")))
+
+# Read all count files
+count_files <- list.files(count_dir, pattern = "\\.gene\\.expr\\.tsv$", full.names = TRUE)
+count_data <- map_dfc(count_files, function(file) {
+  sample_id <- str_extract(basename(file), "^DRX\\d+")
+  fread(file, header = FALSE, col.names = c("gene_id", sample_id)) %>%
+    column_to_rownames("gene_id")
+})
+
+# Ensure sample order matches
+count_data <- count_data[, sample_info$Experiment]
+
+# Create DESeq2 object
+dds <- DESeqDataSetFromMatrix(
+  countData = count_data,
+  colData = sample_info,
+  design = ~ batch + condition
+)
+
+# Pre-filter to remove low count genes
+dds <- dds[rowSums(counts(dds)) > 1, ]
+
+# Run DESeq2 analysis
+dds <- DESeq(dds)
+
+# Get results (comparing cancer-bearing vs non-cancer control)
+res <- results(dds, contrast = c("condition", "cancer-bearing", "non-cancer control"))
+
+# Sort by adjusted p-value
+res_sorted <- res %>%
+  as.data.frame() %>%
+  rownames_to_column("gene_id") %>%
+  arrange(padj) %>%
+  filter(!is.na(padj))
+
+# Save top 50 genes
+top50 <- head(res_sorted, 50)
+fwrite(top50, output_path, sep = "\t", row.names = FALSE)
+
+# Save intermediate results
+fwrite(res_sorted, file.path(tmp_dir, "all_results.tsv"), sep = "\t", row.names = FALSE)
+
+print(paste("Analysis completed. Top 50 genes saved to", output_path))
+print(paste("All results saved to", file.path(tmp_dir, "all_results.tsv")))
+</execute>
+<observation>Error running R code:
+Loading required package: S4Vectors
+Loading required package: stats4
+Loading required package: BiocGenerics
+
+Attaching package: ‘BiocGenerics’
+
+The following objects are masked from ‘package:stats’:
+
+    IQR, mad, sd, var, xtabs
+
+The following objects are masked from ‘package:base’:
+
+    anyDuplicated, aperm, append, as.data.frame, basename, cbind,
+    colnames, dirname, do.call, duplicated, eval, evalq, Filter, Find,
+    get, grep, grepl, intersect, is.unsorted, lapply, Map, mapply,
+    match, mget, order, paste, pmax, pmax.int, pmin, pmin.int,
+    Position, rank, rbind, Reduce, rownames, sapply, setdiff, sort,
+    table, tapply, union, unique, unsplit, which.max, which.min
+
+
+Attaching package: ‘S4Vectors’
+
+The following object is masked from ‘package:utils’:
+
+    findMatches
+
+The following objects are masked from ‘package:base’:
+
+    expand.grid, I, unname
+
+Loading required package: IRanges
+Loading required package: GenomicRanges
+Loading required package: GenomeInfoDb
+Loading required package: SummarizedExperiment
+Loading required package: MatrixGenerics
+Loading required package: matrixStats
+
+Attaching package: ‘MatrixGenerics’
+
+The following objects are masked from ‘package:matrixStats’:
+
+    colAlls, colAnyNAs, colAnys, colAvgsPerRowSet, colCollapse,
+    colCounts, colCummaxs, colCummins, colCumprods, colCumsums,
+    colDiffs, colIQRDiffs, colIQRs, colLogSumExps, colMadDiffs,
+    colMads, colMaxs, colMeans2, colMedians, colMins, colOrderStats,
+    colProds, colQuantiles, colRanges, colRanks, colSdDiffs, colSds,
+    colSums2, colTabulates, colVarDiffs, colVars, colWeightedMads,
+    colWeightedMeans, colWeightedMedians, colWeightedSds,
+    colWeightedVars, rowAlls, rowAnyNAs, rowAnys, rowAvgsPerColSet,
+    rowCollapse, rowCounts, rowCummaxs, rowCummins, rowCumprods,
+    rowCumsums, rowDiffs, rowIQRDiffs, rowIQRs, rowLogSumExps,
+    rowMadDiffs, rowMads, rowMaxs, rowMeans2, rowMedians, rowMins,
+    rowOrderStats, rowProds, rowQuantiles, rowRanges, rowRanks,
+    rowSdDiffs, rowSds, rowSums2, rowTabulates, rowVarDiffs, rowVars,
+    rowWeightedMads, rowWeightedMeans, rowWeightedMedians,
+    rowWeightedSds, rowWeightedVars
+
+Loading required package: Biobase
+Welcome to Bioconductor
+
+    Vignettes contain introductory material; view with
+    'browseVignettes()'. To cite Bioconductor, see
+    'citation("Biobase")', and for packages 'citation("pkgname")'.
+
+
+Attaching package: ‘Biobase’
+
+The following object is masked from ‘package:MatrixGenerics’:
+
+    rowMedians
+
+The following objects are masked from ‘package:matrixStats’:
+
+    anyMissing, rowMedians
+
+── Attaching core tidyverse packages ──────────────────────── tidyverse 2.0.0 ──
+✔ dplyr     1.1.4     ✔ readr     2.1.5
+✔ forcats   1.0.0     ✔ stringr   1.5.2
+✔ ggplot2   3.5.2     ✔ tibble    3.3.0
+✔ lubridate 1.9.4     ✔ tidyr     1.3.1
+✔ purrr     1.1.0     
+── Conflicts ────────────────────────────────────────── tidyverse_conflicts() ──
+✖ lubridate::%within%() masks IRanges::%within%()
+✖ dplyr::collapse()     masks IRanges::collapse()
+✖ dplyr::combine()      masks Biobase::combine(), BiocGenerics::combine()
+✖ dplyr::count()        masks matrixStats::count()
+✖ dplyr::desc()         masks IRanges::desc()
+✖ tidyr::expand()       masks S4Vectors::expand()
+✖ dplyr::filter()       masks stats::filter()
+✖ dplyr::first()        masks S4Vectors::first()
+✖ dplyr::lag()          masks stats::lag()
+✖ ggplot2::Position()   masks BiocGenerics::Position(), base::Position()
+✖ purrr::reduce()       masks GenomicRanges::reduce(), IRanges::reduce()
+✖ dplyr::rename()       masks S4Vectors::rename()
+✖ lubridate::second()   masks S4Vectors::second()
+✖ lubridate::second<-() masks S4Vectors::second<-()
+✖ dplyr::slice()        masks IRanges::slice()
+ℹ Use the conflicted package (<http://conflicted.r-lib.org/>) to force all conflicts to become errors
+Warning messages:
+1: package ‘tidyverse’ was built under R version 4.3.3 
+2: package ‘ggplot2’ was built under R version 4.3.3 
+3: package ‘tibble’ was built under R version 4.3.3 
+4: package ‘tidyr’ was built under R version 4.3.3 
+5: package ‘readr’ was built under R version 4.3.3 
+6: package ‘purrr’ was built under R version 4.3.3 
+7: package ‘dplyr’ was built under R version 4.3.3 
+8: package ‘stringr’ was built under R version 4.3.3 
+9: package ‘forcats’ was built under R version 4.3.3 
+10: package ‘lubridate’ was built under R version 4.3.3 
+
+Attaching package: ‘data.table’
+
+The following objects are masked from ‘package:lubridate’:
+
+    hour, isoweek, mday, minute, month, quarter, second, wday, week,
+    yday, year
+
+The following objects are masked from ‘package:dplyr’:
+
+    between, first, last
+
+The following object is masked from ‘package:purrr’:
+
+    transpose
+
+The following object is masked from ‘package:SummarizedExperiment’:
+
+    shift
+
+The following object is masked from ‘package:GenomicRanges’:
+
+    shift
+
+The following object is masked from ‘package:IRanges’:
+
+    shift
+
+The following objects are masked from ‘package:S4Vectors’:
+
+    first, second
+
+Warning message:
+package ‘data.table’ was built under R version 4.3.3 
+Error in `rename()`:
+! Can't rename columns that don't exist.
+✖ Column `TreatmentTreatment` doesn't exist.
+Backtrace:
+     ▆
+  1. ├─... %>% ...
+  2. ├─dplyr::mutate(...)
+  3. ├─dplyr::rename(., condition = TreatmentTreatment, batch = Study)
+  4. ├─dplyr:::rename.data.frame(., condition = TreatmentTreatment, batch = Study)
+  5. │ └─tidyselect::eval_rename(expr(c(...)), .data)
+  6. │   └─tidyselect:::rename_impl(...)
+  7. │     └─tidyselect:::eval_select_impl(...)
+  8. │       ├─tidyselect:::with_subscript_errors(...)
+  9. │       │ └─base::withCallingHandlers(...)
+ 10. │       └─tidyselect:::vars_select_eval(...)
+ 11. │         └─tidyselect:::walk_data_tree(expr, data_mask, context_mask)
+ 12. │           └─tidyselect:::eval_c(expr, data_mask, context_mask)
+ 13. │             └─tidyselect:::reduce_sels(node, data_mask, context_mask, init = init)
+ 14. │               └─tidyselect:::walk_data_tree(new, data_mask, context_mask)
+ 15. │                 └─tidyselect:::as_indices_sel_impl(...)
+ 16. │                   └─tidyselect:::as_indices_impl(...)
+ 17. │                     └─tidyselect:::chr_as_locations(x, vars, call = call, arg = arg)
+ 18. │                       └─vctrs::vec_as_location(...)
+ 19. └─vctrs (local) `<fn>`()
+ 20.   └─vctrs:::stop_subscript_oob(...)
+ 21.     └─vctrs:::stop_subscript(...)
+ 22.       └─rlang::abort(...)
+Execution halted
+</observation>
+<execute>#!BASH
+# Check column names with awk
+awk -F'\t' 'NR==1 {for(i=1;i<=NF;i++) print i, $i}' benchmark/dataset/MetazExp/sample_info.tsv
+</execute>
+<observation></observation>
+<execute>#!BASH
+# Read first line and split by tabs
+head -n 1 benchmark/dataset/MetazExp/sample_info.tsv | tr '\t' '\n' | nl -ba -s': '
+</execute>
+<observation>     1: 
+</observation>
+<execute>#!BASH
+# Check first few lines of sample info
+head -n 3 benchmark/dataset/MetazExp/sample_info.tsv
+</execute>
+<observation>
+Study	Experiment	Source	Strain	Genotype	DevelopmentDevelopment	Tissue	TreatmentTreatment	Mapped Bases	SeqLen
+DRP006530	DRX198149	PMID:32865275	/	UAS-bub3IR...UAS-bub3IR/en-GAL4 UAS-GFP;UAS-p35/+	L3	hemocyte	cancer-bearing	22.50GB	PE150				
+</observation>
+<execute>#!R
+# Load required libraries
+library(DESeq2)
+library(tidyverse)
+library(data.table)
+
+# Set directories
+count_dir <- "benchmark/dataset/MetazExp/count/"
+sample_info_path <- "benchmark/dataset/MetazExp/sample_info.tsv"
+tmp_dir <- "/root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/metazexp_annotate"
+output_path <- "/root/autodl-tmp/biomni_v20260208_pred_results/doubao-seed-1-8/metazexp_annotate.tsv"
+
+# Create tmp directory if not exists
+dir.create(tmp_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Read sample info with skip first empty line
+sample_info <- fread(sample_info_path, header = TRUE, sep = "\t", skip = 1) %>%
+  mutate(
+    condition = factor(`TreatmentTreatment`, levels = c("non-cancer control", "cancer-bearing")),
+    batch = Study
+  )
+
+# Read all count files
+count_files <- list.files(count_dir, pattern = "\\.gene\\.expr\\.tsv$", full.names = TRUE)
+count_data <- map_dfc(count_files, function(file) {
+  sample_id <- str_extract(basename(file), "^DRX\\d+")
+  fread(file, header = FALSE, col.names = c("gene_id", sample_id)) %>%
+    column_to_rownames("gene_id")
+})
+
+# Ensure sample order matches
+count_data <- count_data[, sample_info$Experiment]
+
+# Create DESeq2 object
+dds <- DESeqDataSetFromMatrix(
+  countData = count_data,
+  colData = sample_info,
+  design = ~ batch + condition
+)
+
+# Pre-filter to remove low count genes
+dds <- dds[rowSums(counts(dds)) > 1, ]
+
+# Run DESeq2 analysis
+dds <- DESeq(dds)
+
+# Get results (comparing cancer-bearing vs non-cancer control)
+res <- results(dds, contrast = c("condition", "cancer-bearing", "non-cancer control"))
+
+# Sort by adjusted p-value
+res_sorted <- res %>%
+  as.data.frame() %>%
+  rownames_to_column("gene_id") %>%
+  arrange(padj) %>%
+  filter(!is.na(padj))
+
+# Save top 50 genes
+top50 <- head(res_sorted, 50)
+fwrite(top50, output_path, sep = "\t", row.names = FALSE)
+
+# Save intermediate results
+fwrite(res_sorted, file.path(tmp_dir, "all_results.tsv"), sep = "\t", row.names = FALSE)
+
+print(paste("Analysis completed. Top 50 genes saved to", output_path))
+print(paste("All results saved to", file.path(tmp_dir, "all_results.tsv")))
+</execute>
+<observation>Error running R code:
+Loading required package: S4Vectors
+Loading required package: stats4
+Loading required package: BiocGenerics
+
+Attaching package: ‘BiocGenerics’
+
+The following objects are masked from ‘package:stats’:
+
+    IQR, mad, sd, var, xtabs
+
+The following objects are masked from ‘package:base’:
+
+    anyDuplicated, aperm, append, as.data.frame, basename, cbind,
+    colnames, dirname, do.call, duplicated, eval, evalq, Filter, Find,
+    get, grep, grepl, intersect, is.unsorted, lapply, Map, mapply,
+    match, mget, order, paste, pmax, pmax.int, pmin, pmin.int,
+    Position, rank, rbind, Reduce, rownames, sapply, setdiff, sort,
+    table, tapply, union, unique, unsplit, which.max, which.min
+
+
+Attaching package: ‘S4Vectors’
+
+The following object is masked from ‘package:utils’:
+
+    findMatches
+
+The following objects are masked from ‘package:base’:
+
+    expand.grid, I, unname
+
+Loading required package: IRanges
+Loading required package: GenomicRanges
+Loading required package: GenomeInfoDb
+Loading required package: SummarizedExperiment
+Loading required package: MatrixGenerics
+Loading required package: matrixStats
+
+Attaching package: ‘MatrixGenerics’
+
+The following objects are masked from ‘package:matrixStats’:
+
+    colAlls, colAnyNAs, colAnys, colAvgsPerRowSet, colCollapse,
+    colCounts, colCummaxs, colCummins, colCumprods, colCumsums,
+    colDiffs, colIQRDiffs, colIQRs, colLogSumExps, colMadDiffs,
+    colMads, colMaxs, colMeans2, colMedians, colMins, colOrderStats,
+    colProds, colQuantiles, colRanges, colRanks, colSdDiffs, colSds,
+    colSums2, colTabulates, colVarDiffs, colVars, colWeightedMads,
+    colWeightedMeans, colWeightedMedians, colWeightedSds,
+    colWeightedVars, rowAlls, rowAnyNAs, rowAnys, rowAvgsPerColSet,
+    rowCollapse, rowCounts, rowCummaxs, rowCummins, rowCumprods,
+    rowCumsums, rowDiffs, rowIQRDiffs, rowIQRs, rowLogSumExps,
+    rowMadDiffs, rowMads, rowMaxs, rowMeans2, rowMedians, rowMins,
+    rowOrderStats, rowProds, rowQuantiles, rowRanges, rowRanks,
+    rowSdDiffs, rowSds, rowSums2, rowTabulates, rowVarDiffs, rowVars,
+    rowWeightedMads, rowWeightedMeans, rowWeightedMedians,
+    rowWeightedSds, rowWeightedVars
+
+Loading required package: Biobase
+Welcome to Bioconductor
+
+    Vignettes contain introductory material; view with
+    'browseVignettes()'. To cite Bioconductor, see
+    'citation("Biobase")', and for packages 'citation("pkgname")'.
+
+
+Attaching package: ‘Biobase’
+
+The following object is masked from ‘package:MatrixGenerics’:
+
+    rowMedians
+
+The following objects are masked from ‘package:matrixStats’:
+
+    anyMissing, rowMedians
+
+── Attaching core tidyverse packages ──────────────────────── tidyverse 2.0.0 ──
+✔ dplyr     1.1.4     ✔ readr     2.1.5
+✔ forcats   1.0.0     ✔ stringr   1.5.2
+✔ ggplot2   3.5.2     ✔ tibble    3.3.0
+✔ lubridate 1.9.4     ✔ tidyr     1.3.1
+✔ purrr     1.1.0     
+── Conflicts ────────────────────────────────────────── tidyverse_conflicts() ──
+✖ lubridate::%within%() masks IRanges::%within%()
+✖ dplyr::collapse()     masks IRanges::collapse()
+✖ dplyr::combine()      masks Biobase::combine(), BiocGenerics::combine()
+✖ dplyr::count()        masks matrixStats::count()
+✖ dplyr::desc()         masks IRanges::desc()
+✖ tidyr::expand()       masks S4Vectors::expand()
+✖ dplyr::filter()       masks stats::filter()
+✖ dplyr::first()        masks S4Vectors::first()
+✖ dplyr::lag()          masks stats::lag()
+✖ ggplot2::Position()   masks BiocGenerics::Position(), base::Position()
+✖ purrr::reduce()       masks GenomicRanges::reduce(), IRanges::reduce()
+✖ dplyr::rename()       masks S4Vectors::rename()
+✖ lubridate::second()   masks S4Vectors::second()
+✖ lubridate::second<-() masks S4Vectors::second<-()
+✖ dplyr::slice()        masks IRanges::slice()
+ℹ Use the conflicted package (<http://conflicted.r-lib.org/>) to force all conflicts to become errors
+Warning messages:
+1: package ‘tidyverse’ was built under R version 4.3.3 
+2: package ‘ggplot2’ was built under R version 4.3.3 
+3: package ‘tibble’ was built under R version 4.3.3 
+4: package ‘tidyr’ was built under R version 4.3.3 
+5: package ‘readr’ was built under R version 4.3.3 
+6: package ‘purrr’ was built under R version 4.3.3 
+7: package ‘dplyr’ was built under R version 4.3.3 
+8: package ‘stringr’ was built under R version 4.3.3 
+9: package ‘forcats’ was built under R version 4.3.3 
+10: package ‘lubridate’ was built under R version 4.3.3 
+
+Attaching package: ‘data.table’
+
+The following objects are masked from ‘package:lubridate’:
+
+    hour, isoweek, mday, minute, month, quarter, second, wday, week,
+    yday, year
+
+The following objects are masked from ‘package:dplyr’:
+
+    between, first, last
+
+The following object is masked from ‘package:purrr’:
+
+    transpose
+
+The following object is masked from ‘package:SummarizedExperiment’:
+
+    shift
+
+The following object is masked from ‘package:GenomicRanges’:
+
+    shift
+
+The following object is masked from ‘package:IRanges’:
+
+    shift
+
+The following objects are masked from ‘package:S4Vectors’:
+
+    first, second
+
+Warning message:
+package ‘data.table’ was built under R version 4.3.3 
+Error in `mutate()`:
+ℹ In argument: `condition = factor(TreatmentTreatment, levels =
+  c("non-cancer control", "cancer-bearing"))`.
+Caused by error:
+! object 'TreatmentTreatment' not found
+Backtrace:
+     ▆
+  1. ├─... %>% ...
+  2. ├─dplyr::mutate(...)
+  3. ├─dplyr:::mutate.data.frame(...)
+  4. │ └─dplyr:::mutate_cols(.data, dplyr_quosures(...), by)
+  5. │   ├─base::withCallingHandlers(...)
+  6. │   └─dplyr:::mutate_col(dots[[i]], data, mask, new_columns)
+  7. │     └─mask$eval_all_mutate(quo)
+  8. │       └─dplyr (local) eval()
+  9. ├─base::factor(...)
+ 10. └─base::.handleSimpleError(...)
+ 11.   └─dplyr (local) h(simpleError(msg, call))
+ 12.     └─rlang::abort(message, class = error_class, parent = parent, call = error_call)
+Execution halted
+</observation>
+<execute>#!R
+# Load required libraries
+library(DESeq2)
+library(tidyverse)
+library(data.table)
+
+# Set directories
+count_dir <- "benchmark/dataset/MetazExp/count/"
+sample_info_path <- "benchmark/dataset/MetazExp/sample_info.tsv"
+tmp_dir <- "/root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/metazexp_annotate"
+output_path <- "/root/autodl-tmp/biomni_v20260208_pred_results/doubao-seed-1-8/metazexp_annotate.tsv"
+
+# Create tmp directory if not exists
+dir.create(tmp_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Define column names manually
+col_names <- c("Study", "Experiment", "Source", "Strain", "Genotype", 
+               "DevelopmentDevelopment", "Tissue", "TreatmentTreatment", 
+               "Mapped Bases", "SeqLen")
+
+# Read sample info with manual column names
+sample_info <- fread(sample_info_path, header = FALSE, sep = "\t", skip = 1, col.names = col_names) %>%
+  mutate(
+    condition = factor(TreatmentTreatment, levels = c("non-cancer control", "cancer-bearing")),
+    batch = Study
+  )
+
+# Read all count files
+count_files <- list.files(count_dir, pattern = "\\.gene\\.expr\\.tsv$", full.names = TRUE)
+count_data <- map_dfc(count_files, function(file) {
+  sample_id <- str_extract(basename(file), "^DRX\\d+")
+  fread(file, header = FALSE, col.names = c("gene_id", sample_id)) %>%
+    column_to_rownames("gene_id")
+})
+
+# Ensure sample order matches
+count_data <- count_data[, sample_info$Experiment]
+
+# Create DESeq2 object
+dds <- DESeqDataSetFromMatrix(
+  countData = count_data,
+  colData = sample_info,
+  design = ~ batch + condition
+)
+
+# Pre-filter to remove low count genes
+dds <- dds[rowSums(counts(dds)) > 1, ]
+
+# Run DESeq2 analysis
+dds <- DESeq(dds)
+
+# Get results (comparing cancer-bearing vs non-cancer control)
+res <- results(dds, contrast = c("condition", "cancer-bearing", "non-cancer control"))
+
+# Sort by adjusted p-value
+res_sorted <- res %>%
+  as.data.frame() %>%
+  rownames_to_column("gene_id") %>%
+  arrange(padj) %>%
+  filter(!is.na(padj))
+
+# Save top 50 genes
+top50 <- head(res_sorted, 50)
+fwrite(top50, output_path, sep = "\t", row.names = FALSE)
+
+# Save intermediate results
+fwrite(res_sorted, file.path(tmp_dir, "all_results.tsv"), sep = "\t", row.names = FALSE)
+
+print(paste("Analysis completed. Top 50 genes saved to", output_path))
+print(paste("All results saved to", file.path(tmp_dir, "all_results.tsv")))
+</execute>
+<observation>Error running R code:
+Loading required package: S4Vectors
+Loading required package: stats4
+Loading required package: BiocGenerics
+
+Attaching package: ‘BiocGenerics’
+
+The following objects are masked from ‘package:stats’:
+
+    IQR, mad, sd, var, xtabs
+
+The following objects are masked from ‘package:base’:
+
+    anyDuplicated, aperm, append, as.data.frame, basename, cbind,
+    colnames, dirname, do.call, duplicated, eval, evalq, Filter, Find,
+    get, grep, grepl, intersect, is.unsorted, lapply, Map, mapply,
+    match, mget, order, paste, pmax, pmax.int, pmin, pmin.int,
+    Position, rank, rbind, Reduce, rownames, sapply, setdiff, sort,
+    table, tapply, union, unique, unsplit, which.max, which.min
+
+
+Attaching package: ‘S4Vectors’
+
+The following object is masked from ‘package:utils’:
+
+    findMatches
+
+The following objects are masked from ‘package:base’:
+
+    expand.grid, I, unname
+
+Loading required package: IRanges
+Loading required package: GenomicRanges
+Loading required package: GenomeInfoDb
+Loading required package: SummarizedExperiment
+Loading required package: MatrixGenerics
+Loading required package: matrixStats
+
+Attaching package: ‘MatrixGenerics’
+
+The following objects are masked from ‘package:matrixStats’:
+
+    colAlls, colAnyNAs, colAnys, colAvgsPerRowSet, colCollapse,
+    colCounts, colCummaxs, colCummins, colCumprods, colCumsums,
+    colDiffs, colIQRDiffs, colIQRs, colLogSumExps, colMadDiffs,
+    colMads, colMaxs, colMeans2, colMedians, colMins, colOrderStats,
+    colProds, colQuantiles, colRanges, colRanks, colSdDiffs, colSds,
+    colSums2, colTabulates, colVarDiffs, colVars, colWeightedMads,
+    colWeightedMeans, colWeightedMedians, colWeightedSds,
+    colWeightedVars, rowAlls, rowAnyNAs, rowAnys, rowAvgsPerColSet,
+    rowCollapse, rowCounts, rowCummaxs, rowCummins, rowCumprods,
+    rowCumsums, rowDiffs, rowIQRDiffs, rowIQRs, rowLogSumExps,
+    rowMadDiffs, rowMads, rowMaxs, rowMeans2, rowMedians, rowMins,
+    rowOrderStats, rowProds, rowQuantiles, rowRanges, rowRanks,
+    rowSdDiffs, rowSds, rowSums2, rowTabulates, rowVarDiffs, rowVars,
+    rowWeightedMads, rowWeightedMeans, rowWeightedMedians,
+    rowWeightedSds, rowWeightedVars
+
+Loading required package: Biobase
+Welcome to Bioconductor
+
+    Vignettes contain introductory material; view with
+    'browseVignettes()'. To cite Bioconductor, see
+    'citation("Biobase")', and for packages 'citation("pkgname")'.
+
+
+Attaching package: ‘Biobase’
+
+The following object is masked from ‘package:MatrixGenerics’:
+
+    rowMedians
+
+The following objects are masked from ‘package:matrixStats’:
+
+    anyMissing, rowMedians
+
+── Attaching core tidyverse packages ──────────────────────── tidyverse 2.0.0 ──
+✔ dplyr     1.1.4     ✔ readr     2.1.5
+✔ forcats   1.0.0     ✔ stringr   1.5.2
+✔ ggplot2   3.5.2     ✔ tibble    3.3.0
+✔ lubridate 1.9.4     ✔ tidyr     1.3.1
+✔ purrr     1.1.0     
+── Conflicts ────────────────────────────────────────── tidyverse_conflicts() ──
+✖ lubridate::%within%() masks IRanges::%within%()
+✖ dplyr::collapse()     masks IRanges::collapse()
+✖ dplyr::combine()      masks Biobase::combine(), BiocGenerics::combine()
+✖ dplyr::count()        masks matrixStats::count()
+✖ dplyr::desc()         masks IRanges::desc()
+✖ tidyr::expand()       masks S4Vectors::expand()
+✖ dplyr::filter()       masks stats::filter()
+✖ dplyr::first()        masks S4Vectors::first()
+✖ dplyr::lag()          masks stats::lag()
+✖ ggplot2::Position()   masks BiocGenerics::Position(), base::Position()
+✖ purrr::reduce()       masks GenomicRanges::reduce(), IRanges::reduce()
+✖ dplyr::rename()       masks S4Vectors::rename()
+✖ lubridate::second()   masks S4Vectors::second()
+✖ lubridate::second<-() masks S4Vectors::second<-()
+✖ dplyr::slice()        masks IRanges::slice()
+ℹ Use the conflicted package (<http://conflicted.r-lib.org/>) to force all conflicts to become errors
+Warning messages:
+1: package ‘tidyverse’ was built under R version 4.3.3 
+2: package ‘ggplot2’ was built under R version 4.3.3 
+3: package ‘tibble’ was built under R version 4.3.3 
+4: package ‘tidyr’ was built under R version 4.3.3 
+5: package ‘readr’ was built under R version 4.3.3 
+6: package ‘purrr’ was built under R version 4.3.3 
+7: package ‘dplyr’ was built under R version 4.3.3 
+8: package ‘stringr’ was built under R version 4.3.3 
+9: package ‘forcats’ was built under R version 4.3.3 
+10: package ‘lubridate’ was built under R version 4.3.3 
+
+Attaching package: ‘data.table’
+
+The following objects are masked from ‘package:lubridate’:
+
+    hour, isoweek, mday, minute, month, quarter, second, wday, week,
+    yday, year
+
+The following objects are masked from ‘package:dplyr’:
+
+    between, first, last
+
+The following object is masked from ‘package:purrr’:
+
+    transpose
+
+The following object is masked from ‘package:SummarizedExperiment’:
+
+    shift
+
+The following object is masked from ‘package:GenomicRanges’:
+
+    shift
+
+The following object is masked from ‘package:IRanges’:
+
+    shift
+
+The following objects are masked from ‘package:S4Vectors’:
+
+    first, second
+
+Warning message:
+package ‘data.table’ was built under R version 4.3.3 
+Error: Can't assign 10 names to a 14-column data.table
+Execution halted
+</observation>
+<execute>#!BASH
+# Check number of columns in sample info
+awk -F'\t' 'NR==2 {print NF}' benchmark/dataset/MetazExp/sample_info.tsv
+</execute>
+<observation>10
+</observation>
+<execute>#!R
+# Load required libraries
+library(DESeq2)
+library(tidyverse)
+library(data.table)
+
+# Set directories
+count_dir <- "benchmark/dataset/MetazExp/count/"
+tmp_dir <- "/root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/metazexp_annotate"
+output_path <- "/root/autodl-tmp/biomni_v20260208_pred_results/doubao-seed-1-8/metazexp_annotate.tsv"
+
+# Create tmp directory if not exists
+dir.create(tmp_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Create sample info manually
+sample_info <- tibble(
+  Experiment = c("DRX198149", "DRX198150", "DRX198151", 
+                 "DRX198152", "DRX198153", "DRX198154"),
+  Study = rep("DRP006530", 6),
+  TreatmentTreatment = c(rep("cancer-bearing", 3), rep("non-cancer control", 3)),
+  condition = factor(TreatmentTreatment, levels = c("non-cancer control", "cancer-bearing")),
+  batch = Study
+)
+
+# Read all count files
+count_files <- list.files(count_dir, pattern = "\\.gene\\.expr\\.tsv$", full.names = TRUE)
+count_data <- map_dfc(count_files, function(file) {
+  sample_id <- str_extract(basename(file), "^DRX\\d+")
+  fread(file, header = FALSE, col.names = c("gene_id", sample_id)) %>%
+    column_to_rownames("gene_id")
+})
+
+# Ensure sample order matches
+count_data <- count_data[, sample_info$Experiment]
+
+# Create DESeq2 object
+dds <- DESeqDataSetFromMatrix(
+  countData = count_data,
+  colData = sample_info,
+  design = ~ batch + condition
+)
+
+# Pre-filter to remove low count genes
+dds <- dds[rowSums(counts(dds)) > 1, ]
+
+# Run DESeq2 analysis
+dds <- DESeq(dds)
+
+# Get results (comparing cancer-bearing vs non-cancer control)
+res <- results(dds, contrast = c("condition", "cancer-bearing", "non-cancer control"))
+
+# Sort by adjusted p-value
+res_sorted <- res %>%
+  as.data.frame() %>%
+  rownames_to_column("gene_id") %>%
+  arrange(padj) %>%
+  filter(!is.na(padj))
+
+# Save top 50 genes
+top50 <- head(res_sorted, 50)
+fwrite(top50, output_path, sep = "\t", row.names = FALSE)
+
+# Save intermediate results
+fwrite(res_sorted, file.path(tmp_dir, "all_results.tsv"), sep = "\t", row.names = FALSE)
+
+print(paste("Analysis completed. Top 50 genes saved to", output_path))
+print(paste("All results saved to", file.path(tmp_dir, "all_results.tsv")))
+</execute>
+<observation>Error running R code:
+Loading required package: S4Vectors
+Loading required package: stats4
+Loading required package: BiocGenerics
+
+Attaching package: ‘BiocGenerics’
+
+The following objects are masked from ‘package:stats’:
+
+    IQR, mad, sd, var, xtabs
+
+The following objects are masked from ‘package:base’:
+
+    anyDuplicated, aperm, append, as.data.frame, basename, cbind,
+    colnames, dirname, do.call, duplicated, eval, evalq, Filter, Find,
+    get, grep, grepl, intersect, is.unsorted, lapply, Map, mapply,
+    match, mget, order, paste, pmax, pmax.int, pmin, pmin.int,
+    Position, rank, rbind, Reduce, rownames, sapply, setdiff, sort,
+    table, tapply, union, unique, unsplit, which.max, which.min
+
+
+Attaching package: ‘S4Vectors’
+
+The following object is masked from ‘package:utils’:
+
+    findMatches
+
+The following objects are masked from ‘package:base’:
+
+    expand.grid, I, unname
+
+Loading required package: IRanges
+Loading required package: GenomicRanges
+Loading required package: GenomeInfoDb
+Loading required package: SummarizedExperiment
+Loading required package: MatrixGenerics
+Loading required package: matrixStats
+
+Attaching package: ‘MatrixGenerics’
+
+The following objects are masked from ‘package:matrixStats’:
+
+    colAlls, colAnyNAs, colAnys, colAvgsPerRowSet, colCollapse,
+    colCounts, colCummaxs, colCummins, colCumprods, colCumsums,
+    colDiffs, colIQRDiffs, colIQRs, colLogSumExps, colMadDiffs,
+    colMads, colMaxs, colMeans2, colMedians, colMins, colOrderStats,
+    colProds, colQuantiles, colRanges, colRanks, colSdDiffs, colSds,
+    colSums2, colTabulates, colVarDiffs, colVars, colWeightedMads,
+    colWeightedMeans, colWeightedMedians, colWeightedSds,
+    colWeightedVars, rowAlls, rowAnyNAs, rowAnys, rowAvgsPerColSet,
+    rowCollapse, rowCounts, rowCummaxs, rowCummins, rowCumprods,
+    rowCumsums, rowDiffs, rowIQRDiffs, rowIQRs, rowLogSumExps,
+    rowMadDiffs, rowMads, rowMaxs, rowMeans2, rowMedians, rowMins,
+    rowOrderStats, rowProds, rowQuantiles, rowRanges, rowRanks,
+    rowSdDiffs, rowSds, rowSums2, rowTabulates, rowVarDiffs, rowVars,
+    rowWeightedMads, rowWeightedMeans, rowWeightedMedians,
+    rowWeightedSds, rowWeightedVars
+
+Loading required package: Biobase
+Welcome to Bioconductor
+
+    Vignettes contain introductory material; view with
+    'browseVignettes()'. To cite Bioconductor, see
+    'citation("Biobase")', and for packages 'citation("pkgname")'.
+
+
+Attaching package: ‘Biobase’
+
+The following object is masked from ‘package:MatrixGenerics’:
+
+    rowMedians
+
+The following objects are masked from ‘package:matrixStats’:
+
+    anyMissing, rowMedians
+
+── Attaching core tidyverse packages ──────────────────────── tidyverse 2.0.0 ──
+✔ dplyr     1.1.4     ✔ readr     2.1.5
+✔ forcats   1.0.0     ✔ stringr   1.5.2
+✔ ggplot2   3.5.2     ✔ tibble    3.3.0
+✔ lubridate 1.9.4     ✔ tidyr     1.3.1
+✔ purrr     1.1.0     
+── Conflicts ────────────────────────────────────────── tidyverse_conflicts() ──
+✖ lubridate::%within%() masks IRanges::%within%()
+✖ dplyr::collapse()     masks IRanges::collapse()
+✖ dplyr::combine()      masks Biobase::combine(), BiocGenerics::combine()
+✖ dplyr::count()        masks matrixStats::count()
+✖ dplyr::desc()         masks IRanges::desc()
+✖ tidyr::expand()       masks S4Vectors::expand()
+✖ dplyr::filter()       masks stats::filter()
+✖ dplyr::first()        masks S4Vectors::first()
+✖ dplyr::lag()          masks stats::lag()
+✖ ggplot2::Position()   masks BiocGenerics::Position(), base::Position()
+✖ purrr::reduce()       masks GenomicRanges::reduce(), IRanges::reduce()
+✖ dplyr::rename()       masks S4Vectors::rename()
+✖ lubridate::second()   masks S4Vectors::second()
+✖ lubridate::second<-() masks S4Vectors::second<-()
+✖ dplyr::slice()        masks IRanges::slice()
+ℹ Use the conflicted package (<http://conflicted.r-lib.org/>) to force all conflicts to become errors
+Warning messages:
+1: package ‘tidyverse’ was built under R version 4.3.3 
+2: package ‘ggplot2’ was built under R version 4.3.3 
+3: package ‘tibble’ was built under R version 4.3.3 
+4: package ‘tidyr’ was built under R version 4.3.3 
+5: package ‘readr’ was built under R version 4.3.3 
+6: package ‘purrr’ was built under R version 4.3.3 
+7: package ‘dplyr’ was built under R version 4.3.3 
+8: package ‘stringr’ was built under R version 4.3.3 
+9: package ‘forcats’ was built under R version 4.3.3 
+10: package ‘lubridate’ was built under R version 4.3.3 
+
+Attaching package: ‘data.table’
+
+The following objects are masked from ‘package:lubridate’:
+
+    hour, isoweek, mday, minute, month, quarter, second, wday, week,
+    yday, year
+
+The following objects are masked from ‘package:dplyr’:
+
+    between, first, last
+
+The following object is masked from ‘package:purrr’:
+
+    transpose
+
+The following object is masked from ‘package:SummarizedExperiment’:
+
+    shift
+
+The following object is masked from ‘package:GenomicRanges’:
+
+    shift
+
+The following object is masked from ‘package:IRanges’:
+
+    shift
+
+The following objects are masked from ‘package:S4Vectors’:
+
+    first, second
+
+Warning message:
+package ‘data.table’ was built under R version 4.3.3 
+Error in `map()`:
+ℹ In index: 1.
+Caused by error:
+! Can't assign 2 names to a 5-column data.table
+Backtrace:
+     ▆
+  1. ├─purrr::map_dfc(...)
+  2. │ └─purrr::map(.x, .f, ...)
+  3. │   └─purrr:::map_("list", .x, .f, ..., .progress = .progress)
+  4. │     ├─purrr:::with_indexed_errors(...)
+  5. │     │ └─base::withCallingHandlers(...)
+  6. │     ├─purrr:::call_with_cleanup(...)
+  7. │     └─global .f(.x[[i]], ...)
+  8. │       ├─... %>% column_to_rownames("gene_id")
+  9. │       └─data.table::fread(...)
+ 10. │         └─data.table::setnames(ans, col.names)
+ 11. │           └─data.table:::stopf(...)
+ 12. │             └─base::stop(...)
+ 13. ├─tibble::column_to_rownames(., "gene_id")
+ 14. │ ├─base::stopifnot(is.data.frame(.data))
+ 15. │ └─base::is.data.frame(.data)
+ 16. └─base::.handleSimpleError(...)
+ 17.   └─purrr (local) h(simpleError(msg, call))
+ 18.     └─cli::cli_abort(...)
+ 19.       └─rlang::abort(...)
+Execution halted
+</observation>
+<execute>#!BASH
+# Check first few lines of a count file
+head -n 3 benchmark/dataset/MetazExp/count/DRX198149.gene.expr.tsv
+</execute>
+<observation>geneId	readCount	Coverage	FPKM	TPM
+FBgn0039635	20831	1530.846436	105.496330	161.640015
+FBgn0086355	28769	2769.733643	150.103287	229.986176
+</observation>
+<execute>#!R
+# Load required libraries
+library(DESeq2)
+library(tidyverse)
+library(data.table)
+
+# Set directories
+count_dir <- "benchmark/dataset/MetazExp/count/"
+tmp_dir <- "/root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/metazexp_annotate"
+output_path <- "/root/autodl-tmp/biomni_v20260208_pred_results/doubao-seed-1-8/metazexp_annotate.tsv"
+
+# Create tmp directory if not exists
+dir.create(tmp_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Create sample info manually
+sample_info <- tibble(
+  Experiment = c("DRX198149", "DRX198150", "DRX198151", 
+                 "DRX198152", "DRX198153", "DRX198154"),
+  Study = rep("DRP006530", 6),
+  TreatmentTreatment = c(rep("cancer-bearing", 3), rep("non-cancer control", 3)),
+  condition = factor(TreatmentTreatment, levels = c("non-cancer control", "cancer-bearing")),
+  batch = Study
+)
+
+# Read all count files
+count_data <- map_dfc(sample_info$Experiment, function(sample_id) {
+  file_path <- file.path(count_dir, paste0(sample_id, ".gene.expr.tsv"))
+  fread(file_path, header = TRUE, sep = "\t") %>%
+    select(geneId, readCount) %>%
+    rename(!!sample_id := readCount) %>%
+    column_to_rownames("geneId")
+})
+
+# Create DESeq2 object
+dds <- DESeqDataSetFromMatrix(
+  countData = count_data,
+  colData = sample_info,
+  design = ~ batch + condition
+)
+
+# Pre-filter to remove low count genes
+dds <- dds[rowSums(counts(dds)) > 1, ]
+
+# Run DESeq2 analysis
+dds <- DESeq(dds)
+
+# Get results (comparing cancer-bearing vs non-cancer control)
+res <- results(dds, contrast = c("condition", "cancer-bearing", "non-cancer control"))
+
+# Sort by adjusted p-value
+res_sorted <- res %>%
+  as.data.frame() %>%
+  rownames_to_column("gene_id") %>%
+  arrange(padj) %>%
+  filter(!is.na(padj))
+
+# Save top 50 genes
+top50 <- head(res_sorted, 50)
+fwrite(top50, output_path, sep = "\t", row.names = FALSE)
+
+# Save intermediate results
+fwrite(res_sorted, file.path(tmp_dir, "all_results.tsv"), sep = "\t", row.names = FALSE)
+
+print(paste("Analysis completed. Top 50 genes saved to", output_path))
+print(paste("All results saved to", file.path(tmp_dir, "all_results.tsv")))
+</execute>
+<observation>Error running R code:
+Loading required package: S4Vectors
+Loading required package: stats4
+Loading required package: BiocGenerics
+
+Attaching package: ‘BiocGenerics’
+
+The following objects are masked from ‘package:stats’:
+
+    IQR, mad, sd, var, xtabs
+
+The following objects are masked from ‘package:base’:
+
+    anyDuplicated, aperm, append, as.data.frame, basename, cbind,
+    colnames, dirname, do.call, duplicated, eval, evalq, Filter, Find,
+    get, grep, grepl, intersect, is.unsorted, lapply, Map, mapply,
+    match, mget, order, paste, pmax, pmax.int, pmin, pmin.int,
+    Position, rank, rbind, Reduce, rownames, sapply, setdiff, sort,
+    table, tapply, union, unique, unsplit, which.max, which.min
+
+
+Attaching package: ‘S4Vectors’
+
+The following object is masked from ‘package:utils’:
+
+    findMatches
+
+The following objects are masked from ‘package:base’:
+
+    expand.grid, I, unname
+
+Loading required package: IRanges
+Loading required package: GenomicRanges
+Loading required package: GenomeInfoDb
+Loading required package: SummarizedExperiment
+Loading required package: MatrixGenerics
+Loading required package: matrixStats
+
+Attaching package: ‘MatrixGenerics’
+
+The following objects are masked from ‘package:matrixStats’:
+
+    colAlls, colAnyNAs, colAnys, colAvgsPerRowSet, colCollapse,
+    colCounts, colCummaxs, colCummins, colCumprods, colCumsums,
+    colDiffs, colIQRDiffs, colIQRs, colLogSumExps, colMadDiffs,
+    colMads, colMaxs, colMeans2, colMedians, colMins, colOrderStats,
+    colProds, colQuantiles, colRanges, colRanks, colSdDiffs, colSds,
+    colSums2, colTabulates, colVarDiffs, colVars, colWeightedMads,
+    colWeightedMeans, colWeightedMedians, colWeightedSds,
+    colWeightedVars, rowAlls, rowAnyNAs, rowAnys, rowAvgsPerColSet,
+    rowCollapse, rowCounts, rowCummaxs, rowCummins, rowCumprods,
+    rowCumsums, rowDiffs, rowIQRDiffs, rowIQRs, rowLogSumExps,
+    rowMadDiffs, rowMads, rowMaxs, rowMeans2, rowMedians, rowMins,
+    rowOrderStats, rowProds, rowQuantiles, rowRanges, rowRanks,
+    rowSdDiffs, rowSds, rowSums2, rowTabulates, rowVarDiffs, rowVars,
+    rowWeightedMads, rowWeightedMeans, rowWeightedMedians,
+    rowWeightedSds, rowWeightedVars
+
+Loading required package: Biobase
+Welcome to Bioconductor
+
+    Vignettes contain introductory material; view with
+    'browseVignettes()'. To cite Bioconductor, see
+    'citation("Biobase")', and for packages 'citation("pkgname")'.
+
+
+Attaching package: ‘Biobase’
+
+The following object is masked from ‘package:MatrixGenerics’:
+
+    rowMedians
+
+The following objects are masked from ‘package:matrixStats’:
+
+    anyMissing, rowMedians
+
+── Attaching core tidyverse packages ──────────────────────── tidyverse 2.0.0 ──
+✔ dplyr     1.1.4     ✔ readr     2.1.5
+✔ forcats   1.0.0     ✔ stringr   1.5.2
+✔ ggplot2   3.5.2     ✔ tibble    3.3.0
+✔ lubridate 1.9.4     ✔ tidyr     1.3.1
+✔ purrr     1.1.0     
+── Conflicts ────────────────────────────────────────── tidyverse_conflicts() ──
+✖ lubridate::%within%() masks IRanges::%within%()
+✖ dplyr::collapse()     masks IRanges::collapse()
+✖ dplyr::combine()      masks Biobase::combine(), BiocGenerics::combine()
+✖ dplyr::count()        masks matrixStats::count()
+✖ dplyr::desc()         masks IRanges::desc()
+✖ tidyr::expand()       masks S4Vectors::expand()
+✖ dplyr::filter()       masks stats::filter()
+✖ dplyr::first()        masks S4Vectors::first()
+✖ dplyr::lag()          masks stats::lag()
+✖ ggplot2::Position()   masks BiocGenerics::Position(), base::Position()
+✖ purrr::reduce()       masks GenomicRanges::reduce(), IRanges::reduce()
+✖ dplyr::rename()       masks S4Vectors::rename()
+✖ lubridate::second()   masks S4Vectors::second()
+✖ lubridate::second<-() masks S4Vectors::second<-()
+✖ dplyr::slice()        masks IRanges::slice()
+ℹ Use the conflicted package (<http://conflicted.r-lib.org/>) to force all conflicts to become errors
+Warning messages:
+1: package ‘tidyverse’ was built under R version 4.3.3 
+2: package ‘ggplot2’ was built under R version 4.3.3 
+3: package ‘tibble’ was built under R version 4.3.3 
+4: package ‘tidyr’ was built under R version 4.3.3 
+5: package ‘readr’ was built under R version 4.3.3 
+6: package ‘purrr’ was built under R version 4.3.3 
+7: package ‘dplyr’ was built under R version 4.3.3 
+8: package ‘stringr’ was built under R version 4.3.3 
+9: package ‘forcats’ was built under R version 4.3.3 
+10: package ‘lubridate’ was built under R version 4.3.3 
+
+Attaching package: ‘data.table’
+
+The following objects are masked from ‘package:lubridate’:
+
+    hour, isoweek, mday, minute, month, quarter, second, wday, week,
+    yday, year
+
+The following objects are masked from ‘package:dplyr’:
+
+    between, first, last
+
+The following object is masked from ‘package:purrr’:
+
+    transpose
+
+The following object is masked from ‘package:SummarizedExperiment’:
+
+    shift
+
+The following object is masked from ‘package:GenomicRanges’:
+
+    shift
+
+The following object is masked from ‘package:IRanges’:
+
+    shift
+
+The following objects are masked from ‘package:S4Vectors’:
+
+    first, second
+
+Warning message:
+package ‘data.table’ was built under R version 4.3.3 
+Error in `contrasts<-`(`*tmp*`, value = contr.funs[1 + isOF[nn]]) : 
+  contrasts can be applied only to factors with 2 or more levels
+Calls: DESeqDataSetFromMatrix -> DESeqDataSet -> <Anonymous> -> contrasts<-
+In addition: Warning message:
+In DESeqDataSet(se, design = design, ignoreRank) :
+  some variables in design formula are characters, converting to factors
+Execution halted
+</observation>
+<execute>#!R
+# Load required libraries
+library(DESeq2)
+library(tidyverse)
+library(data.table)
+
+# Set directories
+count_dir <- "benchmark/dataset/MetazExp/count/"
+tmp_dir <- "/root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/metazexp_annotate"
+output_path <- "/root/autodl-tmp/biomni_v20260208_pred_results/doubao-seed-1-8/metazexp_annotate.tsv"
+
+# Create tmp directory if not exists
+dir.create(tmp_dir, recursive = TRUE, showWarnings = FALSE)
+
+# Create sample info manually
+sample_info <- tibble(
+  Experiment = c("DRX198149", "DRX198150", "DRX198151", 
+                 "DRX198152", "DRX198153", "DRX198154"),
+  condition = factor(c(rep("cancer-bearing", 3), rep("non-cancer control", 3)), 
+                     levels = c("non-cancer control", "cancer-bearing"))
+)
+
+# Read all count files
+count_data <- map_dfc(sample_info$Experiment, function(sample_id) {
+  file_path <- file.path(count_dir, paste0(sample_id, ".gene.expr.tsv"))
+  fread(file_path, header = TRUE, sep = "\t") %>%
+    select(geneId, readCount) %>%
+    rename(!!sample_id := readCount) %>%
+    column_to_rownames("geneId")
+})
+
+# Create DESeq2 object (all samples are from same batch, so no batch correction needed)
+dds <- DESeqDataSetFromMatrix(
+  countData = count_data,
+  colData = sample_info,
+  design = ~ condition
+)
+
+# Pre-filter to remove low count genes
+dds <- dds[rowSums(counts(dds)) > 1, ]
+
+# Run DESeq2 analysis
+dds <- DESeq(dds)
+
+# Get results (comparing cancer-bearing vs non-cancer control)
+res <- results(dds, contrast = c("condition", "cancer-bearing", "non-cancer control"))
+
+# Sort by adjusted p-value
+res_sorted <- res %>%
+  as.data.frame() %>%
+  rownames_to_column("gene_id") %>%
+  arrange(padj) %>%
+  filter(!is.na(padj))
+
+# Save top 50 genes
+top50 <- head(res_sorted, 50)
+fwrite(top50, output_path, sep = "\t", row.names = FALSE)
+
+# Save intermediate results
+fwrite(res_sorted, file.path(tmp_dir, "all_results.tsv"), sep = "\t", row.names = FALSE)
+
+print(paste("Analysis completed. Top 50 genes saved to", output_path))
+print(paste("All results saved to", file.path(tmp_dir, "all_results.tsv")))
+</execute>
+<observation>[1] "Analysis completed. Top 50 genes saved to /root/autodl-tmp/biomni_v20260208_pred_results/doubao-seed-1-8/metazexp_annotate.tsv"
+[1] "All results saved to /root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/metazexp_annotate/all_results.tsv"
+</observation>
+<execute>#!BASH
+# Check the output file
+head -n 5 /root/autodl-tmp/biomni_v20260208_pred_results/doubao-seed-1-8/metazexp_annotate.tsv
+</execute>
+<observation>gene_id	baseMean	log2FoldChange	lfcSE	stat	pvalue	padj
+FBgn0038028	3038.26387547461	-29.4116804243113	2.96032190408386	-9.9352980443569	2.92300509642976e-23	3.77330727898118e-19
+FBgn0052173	2776.4993852518	-29.2023811612151	3.02980490755383	-9.63837014337409	5.50551362722157e-22	3.55353377069016e-18
+FBgn0267317	8442.50572097658	-14.3196691839239	2.01555432897712	-7.10458109615484	1.20688038087233e-12	5.19320627889363e-09
+FBgn0266156	4006.11370829209	-12.4762144648257	1.79461312170106	-6.95203568610925	3.60052288677925e-12	1.16197874863583e-08
+</observation>
+<solution>
+Differential expression analysis completed successfully. The top 50 most significantly differentially expressed genes (ranked by adjusted p-value) have been saved to `/root/autodl-tmp/biomni_v20260208_pred_results/doubao-seed-1-8/metazexp_annotate.tsv`.
+
+Key details:
+- Analysis compared cancer-bearing vs non-cancer control conditions
+- All samples were from the same study/batch, so batch correction was not necessary (but we maintained the experimental design integrity)
+- Results include standard DESeq2 output columns: gene_id, baseMean, log2FoldChange, lfcSE, stat, pvalue, padj
+
+First 5 rows of the output:
+```
+gene_id	baseMean	log2FoldChange	lfcSE	stat	pvalue	padj
+FBgn0038028	3038.26387547461	-29.4116804243113	2.96032190408386	-9.9352980443569	2.92300509642976e-23	3.77330727898118e-19
+FBgn0052173	2776.4993852518	-29.2023811612151	3.02980490755383	-9.63837014337409	5.50551362722157e-22	3.55353377069016e-18
+FBgn0267317	8442.50572097658	-14.3196691839239	2.01555432897712	-7.10458109615484	1.20688038087233e-12	5.19320627889363e-09
+FBgn0266156	4006.11370829209	-12.4762144648257	1.79461312170106	-6.95203568610925	3.60052288677925e-12	1.16197874863583e-08
+```
+</solution>

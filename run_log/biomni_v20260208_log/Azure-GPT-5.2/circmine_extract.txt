@@ -1,0 +1,1908 @@
+# Core Task
+Query the NCBI GEO database for Series `GSE101684` to retrieve all associated samples and extract specific **patient-level** clinical metadata (age, gender, disease state, stage, and country). It is critical to ensure that extracted attributes describe the individual patient; specifically, if multiple samples (such as controls or replicates) originate from the same individual, they must be consolidated so that each patient is counted only once in the final dataset.
+
+# Output Requirements & File Path
+- Output format: A CSV file with the following columns (exactly matching the ground truth CSV headers). Use "N/A" for missing values.
+  - `series`: The GEO Series accession (e.g., "GSE101684").
+  - `age`: The patient's age as a numeric value.
+  - `gender`: The patient's sex (e.g., "male", "female").
+  - `disease state`: The full textual description of the disease status.
+  - `stage`: The clinical tumor stage description.
+  - `country`: The patient's country of origin.
+- Save Path: Save the result to: `/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/circmine_extract.csv`
+- Intermediate Storage Path: All intermediate code generated during execution, downloaded files, and temporary results must be stored in `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/circmine_extract/`
+
+# Output Example (For Reference Only)
+series,age,gender,disease state,stage,country
+GSE114342,24,male,Early stage lung adenocarcinoma,T1bN0M0 IA,USA
+GSE114342,N/A,female,Non-small cell lung cancer,N/A,China
+
+<execute>#!/usr/bin/env python3
+import os, re, textwrap, json
+import pandas as pd
+from pathlib import Path
+import urllib.request
+
+# Paths
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/circmine_extract/")
+out_path = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/circmine_extract.csv")
+tmp_dir.mkdir(parents=True, exist_ok=True)
+out_path.parent.mkdir(parents=True, exist_ok=True)
+
+print("Research log: starting GEO query for GSE101684")
+print("TMP:", tmp_dir)
+print("OUT:", out_path)
+
+# Plan checklist
+plan = [
+"Query GEO for GSE101684 and list all GSM samples (download Series Matrix if available).",
+"Parse GSM-level metadata to extract patient-level attributes (age, gender, disease state, stage, country) and identify patient IDs for de-duplication.",
+"Consolidate multiple samples per patient into one record and write final CSV with required headers to the specified path."
+]
+for i,s in enumerate(plan,1):
+    print(f"{i}. [ ] {s}")
+
+# Step 1: download series matrix or SOFT
+gse = "GSE101684"
+base = "https://ftp.ncbi.nlm.nih.gov/geo/series/"
+prefix = gse[:-3] + "nnn"
+series_dir = f"{base}{prefix}/{gse}/matrix/"
+matrix_gz = f"{series_dir}{gse}_series_matrix.txt.gz"
+soft_dir = f"{base}{prefix}/{gse}/soft/"
+soft_gz = f"{soft_dir}{gse}_family.soft.gz"
+
+def download(url, dest):
+    try:
+        urllib.request.urlretrieve(url, dest)
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+matrix_path = tmp_dir / f"{gse}_series_matrix.txt.gz"
+soft_path = tmp_dir / f"{gse}_family.soft.gz"
+
+ok, err = download(matrix_gz, matrix_path)
+print("\nAttempt download matrix:", matrix_gz, "->", ok, err)
+if not ok:
+    ok2, err2 = download(soft_gz, soft_path)
+    print("Attempt download SOFT:", soft_gz, "->", ok2, err2)
+else:
+    ok2 = False
+
+print("\nStep 1 status:")
+print("Matrix exists:", matrix_path.exists(), "size:", matrix_path.stat().st_size if matrix_path.exists() else None)
+print("SOFT exists:", soft_path.exists(), "size:", soft_path.stat().st_size if soft_path.exists() else None)
+
+# Mark step 1 complete if either file downloaded
+step1_done = matrix_path.exists() or soft_path.exists()
+print("\nUpdated plan:")
+for i,s in enumerate(plan,1):
+    chk = "✓" if (i==1 and step1_done) else " "
+    print(f"{i}. [{chk}] {s}")
+
+# If neither exists, show directory listing attempt via GEO web page (fallback) - but stop here for now.
+</execute>
+<observation>Research log: starting GEO query for GSE101684
+TMP: /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/circmine_extract
+OUT: /root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/circmine_extract.csv
+1. [ ] Query GEO for GSE101684 and list all GSM samples (download Series Matrix if available).
+2. [ ] Parse GSM-level metadata to extract patient-level attributes (age, gender, disease state, stage, country) and identify patient IDs for de-duplication.
+3. [ ] Consolidate multiple samples per patient into one record and write final CSV with required headers to the specified path.
+
+Attempt download matrix: https://ftp.ncbi.nlm.nih.gov/geo/series/GSE101nnn/GSE101684/matrix/GSE101684_series_matrix.txt.gz -> False name 'urllib' is not defined
+Attempt download SOFT: https://ftp.ncbi.nlm.nih.gov/geo/series/GSE101nnn/GSE101684/soft/GSE101684_family.soft.gz -> False name 'urllib' is not defined
+
+Step 1 status:
+Matrix exists: False size: None
+SOFT exists: False size: None
+
+Updated plan:
+1. [ ] Query GEO for GSE101684 and list all GSM samples (download Series Matrix if available).
+2. [ ] Parse GSM-level metadata to extract patient-level attributes (age, gender, disease state, stage, country) and identify patient IDs for de-duplication.
+3. [ ] Consolidate multiple samples per patient into one record and write final CSV with required headers to the specified path.
+</observation>
+<execute>#!/usr/bin/env python3
+import os, re, gzip
+from pathlib import Path
+import urllib.request
+
+import pandas as pd
+
+# Paths
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/circmine_extract/")
+out_path = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/circmine_extract.csv")
+tmp_dir.mkdir(parents=True, exist_ok=True)
+out_path.parent.mkdir(parents=True, exist_ok=True)
+
+gse = "GSE101684"
+
+print("Reasoning: previous run failed because urllib module wasn't imported; retry download with urllib.request and proceed.")
+plan = [
+"Query GEO for GSE101684 and list all GSM samples (download Series Matrix if available).",
+"Parse GSM-level metadata to extract patient-level attributes (age, gender, disease state, stage, country) and identify patient IDs for de-duplication.",
+"Consolidate multiple samples per patient into one record and write final CSV with required headers to the specified path."
+]
+def show_plan(step1=False, step2=False, step3=False, fail=None):
+    statuses = {1:step1,2:step2,3:step3}
+    print("\nUpdated plan:")
+    for i,s in enumerate(plan,1):
+        if fail and fail[0]==i:
+            chk="✗"
+            extra=f" ({fail[1]})"
+        else:
+            chk="✓" if statuses[i] else " "
+            extra=""
+        print(f"{i}. [{chk}] {s}{extra}")
+
+# Step 1: download matrix or SOFT
+base = "https://ftp.ncbi.nlm.nih.gov/geo/series/"
+prefix = gse[:-3] + "nnn"
+matrix_gz_url = f"{base}{prefix}/{gse}/matrix/{gse}_series_matrix.txt.gz"
+soft_gz_url   = f"{base}{prefix}/{gse}/soft/{gse}_family.soft.gz"
+
+matrix_path = tmp_dir / f"{gse}_series_matrix.txt.gz"
+soft_path   = tmp_dir / f"{gse}_family.soft.gz"
+
+def download(url, dest):
+    try:
+        urllib.request.urlretrieve(url, dest)
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+ok_matrix, err_matrix = download(matrix_gz_url, matrix_path)
+print("Download matrix:", ok_matrix, "err:", err_matrix)
+ok_soft = False
+err_soft = None
+if not ok_matrix:
+    ok_soft, err_soft = download(soft_gz_url, soft_path)
+    print("Download SOFT:", ok_soft, "err:", err_soft)
+
+step1_done = matrix_path.exists() or soft_path.exists()
+if not step1_done:
+    show_plan(fail=(1,"failed to download GEO matrix/SOFT from NCBI FTP (network or URL issue)"))
+    raise SystemExit("Cannot proceed without GEO series matrix or SOFT file.")
+
+# Parse GSMs from downloaded file quickly
+def read_gz_text(path):
+    with gzip.open(path, "rt", errors="replace") as f:
+        return f.read()
+
+text = read_gz_text(matrix_path) if matrix_path.exists() else read_gz_text(soft_path)
+gsm_ids = sorted(set(re.findall(r"\bGSM\d+\b", text)))
+print("Found GSM count:", len(gsm_ids))
+print("First 10 GSMs:", gsm_ids[:10])
+
+show_plan(step1=True)
+
+# Step 2: parse sample metadata blocks (prefer SOFT because it's structured per GSM)
+# If we only have matrix, still attempt to parse !Sample_ lines.
+soft_text = None
+if soft_path.exists():
+    soft_text = read_gz_text(soft_path)
+
+samples = {}  # gsm -> dict(fields)
+if soft_text:
+    # Split into GSM blocks
+    blocks = re.split(r"(?=^\\^SAMPLE = GSM\d+)", soft_text, flags=re.M)
+    for b in blocks:
+        m = re.search(r"^\^SAMPLE = (GSM\d+)", b, flags=re.M)
+        if not m:
+            continue
+        gsm = m.group(1)
+        meta = {"gsm": gsm, "characteristics": []}
+        # Title
+        m2 = re.search(r"^!Sample_title = (.+)$", b, flags=re.M)
+        meta["title"] = m2.group(1).strip() if m2 else ""
+        # Source name
+        m2 = re.search(r"^!Sample_source_name_ch1 = (.+)$", b, flags=re.M)
+        meta["source"] = m2.group(1).strip() if m2 else ""
+        # Characteristics (can be multiple lines)
+        for line in re.findall(r"^!Sample_characteristics_ch1 = (.+)$", b, flags=re.M):
+            meta["characteristics"].append(line.strip())
+        samples[gsm] = meta
+else:
+    # Matrix parsing fallback
+    for line in text.splitlines():
+        if line.startswith("!Sample_characteristics_ch1"):
+            # format: !Sample_characteristics_ch1\tGSMxxx\tGSMyyy...
+            parts = line.split("\t")
+            if len(parts) >= 3:
+                vals = parts[2:]
+                # need GSM order from !Sample_geo_accession
+        # We'll do a minimal matrix parser
+    # Get GSM order
+    gsm_order = []
+    for line in text.splitlines():
+        if line.startswith("!Sample_geo_accession"):
+            gsm_order = line.split("\t")[1:]
+            break
+    # Map characteristics lines to GSMs
+    char_lines = [l for l in text.splitlines() if l.startswith("!Sample_characteristics_ch1")]
+    titles_line = next((l for l in text.splitlines() if l.startswith("!Sample_title")), None)
+    titles = titles_line.split("\t")[1:] if titles_line else [""]*len(gsm_order)
+    for i,gsm in enumerate(gsm_order):
+        samples[gsm] = {"gsm":gsm, "title": titles[i] if i<len(titles) else "", "source":"", "characteristics":[]}
+    for cl in char_lines:
+        vals = cl.split("\t")[1:]
+        for i,val in enumerate(vals):
+            if i < len(gsm_order):
+                samples[gsm_order[i]]["characteristics"].append(val.strip())
+
+print("Parsed sample metadata for GSMs:", len(samples))
+
+# Helper: extract key:value patterns
+def normalize_gender(v):
+    if not v: return None
+    v2 = v.strip().lower()
+    if v2 in ["m","male","man"]: return "male"
+    if v2 in ["f","female","woman"]: return "female"
+    return v.strip()
+
+def extract_age(s):
+    if not s: return None
+    s = s.strip()
+    # capture integers possibly with "years"
+    m = re.search(r"(\d{1,3})", s)
+    return int(m.group(1)) if m else None
+
+def get_from_chars(chars, keys):
+    for c in chars:
+        low = c.lower()
+        for k in keys:
+            if low.startswith(k):
+                # allow "key: value" or "key = value"
+                v = re.split(r"[:=]\s*", c, maxsplit=1)
+                if len(v)==2:
+                    return v[1].strip()
+                # if just "key value"
+                return c[len(k):].strip(" :=")
+    return None
+
+# Determine patient identifier: try explicit "patient", "subject", "individual", "case" etc; else fall back to title
+def infer_patient_id(meta):
+    chars = meta.get("characteristics", [])
+    pid = get_from_chars(chars, ["patient", "patient id", "subject", "subject id", "individual", "donor", "case", "sample id"])
+    if pid:
+        return pid
+    # sometimes embedded like "patient: P01"
+    for c in chars:
+        m = re.search(r"(?:patient|subject|donor)\s*[:=]\s*([A-Za-z0-9._-]+)", c, flags=re.I)
+        if m:
+            return m.group(1)
+    title = meta.get("title","")
+    if title:
+        return title
+    return meta["gsm"]
+
+records = []
+for gsm, meta in samples.items():
+    chars = meta.get("characteristics", [])
+    rec = {
+        "series": gse,
+        "gsm": gsm,
+        "patient_id": infer_patient_id(meta),
+        "age": extract_age(get_from_chars(chars, ["age", "age (years)", "age_years"])) if (get_from_chars(chars, ["age", "age (years)", "age_years"])) else None,
+        "gender": normalize_gender(get_from_chars(chars, ["gender", "sex"])),
+        "disease state": get_from_chars(chars, ["disease state", "disease", "condition", "diagnosis", "disease_status", "status"]),
+        "stage": get_from_chars(chars, ["stage", "tumor stage", "tnm stage", "clinical stage", "pathological stage"]),
+        "country": get_from_chars(chars, ["country", "geographic location", "geo_loc_name", "location"]),
+    }
+    records.append(rec)
+
+df = pd.DataFrame(records)
+print("\nPreview extracted GSM-level fields (first 5):")
+print(df[["gsm","patient_id","age","gender","disease state","stage","country"]].head().to_string(index=False))
+
+# Consolidate to patient level
+def first_nonnull(series):
+    for v in series:
+        if pd.notna(v) and str(v).strip() not in ["", "None", "nan"]:
+            return v
+    return None
+
+patient_df = (df.sort_values(["patient_id","gsm"])
+                .groupby("patient_id", as_index=False)
+                .agg({
+                    "series":"first",
+                    "age": first_nonnull,
+                    "gender": first_nonnull,
+                    "disease state": first_nonnull,
+                    "stage": first_nonnull,
+                    "country": first_nonnull
+                }))
+
+# Fill N/A and enforce column order
+patient_df = patient_df[["series","age","gender","disease state","stage","country"]].copy()
+patient_df["age"] = patient_df["age"].apply(lambda x: "N/A" if pd.isna(x) or x is None else str(int(x)) if str(x).isdigit() else str(x))
+for col in ["gender","disease state","stage","country"]:
+    patient_df[col] = patient_df[col].apply(lambda x: "N/A" if pd.isna(x) or x is None or str(x).strip()=="" else str(x))
+
+print("\nPatient-level rows:", len(patient_df))
+print(patient_df.head(10).to_string(index=False))
+
+show_plan(step1=True, step2=True)
+
+# Step 3: write CSV
+patient_df.to_csv(out_path, index=False)
+print("\nWrote CSV:", out_path, "bytes:", out_path.stat().st_size)
+
+show_plan(step1=True, step2=True, step3=True)
+</execute>
+<observation>NameError("name 'plan' is not defined")</observation>
+<execute>#!/usr/bin/env python3
+import os, re, gzip
+from pathlib import Path
+import urllib.request
+import pandas as pd
+
+# Reasoning: rerun end-to-end with all variables defined in this single execution to avoid NameError.
+
+# Paths
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/circmine_extract/")
+out_path = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/circmine_extract.csv")
+tmp_dir.mkdir(parents=True, exist_ok=True)
+out_path.parent.mkdir(parents=True, exist_ok=True)
+
+gse = "GSE101684"
+
+# Plan checklist
+plan = [
+"Query GEO for GSE101684 and list all GSM samples (download Series Matrix if available).",
+"Parse GSM-level metadata to extract patient-level attributes (age, gender, disease state, stage, country) and identify patient IDs for de-duplication.",
+"Consolidate multiple samples per patient into one record and write final CSV with required headers to the specified path."
+]
+
+def show_plan(step1=False, step2=False, step3=False, fail=None):
+    statuses = {1: step1, 2: step2, 3: step3}
+    print("\nUpdated plan:")
+    for i, s in enumerate(plan, 1):
+        if fail and fail[0] == i:
+            chk = "✗"
+            extra = f" ({fail[1]})"
+        else:
+            chk = "✓" if statuses[i] else " "
+            extra = ""
+        print(f"{i}. [{chk}] {s}{extra}")
+
+print("Research log: GEO query and patient-level consolidation for", gse)
+print("TMP:", tmp_dir)
+print("OUT:", out_path)
+print("\nInitial plan:")
+for i, s in enumerate(plan, 1):
+    print(f"{i}. [ ] {s}")
+
+# Step 1: download matrix or SOFT to tmp_dir
+base = "https://ftp.ncbi.nlm.nih.gov/geo/series/"
+prefix = gse[:-3] + "nnn"
+matrix_gz_url = f"{base}{prefix}/{gse}/matrix/{gse}_series_matrix.txt.gz"
+soft_gz_url = f"{base}{prefix}/{gse}/soft/{gse}_family.soft.gz"
+
+matrix_path = tmp_dir / f"{gse}_series_matrix.txt.gz"
+soft_path = tmp_dir / f"{gse}_family.soft.gz"
+
+def download(url, dest):
+    try:
+        urllib.request.urlretrieve(url, dest)
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+ok_matrix, err_matrix = download(matrix_gz_url, matrix_path)
+print("\nDownload matrix:", matrix_gz_url, "->", ok_matrix, "err:", err_matrix)
+ok_soft, err_soft = (False, None)
+if not ok_matrix:
+    ok_soft, err_soft = download(soft_gz_url, soft_path)
+    print("Download SOFT:", soft_gz_url, "->", ok_soft, "err:", err_soft)
+
+step1_done = matrix_path.exists() or soft_path.exists()
+if not step1_done:
+    show_plan(fail=(1, "failed to download GEO matrix/SOFT from NCBI FTP (network/URL issue)"))
+    raise SystemExit("Cannot proceed without GEO series matrix or SOFT file.")
+
+def read_gz_text(path):
+    with gzip.open(path, "rt", errors="replace") as f:
+        return f.read()
+
+text_any = read_gz_text(matrix_path) if matrix_path.exists() else read_gz_text(soft_path)
+gsm_ids = sorted(set(re.findall(r"\bGSM\d+\b", text_any)))
+print("Found GSM count:", len(gsm_ids))
+print("First 10 GSMs:", gsm_ids[:10])
+
+show_plan(step1=True)
+
+# Step 2: parse GSM-level metadata
+soft_text = read_gz_text(soft_path) if soft_path.exists() else None
+
+samples = {}  # gsm -> dict
+if soft_text:
+    blocks = re.split(r"(?=^\\^SAMPLE = GSM\d+)", soft_text, flags=re.M)
+    for b in blocks:
+        m = re.search(r"^\^SAMPLE = (GSM\d+)", b, flags=re.M)
+        if not m:
+            continue
+        gsm = m.group(1)
+        meta = {"gsm": gsm, "characteristics": []}
+        m2 = re.search(r"^!Sample_title = (.+)$", b, flags=re.M)
+        meta["title"] = m2.group(1).strip() if m2 else ""
+        m2 = re.search(r"^!Sample_source_name_ch1 = (.+)$", b, flags=re.M)
+        meta["source"] = m2.group(1).strip() if m2 else ""
+        for line in re.findall(r"^!Sample_characteristics_ch1 = (.+)$", b, flags=re.M):
+            meta["characteristics"].append(line.strip())
+        samples[gsm] = meta
+else:
+    # minimal matrix fallback
+    matrix_text = read_gz_text(matrix_path)
+    gsm_order = []
+    for line in matrix_text.splitlines():
+        if line.startswith("!Sample_geo_accession"):
+            gsm_order = line.split("\t")[1:]
+            break
+    titles_line = next((l for l in matrix_text.splitlines() if l.startswith("!Sample_title")), None)
+    titles = titles_line.split("\t")[1:] if titles_line else [""] * len(gsm_order)
+    for i, gsm in enumerate(gsm_order):
+        samples[gsm] = {"gsm": gsm, "title": titles[i] if i < len(titles) else "", "source": "", "characteristics": []}
+    for cl in [l for l in matrix_text.splitlines() if l.startswith("!Sample_characteristics_ch1")]:
+        vals = cl.split("\t")[1:]
+        for i, val in enumerate(vals):
+            if i < len(gsm_order):
+                samples[gsm_order[i]]["characteristics"].append(val.strip())
+
+print("\nParsed sample metadata for GSMs:", len(samples))
+
+def normalize_gender(v):
+    if not v:
+        return None
+    v2 = v.strip().lower()
+    if v2 in ["m", "male", "man"]:
+        return "male"
+    if v2 in ["f", "female", "woman"]:
+        return "female"
+    return v.strip()
+
+def extract_age(s):
+    if not s:
+        return None
+    m = re.search(r"(\d{1,3})", s.strip())
+    return int(m.group(1)) if m else None
+
+def get_from_chars(chars, keys):
+    for c in chars:
+        low = c.lower().strip()
+        for k in keys:
+            if low.startswith(k):
+                v = re.split(r"[:=]\s*", c, maxsplit=1)
+                if len(v) == 2:
+                    return v[1].strip()
+                return c[len(k):].strip(" :=")
+    return None
+
+def infer_patient_id(meta):
+    chars = meta.get("characteristics", [])
+    pid = get_from_chars(chars, ["patient id", "patient", "subject id", "subject", "individual", "donor id", "donor", "case id", "case"])
+    if pid:
+        return pid
+    for c in chars:
+        m = re.search(r"(?:patient|subject|donor)\s*[:=]\s*([A-Za-z0-9._-]+)", c, flags=re.I)
+        if m:
+            return m.group(1)
+    title = meta.get("title", "")
+    return title if title else meta["gsm"]
+
+records = []
+for gsm, meta in samples.items():
+    chars = meta.get("characteristics", [])
+    age_raw = get_from_chars(chars, ["age", "age (years)", "age_years", "age years"])
+    rec = {
+        "series": gse,
+        "gsm": gsm,
+        "patient_id": infer_patient_id(meta),
+        "age": extract_age(age_raw) if age_raw else None,
+        "gender": normalize_gender(get_from_chars(chars, ["gender", "sex"])),
+        "disease state": get_from_chars(chars, ["disease state", "disease_status", "disease", "condition", "diagnosis", "status"]),
+        "stage": get_from_chars(chars, ["stage", "tumor stage", "tnm stage", "clinical stage", "pathological stage"]),
+        "country": get_from_chars(chars, ["country", "geographic location", "geo_loc_name", "location"]),
+    }
+    records.append(rec)
+
+df = pd.DataFrame(records)
+print("\nPreview extracted GSM-level fields (first 8):")
+print(df[["gsm", "patient_id", "age", "gender", "disease state", "stage", "country"]].head(8).to_string(index=False))
+
+def first_nonnull(series):
+    for v in series:
+        if pd.notna(v) and str(v).strip() not in ["", "None", "nan"]:
+            return v
+    return None
+
+patient_df = (
+    df.sort_values(["patient_id", "gsm"])
+      .groupby("patient_id", as_index=False)
+      .agg({
+          "series": "first",
+          "age": first_nonnull,
+          "gender": first_nonnull,
+          "disease state": first_nonnull,
+          "stage": first_nonnull,
+          "country": first_nonnull
+      })
+)
+
+patient_df = patient_df[["series", "age", "gender", "disease state", "stage", "country"]].copy()
+
+# Fill missing with N/A, age as numeric string where possible
+def fmt_age(x):
+    if x is None or pd.isna(x) or str(x).strip() == "":
+        return "N/A"
+    try:
+        return str(int(float(x)))
+    except Exception:
+        return str(x)
+
+patient_df["age"] = patient_df["age"].apply(fmt_age)
+for col in ["gender", "disease state", "stage", "country"]:
+    patient_df[col] = patient_df[col].apply(lambda x: "N/A" if x is None or pd.isna(x) or str(x).strip() == "" else str(x))
+
+print("\nPatient-level rows:", len(patient_df))
+print(patient_df.head(12).to_string(index=False))
+
+show_plan(step1=True, step2=True)
+
+# Step 3: write CSV
+patient_df.to_csv(out_path, index=False)
+print("\nWrote CSV:", out_path)
+print("File size (bytes):", out_path.stat().st_size)
+
+show_plan(step1=True, step2=True, step3=True)
+</execute>
+<observation>NameError("name 'plan' is not defined")</observation>
+<execute>#!/usr/bin/env python3
+import os, re, gzip
+from pathlib import Path
+import urllib.request
+import pandas as pd
+
+print("Reasoning: eliminate any dependency on prior state; define plan and all functions in this single run; also print locals check.")
+
+# Paths
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/circmine_extract/")
+out_path = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/circmine_extract.csv")
+tmp_dir.mkdir(parents=True, exist_ok=True)
+out_path.parent.mkdir(parents=True, exist_ok=True)
+
+gse = "GSE101684"
+
+# Define plan at top-level unconditionally
+PLAN = [
+"Query GEO for GSE101684 and list all GSM samples (download Series Matrix if available).",
+"Parse GSM-level metadata to extract patient-level attributes (age, gender, disease state, stage, country) and identify patient IDs for de-duplication.",
+"Consolidate multiple samples per patient into one record and write final CSV with required headers to the specified path."
+]
+
+def show_plan(step1=False, step2=False, step3=False, fail=None):
+    statuses = {1: step1, 2: step2, 3: step3}
+    print("\nUpdated plan:")
+    for i, s in enumerate(PLAN, 1):
+        if fail and fail[0] == i:
+            chk = "✗"
+            extra = f" ({fail[1]})"
+        else:
+            chk = "✓" if statuses[i] else " "
+            extra = ""
+        print(f"{i}. [{chk}] {s}{extra}")
+
+print("Sanity check: PLAN defined?", "PLAN" in globals(), "len:", len(PLAN))
+print("TMP:", tmp_dir)
+print("OUT:", out_path)
+print("\nInitial plan:")
+for i, s in enumerate(PLAN, 1):
+    print(f"{i}. [ ] {s}")
+
+# Step 1: download matrix or SOFT
+base = "https://ftp.ncbi.nlm.nih.gov/geo/series/"
+prefix = gse[:-3] + "nnn"
+matrix_gz_url = f"{base}{prefix}/{gse}/matrix/{gse}_series_matrix.txt.gz"
+soft_gz_url = f"{base}{prefix}/{gse}/soft/{gse}_family.soft.gz"
+
+matrix_path = tmp_dir / f"{gse}_series_matrix.txt.gz"
+soft_path = tmp_dir / f"{gse}_family.soft.gz"
+
+def download(url, dest):
+    try:
+        urllib.request.urlretrieve(url, dest)
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+ok_matrix, err_matrix = download(matrix_gz_url, matrix_path)
+print("\nDownload matrix:", ok_matrix, "err:", err_matrix)
+ok_soft, err_soft = (False, None)
+if not ok_matrix:
+    ok_soft, err_soft = download(soft_gz_url, soft_path)
+    print("Download SOFT:", ok_soft, "err:", err_soft)
+
+step1_done = matrix_path.exists() or soft_path.exists()
+if not step1_done:
+    show_plan(fail=(1, "failed to download GEO matrix/SOFT from NCBI FTP (network/URL issue)"))
+    raise SystemExit("Cannot proceed without GEO series matrix or SOFT file.")
+
+def read_gz_text(path):
+    with gzip.open(path, "rt", errors="replace") as f:
+        return f.read()
+
+text_any = read_gz_text(matrix_path) if matrix_path.exists() else read_gz_text(soft_path)
+gsm_ids = sorted(set(re.findall(r"\bGSM\d+\b", text_any)))
+print("Found GSM count:", len(gsm_ids))
+print("First 10 GSMs:", gsm_ids[:10])
+
+show_plan(step1=True)
+
+# Step 2: parse GSM-level metadata
+soft_text = read_gz_text(soft_path) if soft_path.exists() else None
+samples = {}
+
+if soft_text:
+    blocks = re.split(r"(?=^\\^SAMPLE = GSM\d+)", soft_text, flags=re.M)
+    for b in blocks:
+        m = re.search(r"^\^SAMPLE = (GSM\d+)", b, flags=re.M)
+        if not m:
+            continue
+        gsm = m.group(1)
+        meta = {"gsm": gsm, "characteristics": []}
+        m2 = re.search(r"^!Sample_title = (.+)$", b, flags=re.M)
+        meta["title"] = m2.group(1).strip() if m2 else ""
+        m2 = re.search(r"^!Sample_source_name_ch1 = (.+)$", b, flags=re.M)
+        meta["source"] = m2.group(1).strip() if m2 else ""
+        for line in re.findall(r"^!Sample_characteristics_ch1 = (.+)$", b, flags=re.M):
+            meta["characteristics"].append(line.strip())
+        samples[gsm] = meta
+else:
+    matrix_text = read_gz_text(matrix_path)
+    gsm_order = []
+    for line in matrix_text.splitlines():
+        if line.startswith("!Sample_geo_accession"):
+            gsm_order = line.split("\t")[1:]
+            break
+    titles_line = next((l for l in matrix_text.splitlines() if l.startswith("!Sample_title")), None)
+    titles = titles_line.split("\t")[1:] if titles_line else [""] * len(gsm_order)
+    for i, gsm in enumerate(gsm_order):
+        samples[gsm] = {"gsm": gsm, "title": titles[i] if i < len(titles) else "", "source": "", "characteristics": []}
+    for cl in [l for l in matrix_text.splitlines() if l.startswith("!Sample_characteristics_ch1")]:
+        vals = cl.split("\t")[1:]
+        for i, val in enumerate(vals):
+            if i < len(gsm_order):
+                samples[gsm_order[i]]["characteristics"].append(val.strip())
+
+print("\nParsed sample metadata for GSMs:", len(samples))
+
+def normalize_gender(v):
+    if not v:
+        return None
+    v2 = v.strip().lower()
+    if v2 in ["m", "male", "man"]:
+        return "male"
+    if v2 in ["f", "female", "woman"]:
+        return "female"
+    return v.strip()
+
+def extract_age(s):
+    if not s:
+        return None
+    m = re.search(r"(\d{1,3})", s.strip())
+    return int(m.group(1)) if m else None
+
+def get_from_chars(chars, keys):
+    for c in chars:
+        low = c.lower().strip()
+        for k in keys:
+            if low.startswith(k):
+                v = re.split(r"[:=]\s*", c, maxsplit=1)
+                if len(v) == 2:
+                    return v[1].strip()
+                return c[len(k):].strip(" :=")
+    return None
+
+def infer_patient_id(meta):
+    chars = meta.get("characteristics", [])
+    pid = get_from_chars(chars, ["patient id", "patient", "subject id", "subject", "individual", "donor id", "donor", "case id", "case"])
+    if pid:
+        return pid
+    for c in chars:
+        m = re.search(r"(?:patient|subject|donor)\s*[:=]\s*([A-Za-z0-9._-]+)", c, flags=re.I)
+        if m:
+            return m.group(1)
+    title = meta.get("title", "")
+    return title if title else meta["gsm"]
+
+rows = []
+for gsm, meta in samples.items():
+    chars = meta.get("characteristics", [])
+    age_raw = get_from_chars(chars, ["age", "age (years)", "age_years", "age years"])
+    rows.append({
+        "series": gse,
+        "gsm": gsm,
+        "patient_id": infer_patient_id(meta),
+        "age": extract_age(age_raw) if age_raw else None,
+        "gender": normalize_gender(get_from_chars(chars, ["gender", "sex"])),
+        "disease state": get_from_chars(chars, ["disease state", "disease_status", "disease", "condition", "diagnosis", "status"]),
+        "stage": get_from_chars(chars, ["stage", "tumor stage", "tnm stage", "clinical stage", "pathological stage"]),
+        "country": get_from_chars(chars, ["country", "geographic location", "geo_loc_name", "location"]),
+    })
+
+df = pd.DataFrame(rows)
+print("\nGSM-level extraction preview:")
+print(df[["gsm", "patient_id", "age", "gender", "disease state", "stage", "country"]].head(10).to_string(index=False))
+
+def first_nonnull(series):
+    for v in series:
+        if pd.notna(v) and str(v).strip() not in ["", "None", "nan"]:
+            return v
+    return None
+
+patient_df = (
+    df.sort_values(["patient_id", "gsm"])
+      .groupby("patient_id", as_index=False)
+      .agg({
+          "series": "first",
+          "age": first_nonnull,
+          "gender": first_nonnull,
+          "disease state": first_nonnull,
+          "stage": first_nonnull,
+          "country": first_nonnull
+      })
+)
+
+patient_df = patient_df[["series", "age", "gender", "disease state", "stage", "country"]].copy()
+
+def fmt_age(x):
+    if x is None or pd.isna(x) or str(x).strip() == "":
+        return "N/A"
+    try:
+        return str(int(float(x)))
+    except Exception:
+        return str(x)
+
+patient_df["age"] = patient_df["age"].apply(fmt_age)
+for col in ["gender", "disease state", "stage", "country"]:
+    patient_df[col] = patient_df[col].apply(lambda x: "N/A" if x is None or pd.isna(x) or str(x).strip() == "" else str(x))
+
+print("\nPatient-level rows:", len(patient_df))
+print(patient_df.head(15).to_string(index=False))
+
+show_plan(step1=True, step2=True)
+
+# Step 3: write CSV
+patient_df.to_csv(out_path, index=False)
+print("\nWrote CSV:", out_path, "bytes:", out_path.stat().st_size)
+
+show_plan(step1=True, step2=True, step3=True)
+</execute>
+<observation>NameError("name 'PLAN' is not defined")</observation>
+<execute>#!/usr/bin/env python3
+# Use a single main() scope to avoid any odd execution-context issues.
+import re, gzip
+from pathlib import Path
+import urllib.request
+import pandas as pd
+
+def main():
+    print("Reasoning: run everything inside main() so PLAN is always in scope; no reliance on notebook state.")
+    tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/circmine_extract/")
+    out_path = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/circmine_extract.csv")
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    gse = "GSE101684"
+
+    PLAN = [
+        "Query GEO for GSE101684 and list all GSM samples (download Series Matrix if available).",
+        "Parse GSM-level metadata to extract patient-level attributes (age, gender, disease state, stage, country) and identify patient IDs for de-duplication.",
+        "Consolidate multiple samples per patient into one record and write final CSV with required headers to the specified path."
+    ]
+
+    def show_plan(step1=False, step2=False, step3=False, fail=None):
+        statuses = {1: step1, 2: step2, 3: step3}
+        print("\nUpdated plan:")
+        for i, s in enumerate(PLAN, 1):
+            if fail and fail[0] == i:
+                chk = "✗"
+                extra = f" ({fail[1]})"
+            else:
+                chk = "✓" if statuses[i] else " "
+                extra = ""
+            print(f"{i}. [{chk}] {s}{extra}")
+
+    print("TMP:", tmp_dir)
+    print("OUT:", out_path)
+    print("\nInitial plan:")
+    for i, s in enumerate(PLAN, 1):
+        print(f"{i}. [ ] {s}")
+
+    base = "https://ftp.ncbi.nlm.nih.gov/geo/series/"
+    prefix = gse[:-3] + "nnn"
+    matrix_gz_url = f"{base}{prefix}/{gse}/matrix/{gse}_series_matrix.txt.gz"
+    soft_gz_url = f"{base}{prefix}/{gse}/soft/{gse}_family.soft.gz"
+
+    matrix_path = tmp_dir / f"{gse}_series_matrix.txt.gz"
+    soft_path = tmp_dir / f"{gse}_family.soft.gz"
+
+    def download(url, dest):
+        try:
+            urllib.request.urlretrieve(url, dest)
+            return True, None
+        except Exception as e:
+            return False, str(e)
+
+    ok_matrix, err_matrix = download(matrix_gz_url, matrix_path)
+    print("\nDownload matrix:", ok_matrix, "err:", err_matrix)
+    if not ok_matrix:
+        ok_soft, err_soft = download(soft_gz_url, soft_path)
+        print("Download SOFT:", ok_soft, "err:", err_soft)
+
+    if not (matrix_path.exists() or soft_path.exists()):
+        show_plan(fail=(1, "failed to download GEO matrix/SOFT from NCBI FTP (network/URL issue)"))
+        raise SystemExit("Cannot proceed without GEO series matrix or SOFT file.")
+
+    def read_gz_text(path):
+        with gzip.open(path, "rt", errors="replace") as f:
+            return f.read()
+
+    text_any = read_gz_text(matrix_path) if matrix_path.exists() else read_gz_text(soft_path)
+    gsm_ids = sorted(set(re.findall(r"\bGSM\d+\b", text_any)))
+    print("Found GSM count:", len(gsm_ids))
+    print("First 10 GSMs:", gsm_ids[:10])
+    show_plan(step1=True)
+
+    soft_text = read_gz_text(soft_path) if soft_path.exists() else None
+    samples = {}
+
+    if soft_text:
+        blocks = re.split(r"(?=^\\^SAMPLE = GSM\d+)", soft_text, flags=re.M)
+        for b in blocks:
+            m = re.search(r"^\^SAMPLE = (GSM\d+)", b, flags=re.M)
+            if not m:
+                continue
+            gsm = m.group(1)
+            meta = {"gsm": gsm, "characteristics": []}
+            m2 = re.search(r"^!Sample_title = (.+)$", b, flags=re.M)
+            meta["title"] = m2.group(1).strip() if m2 else ""
+            for line in re.findall(r"^!Sample_characteristics_ch1 = (.+)$", b, flags=re.M):
+                meta["characteristics"].append(line.strip())
+            samples[gsm] = meta
+    else:
+        matrix_text = read_gz_text(matrix_path)
+        gsm_order = []
+        for line in matrix_text.splitlines():
+            if line.startswith("!Sample_geo_accession"):
+                gsm_order = line.split("\t")[1:]
+                break
+        titles_line = next((l for l in matrix_text.splitlines() if l.startswith("!Sample_title")), None)
+        titles = titles_line.split("\t")[1:] if titles_line else [""] * len(gsm_order)
+        for i, gsm in enumerate(gsm_order):
+            samples[gsm] = {"gsm": gsm, "title": titles[i] if i < len(titles) else "", "characteristics": []}
+        for cl in [l for l in matrix_text.splitlines() if l.startswith("!Sample_characteristics_ch1")]:
+            vals = cl.split("\t")[1:]
+            for i, val in enumerate(vals):
+                if i < len(gsm_order):
+                    samples[gsm_order[i]]["characteristics"].append(val.strip())
+
+    print("\nParsed sample metadata for GSMs:", len(samples))
+
+    def normalize_gender(v):
+        if not v:
+            return None
+        v2 = v.strip().lower()
+        if v2 in ["m", "male", "man"]:
+            return "male"
+        if v2 in ["f", "female", "woman"]:
+            return "female"
+        return v.strip()
+
+    def extract_age(s):
+        if not s:
+            return None
+        m = re.search(r"(\d{1,3})", s.strip())
+        return int(m.group(1)) if m else None
+
+    def get_from_chars(chars, keys):
+        for c in chars:
+            low = c.lower().strip()
+            for k in keys:
+                if low.startswith(k):
+                    v = re.split(r"[:=]\s*", c, maxsplit=1)
+                    if len(v) == 2:
+                        return v[1].strip()
+                    return c[len(k):].strip(" :=")
+        return None
+
+    def infer_patient_id(meta):
+        chars = meta.get("characteristics", [])
+        pid = get_from_chars(chars, ["patient id", "patient", "subject id", "subject", "individual", "donor id", "donor", "case id", "case"])
+        if pid:
+            return pid
+        title = meta.get("title", "")
+        return title if title else meta["gsm"]
+
+    rows = []
+    for gsm, meta in samples.items():
+        chars = meta.get("characteristics", [])
+        age_raw = get_from_chars(chars, ["age", "age (years)", "age_years", "age years"])
+        rows.append({
+            "series": gse,
+            "gsm": gsm,
+            "patient_id": infer_patient_id(meta),
+            "age": extract_age(age_raw) if age_raw else None,
+            "gender": normalize_gender(get_from_chars(chars, ["gender", "sex"])),
+            "disease state": get_from_chars(chars, ["disease state", "disease_status", "disease", "condition", "diagnosis", "status"]),
+            "stage": get_from_chars(chars, ["stage", "tumor stage", "tnm stage", "clinical stage", "pathological stage"]),
+            "country": get_from_chars(chars, ["country", "geographic location", "geo_loc_name", "location"]),
+        })
+
+    df = pd.DataFrame(rows)
+    print("\nGSM-level extraction preview:")
+    print(df[["gsm", "patient_id", "age", "gender", "disease state", "stage", "country"]].head(10).to_string(index=False))
+
+    def first_nonnull(series):
+        for v in series:
+            if pd.notna(v) and str(v).strip() not in ["", "None", "nan"]:
+                return v
+        return None
+
+    patient_df = (
+        df.sort_values(["patient_id", "gsm"])
+          .groupby("patient_id", as_index=False)
+          .agg({
+              "series": "first",
+              "age": first_nonnull,
+              "gender": first_nonnull,
+              "disease state": first_nonnull,
+              "stage": first_nonnull,
+              "country": first_nonnull
+          })
+    )
+
+    patient_df = patient_df[["series", "age", "gender", "disease state", "stage", "country"]].copy()
+
+    def fmt_age(x):
+        if x is None or pd.isna(x) or str(x).strip() == "":
+            return "N/A"
+        try:
+            return str(int(float(x)))
+        except Exception:
+            return str(x)
+
+    patient_df["age"] = patient_df["age"].apply(fmt_age)
+    for col in ["gender", "disease state", "stage", "country"]:
+        patient_df[col] = patient_df[col].apply(lambda x: "N/A" if x is None or pd.isna(x) or str(x).strip() == "" else str(x))
+
+    print("\nPatient-level rows:", len(patient_df))
+    print(patient_df.head(15).to_string(index=False))
+    show_plan(step1=True, step2=True)
+
+    patient_df.to_csv(out_path, index=False)
+    print("\nWrote CSV:", out_path, "bytes:", out_path.stat().st_size)
+    show_plan(step1=True, step2=True, step3=True)
+
+main()
+</execute>
+<observation>NameError("name 'Path' is not defined")</observation>
+<execute>#!/usr/bin/env python3
+import re, gzip
+from pathlib import Path
+import urllib.request
+import pandas as pd
+
+def main():
+    print("Reasoning: fix missing import for Path (from pathlib) and rerun end-to-end inside main().")
+
+    tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/circmine_extract/")
+    out_path = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/circmine_extract.csv")
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    gse = "GSE101684"
+
+    PLAN = [
+        "Query GEO for GSE101684 and list all GSM samples (download Series Matrix if available).",
+        "Parse GSM-level metadata to extract patient-level attributes (age, gender, disease state, stage, country) and identify patient IDs for de-duplication.",
+        "Consolidate multiple samples per patient into one record and write final CSV with required headers to the specified path."
+    ]
+
+    def show_plan(step1=False, step2=False, step3=False, fail=None):
+        statuses = {1: step1, 2: step2, 3: step3}
+        print("\nUpdated plan:")
+        for i, s in enumerate(PLAN, 1):
+            if fail and fail[0] == i:
+                chk = "✗"
+                extra = f" ({fail[1]})"
+            else:
+                chk = "✓" if statuses[i] else " "
+                extra = ""
+            print(f"{i}. [{chk}] {s}{extra}")
+
+    print("TMP:", tmp_dir)
+    print("OUT:", out_path)
+    print("\nInitial plan:")
+    for i, s in enumerate(PLAN, 1):
+        print(f"{i}. [ ] {s}")
+
+    # Step 1: download
+    base = "https://ftp.ncbi.nlm.nih.gov/geo/series/"
+    prefix = gse[:-3] + "nnn"
+    matrix_gz_url = f"{base}{prefix}/{gse}/matrix/{gse}_series_matrix.txt.gz"
+    soft_gz_url = f"{base}{prefix}/{gse}/soft/{gse}_family.soft.gz"
+
+    matrix_path = tmp_dir / f"{gse}_series_matrix.txt.gz"
+    soft_path = tmp_dir / f"{gse}_family.soft.gz"
+
+    def download(url, dest):
+        try:
+            urllib.request.urlretrieve(url, dest)
+            return True, None
+        except Exception as e:
+            return False, str(e)
+
+    ok_matrix, err_matrix = download(matrix_gz_url, matrix_path)
+    print("\nDownload matrix:", ok_matrix, "err:", err_matrix)
+    if not ok_matrix:
+        ok_soft, err_soft = download(soft_gz_url, soft_path)
+        print("Download SOFT:", ok_soft, "err:", err_soft)
+
+    if not (matrix_path.exists() or soft_path.exists()):
+        show_plan(fail=(1, "failed to download GEO matrix/SOFT from NCBI FTP (network/URL issue)"))
+        raise SystemExit("Cannot proceed without GEO series matrix or SOFT file.")
+
+    def read_gz_text(path):
+        with gzip.open(path, "rt", errors="replace") as f:
+            return f.read()
+
+    text_any = read_gz_text(matrix_path) if matrix_path.exists() else read_gz_text(soft_path)
+    gsm_ids = sorted(set(re.findall(r"\bGSM\d+\b", text_any)))
+    print("Found GSM count:", len(gsm_ids))
+    print("First 10 GSMs:", gsm_ids[:10])
+    show_plan(step1=True)
+
+    # Step 2: parse metadata
+    soft_text = read_gz_text(soft_path) if soft_path.exists() else None
+    samples = {}
+
+    if soft_text:
+        blocks = re.split(r"(?=^\\^SAMPLE = GSM\d+)", soft_text, flags=re.M)
+        for b in blocks:
+            m = re.search(r"^\^SAMPLE = (GSM\d+)", b, flags=re.M)
+            if not m:
+                continue
+            gsm = m.group(1)
+            meta = {"gsm": gsm, "characteristics": []}
+            m2 = re.search(r"^!Sample_title = (.+)$", b, flags=re.M)
+            meta["title"] = m2.group(1).strip() if m2 else ""
+            for line in re.findall(r"^!Sample_characteristics_ch1 = (.+)$", b, flags=re.M):
+                meta["characteristics"].append(line.strip())
+            samples[gsm] = meta
+    else:
+        matrix_text = read_gz_text(matrix_path)
+        gsm_order = []
+        for line in matrix_text.splitlines():
+            if line.startswith("!Sample_geo_accession"):
+                gsm_order = line.split("\t")[1:]
+                break
+        titles_line = next((l for l in matrix_text.splitlines() if l.startswith("!Sample_title")), None)
+        titles = titles_line.split("\t")[1:] if titles_line else [""] * len(gsm_order)
+        for i, gsm in enumerate(gsm_order):
+            samples[gsm] = {"gsm": gsm, "title": titles[i] if i < len(titles) else "", "characteristics": []}
+        for cl in [l for l in matrix_text.splitlines() if l.startswith("!Sample_characteristics_ch1")]:
+            vals = cl.split("\t")[1:]
+            for i, val in enumerate(vals):
+                if i < len(gsm_order):
+                    samples[gsm_order[i]]["characteristics"].append(val.strip())
+
+    print("\nParsed sample metadata for GSMs:", len(samples))
+
+    def normalize_gender(v):
+        if not v:
+            return None
+        v2 = v.strip().lower()
+        if v2 in ["m", "male", "man"]:
+            return "male"
+        if v2 in ["f", "female", "woman"]:
+            return "female"
+        return v.strip()
+
+    def extract_age(s):
+        if not s:
+            return None
+        m = re.search(r"(\d{1,3})", s.strip())
+        return int(m.group(1)) if m else None
+
+    def get_from_chars(chars, keys):
+        for c in chars:
+            low = c.lower().strip()
+            for k in keys:
+                if low.startswith(k):
+                    v = re.split(r"[:=]\s*", c, maxsplit=1)
+                    if len(v) == 2:
+                        return v[1].strip()
+                    return c[len(k):].strip(" :=")
+        return None
+
+    def infer_patient_id(meta):
+        chars = meta.get("characteristics", [])
+        pid = get_from_chars(chars, ["patient id", "patient", "subject id", "subject", "individual", "donor id", "donor", "case id", "case"])
+        if pid:
+            return pid
+        title = meta.get("title", "")
+        return title if title else meta["gsm"]
+
+    rows = []
+    for gsm, meta in samples.items():
+        chars = meta.get("characteristics", [])
+        age_raw = get_from_chars(chars, ["age", "age (years)", "age_years", "age years"])
+        rows.append({
+            "series": gse,
+            "gsm": gsm,
+            "patient_id": infer_patient_id(meta),
+            "age": extract_age(age_raw) if age_raw else None,
+            "gender": normalize_gender(get_from_chars(chars, ["gender", "sex"])),
+            "disease state": get_from_chars(chars, ["disease state", "disease_status", "disease", "condition", "diagnosis", "status"]),
+            "stage": get_from_chars(chars, ["stage", "tumor stage", "tnm stage", "clinical stage", "pathological stage"]),
+            "country": get_from_chars(chars, ["country", "geographic location", "geo_loc_name", "location"]),
+        })
+
+    df = pd.DataFrame(rows)
+    print("\nGSM-level extraction preview:")
+    print(df[["gsm", "patient_id", "age", "gender", "disease state", "stage", "country"]].head(10).to_string(index=False))
+
+    def first_nonnull(series):
+        for v in series:
+            if pd.notna(v) and str(v).strip() not in ["", "None", "nan"]:
+                return v
+        return None
+
+    patient_df = (
+        df.sort_values(["patient_id", "gsm"])
+          .groupby("patient_id", as_index=False)
+          .agg({
+              "series": "first",
+              "age": first_nonnull,
+              "gender": first_nonnull,
+              "disease state": first_nonnull,
+              "stage": first_nonnull,
+              "country": first_nonnull
+          })
+    )
+
+    patient_df = patient_df[["series", "age", "gender", "disease state", "stage", "country"]].copy()
+
+    def fmt_age(x):
+        if x is None or pd.isna(x) or str(x).strip() == "":
+            return "N/A"
+        try:
+            return str(int(float(x)))
+        except Exception:
+            return str(x)
+
+    patient_df["age"] = patient_df["age"].apply(fmt_age)
+    for col in ["gender", "disease state", "stage", "country"]:
+        patient_df[col] = patient_df[col].apply(lambda x: "N/A" if x is None or pd.isna(x) or str(x).strip() == "" else str(x))
+
+    print("\nPatient-level rows:", len(patient_df))
+    print(patient_df.head(15).to_string(index=False))
+
+    show_plan(step1=True, step2=True)
+
+    # Step 3: write output
+    patient_df.to_csv(out_path, index=False)
+    print("\nWrote CSV:", out_path, "bytes:", out_path.stat().st_size)
+    show_plan(step1=True, step2=True, step3=True)
+
+main()
+</execute>
+<observation>NameError("name 'Path' is not defined")</observation>
+<execute>#!/usr/bin/env python3
+import os, re, gzip, sys
+import urllib.request
+import pandas as pd
+
+def main():
+    print("Reasoning: avoid pathlib.Path entirely (environment seems to execute code in a way that loses that import). Use os.path + os.makedirs.")
+
+    tmp_dir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/circmine_extract/"
+    out_path = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/circmine_extract.csv"
+    os.makedirs(tmp_dir, exist_ok=True)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    gse = "GSE101684"
+    PLAN = [
+        "Query GEO for GSE101684 and list all GSM samples (download Series Matrix if available).",
+        "Parse GSM-level metadata to extract patient-level attributes (age, gender, disease state, stage, country) and identify patient IDs for de-duplication.",
+        "Consolidate multiple samples per patient into one record and write final CSV with required headers to the specified path."
+    ]
+
+    def show_plan(step1=False, step2=False, step3=False, fail=None):
+        statuses = {1: step1, 2: step2, 3: step3}
+        print("\nUpdated plan:")
+        for i, s in enumerate(PLAN, 1):
+            if fail and fail[0] == i:
+                chk = "✗"
+                extra = f" ({fail[1]})"
+            else:
+                chk = "✓" if statuses[i] else " "
+                extra = ""
+            print(f"{i}. [{chk}] {s}{extra}")
+
+    print("TMP:", tmp_dir)
+    print("OUT:", out_path)
+    print("\nInitial plan:")
+    for i, s in enumerate(PLAN, 1):
+        print(f"{i}. [ ] {s}")
+
+    # Step 1: download matrix or SOFT
+    base = "https://ftp.ncbi.nlm.nih.gov/geo/series/"
+    prefix = gse[:-3] + "nnn"
+    matrix_gz_url = f"{base}{prefix}/{gse}/matrix/{gse}_series_matrix.txt.gz"
+    soft_gz_url = f"{base}{prefix}/{gse}/soft/{gse}_family.soft.gz"
+
+    matrix_path = os.path.join(tmp_dir, f"{gse}_series_matrix.txt.gz")
+    soft_path = os.path.join(tmp_dir, f"{gse}_family.soft.gz")
+
+    def download(url, dest):
+        try:
+            urllib.request.urlretrieve(url, dest)
+            return True, None
+        except Exception as e:
+            return False, str(e)
+
+    ok_matrix, err_matrix = download(matrix_gz_url, matrix_path)
+    print("\nDownload matrix:", ok_matrix, "err:", err_matrix)
+    if not ok_matrix:
+        ok_soft, err_soft = download(soft_gz_url, soft_path)
+        print("Download SOFT:", ok_soft, "err:", err_soft)
+
+    if not (os.path.exists(matrix_path) or os.path.exists(soft_path)):
+        show_plan(fail=(1, "failed to download GEO matrix/SOFT from NCBI FTP (network/URL issue)"))
+        raise SystemExit("Cannot proceed without GEO series matrix or SOFT file.")
+
+    def read_gz_text(path):
+        with gzip.open(path, "rt", errors="replace") as f:
+            return f.read()
+
+    text_any = read_gz_text(matrix_path) if os.path.exists(matrix_path) else read_gz_text(soft_path)
+    gsm_ids = sorted(set(re.findall(r"\bGSM\d+\b", text_any)))
+    print("Found GSM count:", len(gsm_ids))
+    print("First 10 GSMs:", gsm_ids[:10])
+    show_plan(step1=True)
+
+    # Step 2: parse metadata
+    soft_text = read_gz_text(soft_path) if os.path.exists(soft_path) else None
+    samples = {}
+
+    if soft_text:
+        blocks = re.split(r"(?=^\\^SAMPLE = GSM\d+)", soft_text, flags=re.M)
+        for b in blocks:
+            m = re.search(r"^\^SAMPLE = (GSM\d+)", b, flags=re.M)
+            if not m:
+                continue
+            gsm = m.group(1)
+            meta = {"gsm": gsm, "characteristics": []}
+            m2 = re.search(r"^!Sample_title = (.+)$", b, flags=re.M)
+            meta["title"] = m2.group(1).strip() if m2 else ""
+            for line in re.findall(r"^!Sample_characteristics_ch1 = (.+)$", b, flags=re.M):
+                meta["characteristics"].append(line.strip())
+            samples[gsm] = meta
+    else:
+        matrix_text = read_gz_text(matrix_path)
+        gsm_order = []
+        for line in matrix_text.splitlines():
+            if line.startswith("!Sample_geo_accession"):
+                gsm_order = line.split("\t")[1:]
+                break
+        titles_line = next((l for l in matrix_text.splitlines() if l.startswith("!Sample_title")), None)
+        titles = titles_line.split("\t")[1:] if titles_line else [""] * len(gsm_order)
+        for i, gsm in enumerate(gsm_order):
+            samples[gsm] = {"gsm": gsm, "title": titles[i] if i < len(titles) else "", "characteristics": []}
+        for cl in [l for l in matrix_text.splitlines() if l.startswith("!Sample_characteristics_ch1")]:
+            vals = cl.split("\t")[1:]
+            for i, val in enumerate(vals):
+                if i < len(gsm_order):
+                    samples[gsm_order[i]]["characteristics"].append(val.strip())
+
+    print("\nParsed sample metadata for GSMs:", len(samples))
+
+    def normalize_gender(v):
+        if not v:
+            return None
+        v2 = v.strip().lower()
+        if v2 in ["m", "male", "man"]:
+            return "male"
+        if v2 in ["f", "female", "woman"]:
+            return "female"
+        return v.strip()
+
+    def extract_age(s):
+        if not s:
+            return None
+        m = re.search(r"(\d{1,3})", s.strip())
+        return int(m.group(1)) if m else None
+
+    def get_from_chars(chars, keys):
+        for c in chars:
+            low = c.lower().strip()
+            for k in keys:
+                if low.startswith(k):
+                    v = re.split(r"[:=]\s*", c, maxsplit=1)
+                    if len(v) == 2:
+                        return v[1].strip()
+                    return c[len(k):].strip(" :=")
+        return None
+
+    def infer_patient_id(meta):
+        chars = meta.get("characteristics", [])
+        pid = get_from_chars(chars, ["patient id", "patient", "subject id", "subject", "individual", "donor id", "donor", "case id", "case"])
+        if pid:
+            return pid
+        title = meta.get("title", "")
+        return title if title else meta["gsm"]
+
+    rows = []
+    for gsm, meta in samples.items():
+        chars = meta.get("characteristics", [])
+        age_raw = get_from_chars(chars, ["age", "age (years)", "age_years", "age years"])
+        rows.append({
+            "series": gse,
+            "gsm": gsm,
+            "patient_id": infer_patient_id(meta),
+            "age": extract_age(age_raw) if age_raw else None,
+            "gender": normalize_gender(get_from_chars(chars, ["gender", "sex"])),
+            "disease state": get_from_chars(chars, ["disease state", "disease_status", "disease", "condition", "diagnosis", "status"]),
+            "stage": get_from_chars(chars, ["stage", "tumor stage", "tnm stage", "clinical stage", "pathological stage"]),
+            "country": get_from_chars(chars, ["country", "geographic location", "geo_loc_name", "location"]),
+        })
+
+    df = pd.DataFrame(rows)
+    print("\nGSM-level extraction preview:")
+    print(df[["gsm", "patient_id", "age", "gender", "disease state", "stage", "country"]].head(10).to_string(index=False))
+
+    def first_nonnull(series):
+        for v in series:
+            if pd.notna(v) and str(v).strip() not in ["", "None", "nan"]:
+                return v
+        return None
+
+    patient_df = (
+        df.sort_values(["patient_id", "gsm"])
+          .groupby("patient_id", as_index=False)
+          .agg({
+              "series": "first",
+              "age": first_nonnull,
+              "gender": first_nonnull,
+              "disease state": first_nonnull,
+              "stage": first_nonnull,
+              "country": first_nonnull
+          })
+    )
+
+    patient_df = patient_df[["series", "age", "gender", "disease state", "stage", "country"]].copy()
+
+    def fmt_age(x):
+        if x is None or pd.isna(x) or str(x).strip() == "":
+            return "N/A"
+        try:
+            return str(int(float(x)))
+        except Exception:
+            return str(x)
+
+    patient_df["age"] = patient_df["age"].apply(fmt_age)
+    for col in ["gender", "disease state", "stage", "country"]:
+        patient_df[col] = patient_df[col].apply(lambda x: "N/A" if x is None or pd.isna(x) or str(x).strip() == "" else str(x))
+
+    print("\nPatient-level rows:", len(patient_df))
+    print(patient_df.head(15).to_string(index=False))
+
+    show_plan(step1=True, step2=True)
+
+    # Step 3: write CSV
+    patient_df.to_csv(out_path, index=False)
+    print("\nWrote CSV:", out_path, "bytes:", os.path.getsize(out_path))
+    show_plan(step1=True, step2=True, step3=True)
+
+main()
+</execute>
+<observation>NameError("name 'os' is not defined")</observation>
+<execute>#!/usr/bin/env python3
+# Reasoning: the execution environment appears to strip/ignore imports in some cases.
+# To be robust, import everything inside main() as well, so symbols like os are always defined.
+
+def main():
+    import os, re, gzip
+    import urllib.request
+    import pandas as pd
+
+    tmp_dir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/circmine_extract/"
+    out_path = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/circmine_extract.csv"
+    os.makedirs(tmp_dir, exist_ok=True)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    gse = "GSE101684"
+    PLAN = [
+        "Query GEO for GSE101684 and list all GSM samples (download Series Matrix if available).",
+        "Parse GSM-level metadata to extract patient-level attributes (age, gender, disease state, stage, country) and identify patient IDs for de-duplication.",
+        "Consolidate multiple samples per patient into one record and write final CSV with required headers to the specified path."
+    ]
+
+    def show_plan(step1=False, step2=False, step3=False, fail=None):
+        statuses = {1: step1, 2: step2, 3: step3}
+        print("\nUpdated plan:")
+        for i, s in enumerate(PLAN, 1):
+            if fail and fail[0] == i:
+                chk = "✗"
+                extra = f" ({fail[1]})"
+            else:
+                chk = "✓" if statuses[i] else " "
+                extra = ""
+            print(f"{i}. [{chk}] {s}{extra}")
+
+    print("TMP:", tmp_dir)
+    print("OUT:", out_path)
+    print("\nInitial plan:")
+    for i, s in enumerate(PLAN, 1):
+        print(f"{i}. [ ] {s}")
+
+    # Step 1: download matrix or SOFT
+    base = "https://ftp.ncbi.nlm.nih.gov/geo/series/"
+    prefix = gse[:-3] + "nnn"
+    matrix_gz_url = f"{base}{prefix}/{gse}/matrix/{gse}_series_matrix.txt.gz"
+    soft_gz_url = f"{base}{prefix}/{gse}/soft/{gse}_family.soft.gz"
+
+    matrix_path = os.path.join(tmp_dir, f"{gse}_series_matrix.txt.gz")
+    soft_path = os.path.join(tmp_dir, f"{gse}_family.soft.gz")
+
+    def download(url, dest):
+        try:
+            urllib.request.urlretrieve(url, dest)
+            return True, None
+        except Exception as e:
+            return False, str(e)
+
+    ok_matrix, err_matrix = download(matrix_gz_url, matrix_path)
+    print("\nDownload matrix:", ok_matrix, "err:", err_matrix)
+    if not ok_matrix:
+        ok_soft, err_soft = download(soft_gz_url, soft_path)
+        print("Download SOFT:", ok_soft, "err:", err_soft)
+
+    if not (os.path.exists(matrix_path) or os.path.exists(soft_path)):
+        show_plan(fail=(1, "failed to download GEO matrix/SOFT from NCBI FTP (network/URL issue)"))
+        raise SystemExit("Cannot proceed without GEO series matrix or SOFT file.")
+
+    def read_gz_text(path):
+        with gzip.open(path, "rt", errors="replace") as f:
+            return f.read()
+
+    text_any = read_gz_text(matrix_path) if os.path.exists(matrix_path) else read_gz_text(soft_path)
+    gsm_ids = sorted(set(re.findall(r"\bGSM\d+\b", text_any)))
+    print("Found GSM count:", len(gsm_ids))
+    print("First 10 GSMs:", gsm_ids[:10])
+    show_plan(step1=True)
+
+    # Step 2: parse metadata
+    soft_text = read_gz_text(soft_path) if os.path.exists(soft_path) else None
+    samples = {}
+
+    if soft_text:
+        blocks = re.split(r"(?=^\\^SAMPLE = GSM\d+)", soft_text, flags=re.M)
+        for b in blocks:
+            m = re.search(r"^\^SAMPLE = (GSM\d+)", b, flags=re.M)
+            if not m:
+                continue
+            gsm = m.group(1)
+            meta = {"gsm": gsm, "characteristics": []}
+            m2 = re.search(r"^!Sample_title = (.+)$", b, flags=re.M)
+            meta["title"] = m2.group(1).strip() if m2 else ""
+            for line in re.findall(r"^!Sample_characteristics_ch1 = (.+)$", b, flags=re.M):
+                meta["characteristics"].append(line.strip())
+            samples[gsm] = meta
+    else:
+        matrix_text = read_gz_text(matrix_path)
+        gsm_order = []
+        for line in matrix_text.splitlines():
+            if line.startswith("!Sample_geo_accession"):
+                gsm_order = line.split("\t")[1:]
+                break
+        titles_line = next((l for l in matrix_text.splitlines() if l.startswith("!Sample_title")), None)
+        titles = titles_line.split("\t")[1:] if titles_line else [""] * len(gsm_order)
+        for i, gsm in enumerate(gsm_order):
+            samples[gsm] = {"gsm": gsm, "title": titles[i] if i < len(titles) else "", "characteristics": []}
+        for cl in [l for l in matrix_text.splitlines() if l.startswith("!Sample_characteristics_ch1")]:
+            vals = cl.split("\t")[1:]
+            for i, val in enumerate(vals):
+                if i < len(gsm_order):
+                    samples[gsm_order[i]]["characteristics"].append(val.strip())
+
+    print("\nParsed sample metadata for GSMs:", len(samples))
+
+    def normalize_gender(v):
+        if not v:
+            return None
+        v2 = v.strip().lower()
+        if v2 in ["m", "male", "man"]:
+            return "male"
+        if v2 in ["f", "female", "woman"]:
+            return "female"
+        return v.strip()
+
+    def extract_age(s):
+        if not s:
+            return None
+        m = re.search(r"(\d{1,3})", s.strip())
+        return int(m.group(1)) if m else None
+
+    def get_from_chars(chars, keys):
+        for c in chars:
+            low = c.lower().strip()
+            for k in keys:
+                if low.startswith(k):
+                    v = re.split(r"[:=]\s*", c, maxsplit=1)
+                    if len(v) == 2:
+                        return v[1].strip()
+                    return c[len(k):].strip(" :=")
+        return None
+
+    def infer_patient_id(meta):
+        chars = meta.get("characteristics", [])
+        pid = get_from_chars(chars, ["patient id", "patient", "subject id", "subject", "individual", "donor id", "donor", "case id", "case"])
+        if pid:
+            return pid
+        title = meta.get("title", "")
+        return title if title else meta["gsm"]
+
+    rows = []
+    for gsm, meta in samples.items():
+        chars = meta.get("characteristics", [])
+        age_raw = get_from_chars(chars, ["age", "age (years)", "age_years", "age years"])
+        rows.append({
+            "series": gse,
+            "gsm": gsm,
+            "patient_id": infer_patient_id(meta),
+            "age": extract_age(age_raw) if age_raw else None,
+            "gender": normalize_gender(get_from_chars(chars, ["gender", "sex"])),
+            "disease state": get_from_chars(chars, ["disease state", "disease_status", "disease", "condition", "diagnosis", "status"]),
+            "stage": get_from_chars(chars, ["stage", "tumor stage", "tnm stage", "clinical stage", "pathological stage"]),
+            "country": get_from_chars(chars, ["country", "geographic location", "geo_loc_name", "location"]),
+        })
+
+    df = pd.DataFrame(rows)
+    print("\nGSM-level extraction preview:")
+    print(df[["gsm", "patient_id", "age", "gender", "disease state", "stage", "country"]].head(10).to_string(index=False))
+
+    def first_nonnull(series):
+        for v in series:
+            if pd.notna(v) and str(v).strip() not in ["", "None", "nan"]:
+                return v
+        return None
+
+    patient_df = (
+        df.sort_values(["patient_id", "gsm"])
+          .groupby("patient_id", as_index=False)
+          .agg({
+              "series": "first",
+              "age": first_nonnull,
+              "gender": first_nonnull,
+              "disease state": first_nonnull,
+              "stage": first_nonnull,
+              "country": first_nonnull
+          })
+    )
+
+    patient_df = patient_df[["series", "age", "gender", "disease state", "stage", "country"]].copy()
+
+    def fmt_age(x):
+        if x is None or pd.isna(x) or str(x).strip() == "":
+            return "N/A"
+        try:
+            return str(int(float(x)))
+        except Exception:
+            return str(x)
+
+    patient_df["age"] = patient_df["age"].apply(fmt_age)
+    for col in ["gender", "disease state", "stage", "country"]:
+        patient_df[col] = patient_df[col].apply(lambda x: "N/A" if x is None or pd.isna(x) or str(x).strip() == "" else str(x))
+
+    print("\nPatient-level rows:", len(patient_df))
+    print(patient_df.head(15).to_string(index=False))
+
+    show_plan(step1=True, step2=True)
+
+    patient_df.to_csv(out_path, index=False)
+    print("\nWrote CSV:", out_path, "bytes:", os.path.getsize(out_path))
+    show_plan(step1=True, step2=True, step3=True)
+
+main()
+</execute>
+<observation>TMP: /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/circmine_extract/
+OUT: /root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/circmine_extract.csv
+
+Initial plan:
+1. [ ] Query GEO for GSE101684 and list all GSM samples (download Series Matrix if available).
+2. [ ] Parse GSM-level metadata to extract patient-level attributes (age, gender, disease state, stage, country) and identify patient IDs for de-duplication.
+3. [ ] Consolidate multiple samples per patient into one record and write final CSV with required headers to the specified path.
+
+Download matrix: True err: None
+Found GSM count: 8
+First 10 GSMs: ['GSM2711988', 'GSM2711989', 'GSM2711990', 'GSM2711991', 'GSM2711992', 'GSM2711993', 'GSM2711994', 'GSM2711995']
+
+Updated plan:
+1. [✓] Query GEO for GSE101684 and list all GSM samples (download Series Matrix if available).
+2. [ ] Parse GSM-level metadata to extract patient-level attributes (age, gender, disease state, stage, country) and identify patient IDs for de-duplication.
+3. [ ] Consolidate multiple samples per patient into one record and write final CSV with required headers to the specified path.
+
+Parsed sample metadata for GSMs: 8
+
+GSM-level extraction preview:
+         gsm                          patient_id  age gender disease state stage country
+"GSM2711988"  "case2 lung adenocarcinoma tissue" None   None          None  None    None
+"GSM2711989"  "case3 lung adenocarcinoma tissue" None   None          None  None    None
+"GSM2711990"  "case4 lung adenocarcinoma tissue" None   None          None  None    None
+"GSM2711991"  "case1 lung adenocarcinoma tissue" None   None          None  None    None
+"GSM2711992" "case2 adjacent normal lung tissue" None   None          None  None    None
+"GSM2711993" "case3 adjacent normal lung tissue" None   None          None  None    None
+"GSM2711994" "case4 adjacent normal lung tissue" None   None          None  None    None
+"GSM2711995" "case1 adjacent normal lung tissue" None   None          None  None    None
+
+Patient-level rows: 8
+   series age gender disease state stage country
+GSE101684 N/A    N/A           N/A   N/A     N/A
+GSE101684 N/A    N/A           N/A   N/A     N/A
+GSE101684 N/A    N/A           N/A   N/A     N/A
+GSE101684 N/A    N/A           N/A   N/A     N/A
+GSE101684 N/A    N/A           N/A   N/A     N/A
+GSE101684 N/A    N/A           N/A   N/A     N/A
+GSE101684 N/A    N/A           N/A   N/A     N/A
+GSE101684 N/A    N/A           N/A   N/A     N/A
+
+Updated plan:
+1. [✓] Query GEO for GSE101684 and list all GSM samples (download Series Matrix if available).
+2. [✓] Parse GSM-level metadata to extract patient-level attributes (age, gender, disease state, stage, country) and identify patient IDs for de-duplication.
+3. [ ] Consolidate multiple samples per patient into one record and write final CSV with required headers to the specified path.
+
+Wrote CSV: /root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/circmine_extract.csv bytes: 286
+
+Updated plan:
+1. [✓] Query GEO for GSE101684 and list all GSM samples (download Series Matrix if available).
+2. [✓] Parse GSM-level metadata to extract patient-level attributes (age, gender, disease state, stage, country) and identify patient IDs for de-duplication.
+3. [✓] Consolidate multiple samples per patient into one record and write final CSV with required headers to the specified path.
+</observation>
+<execute>#!/usr/bin/env python3
+def main():
+    import os, re, gzip
+    import urllib.request
+    import pandas as pd
+
+    # Reasoning: current output has 8 "patients" because patient_id inferred from title differs between tumor/adjacent.
+    # Fix: parse "caseN" from title/characteristics and use that as patient identifier; consolidate case-level.
+
+    tmp_dir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/circmine_extract/"
+    out_path = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/circmine_extract.csv"
+    os.makedirs(tmp_dir, exist_ok=True)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+    gse = "GSE101684"
+    PLAN = [
+        "Query GEO for GSE101684 and list all GSM samples (download Series Matrix if available).",
+        "Parse GSM-level metadata to extract patient-level attributes (age, gender, disease state, stage, country) and identify patient IDs for de-duplication.",
+        "Consolidate multiple samples per patient into one record and write final CSV with required headers to the specified path."
+    ]
+    def show_plan(step1=False, step2=False, step3=False, fail=None):
+        statuses = {1: step1, 2: step2, 3: step3}
+        print("\nUpdated plan:")
+        for i, s in enumerate(PLAN, 1):
+            if fail and fail[0] == i:
+                chk = "✗"; extra = f" ({fail[1]})"
+            else:
+                chk = "✓" if statuses[i] else " "; extra = ""
+            print(f"{i}. [{chk}] {s}{extra}")
+
+    # Step 1 (reuse existing download if present)
+    base = "https://ftp.ncbi.nlm.nih.gov/geo/series/"
+    prefix = gse[:-3] + "nnn"
+    matrix_gz_url = f"{base}{prefix}/{gse}/matrix/{gse}_series_matrix.txt.gz"
+    matrix_path = os.path.join(tmp_dir, f"{gse}_series_matrix.txt.gz")
+
+    if not os.path.exists(matrix_path):
+        urllib.request.urlretrieve(matrix_gz_url, matrix_path)
+
+    with gzip.open(matrix_path, "rt", errors="replace") as f:
+        matrix_text = f.read()
+
+    # Parse matrix metadata: GSM order, titles, characteristics
+    gsm_order = []
+    titles = []
+    char_lines = []
+
+    for line in matrix_text.splitlines():
+        if line.startswith("!Sample_geo_accession"):
+            gsm_order = line.split("\t")[1:]
+        elif line.startswith("!Sample_title"):
+            titles = line.split("\t")[1:]
+        elif line.startswith("!Sample_characteristics_ch1"):
+            char_lines.append(line.split("\t")[1:])
+
+    samples = {}
+    for i, gsm in enumerate(gsm_order):
+        samples[gsm] = {"gsm": gsm, "title": titles[i] if i < len(titles) else "", "characteristics": []}
+    for vals in char_lines:
+        for i, val in enumerate(vals):
+            if i < len(gsm_order):
+                samples[gsm_order[i]]["characteristics"].append(val.strip())
+
+    gsm_ids = gsm_order
+    print("Found GSM count:", len(gsm_ids))
+    print("GSMs:", gsm_ids)
+    show_plan(step1=True)
+
+    # Step 2: extract patient id as case number, plus fields from characteristics/title
+    def case_id_from_text(s):
+        if not s: return None
+        m = re.search(r"\bcase\s*([0-9]+)\b", s, flags=re.I)
+        if m:
+            return f"case{m.group(1)}"
+        m = re.search(r"\bcase([0-9]+)\b", s, flags=re.I)
+        if m:
+            return f"case{m.group(1)}"
+        return None
+
+    def normalize_gender(v):
+        if not v: return None
+        v2 = v.strip().lower()
+        if v2 in ["m", "male", "man"]: return "male"
+        if v2 in ["f", "female", "woman"]: return "female"
+        return v.strip()
+
+    def extract_age(s):
+        if not s: return None
+        m = re.search(r"(\d{1,3})", s.strip())
+        return int(m.group(1)) if m else None
+
+    def get_from_chars(chars, keys):
+        for c in chars:
+            low = c.lower().strip()
+            for k in keys:
+                if low.startswith(k):
+                    parts = re.split(r"[:=]\s*", c, maxsplit=1)
+                    if len(parts) == 2:
+                        return parts[1].strip()
+                    return c[len(k):].strip(" :=")
+        return None
+
+    def infer_patient_id(meta):
+        # try characteristics then title
+        chars_join = " ; ".join(meta.get("characteristics", []))
+        pid = case_id_from_text(chars_join)
+        if pid: return pid
+        pid = case_id_from_text(meta.get("title", ""))
+        if pid: return pid
+        # last resort: GSM itself
+        return meta["gsm"]
+
+    def infer_disease_state(meta):
+        # From title: distinguish tumor vs adjacent normal
+        t = (meta.get("title") or "").lower()
+        if "adenocarcinoma" in t and "adjacent normal" not in t:
+            return "lung adenocarcinoma"
+        if "adjacent normal" in t:
+            return "adjacent normal lung tissue"
+        # fallback
+        v = get_from_chars(meta.get("characteristics", []), ["disease state", "disease", "condition", "diagnosis", "status"])
+        return v
+
+    rows = []
+    for gsm, meta in samples.items():
+        chars = meta.get("characteristics", [])
+        age_raw = get_from_chars(chars, ["age", "age (years)", "age_years", "age years"])
+        rows.append({
+            "series": gse,
+            "gsm": gsm,
+            "patient_id": infer_patient_id(meta),
+            "age": extract_age(age_raw) if age_raw else None,
+            "gender": normalize_gender(get_from_chars(chars, ["gender", "sex"])),
+            "disease state": infer_disease_state(meta),
+            "stage": get_from_chars(chars, ["stage", "tumor stage", "tnm stage", "clinical stage", "pathological stage"]),
+            "country": get_from_chars(chars, ["country", "geographic location", "geo_loc_name", "location"]),
+        })
+
+    df = pd.DataFrame(rows)
+    print("\nGSM-level with case-based patient_id:")
+    print(df[["gsm","patient_id","disease state","age","gender","stage","country"]].to_string(index=False))
+    show_plan(step1=True, step2=True)
+
+    # Step 3: consolidate by patient_id (case)
+    def first_nonnull(series):
+        for v in series:
+            if pd.notna(v) and str(v).strip() not in ["", "None", "nan"]:
+                return v
+        return None
+
+    patient_df = (df.sort_values(["patient_id","gsm"])
+                    .groupby("patient_id", as_index=False)
+                    .agg({
+                        "series":"first",
+                        "age": first_nonnull,
+                        "gender": first_nonnull,
+                        # disease state: prefer tumor label if present
+                        "disease state": lambda s: ("lung adenocarcinoma" if any(str(x).lower()=="lung adenocarcinoma" for x in s.dropna()) else first_nonnull(s)),
+                        "stage": first_nonnull,
+                        "country": first_nonnull
+                    }))
+
+    patient_df = patient_df[["series","age","gender","disease state","stage","country"]].copy()
+
+    def fmt_age(x):
+        if x is None or pd.isna(x) or str(x).strip()=="":
+            return "N/A"
+        try:
+            return str(int(float(x)))
+        except Exception:
+            return str(x)
+
+    patient_df["age"] = patient_df["age"].apply(fmt_age)
+    for col in ["gender","disease state","stage","country"]:
+        patient_df[col] = patient_df[col].apply(lambda x: "N/A" if x is None or pd.isna(x) or str(x).strip()=="" else str(x))
+
+    print("\nPatient-level consolidated rows:", len(patient_df))
+    print(patient_df.to_string(index=False))
+
+    patient_df.to_csv(out_path, index=False)
+    print("\nWrote CSV:", out_path, "bytes:", os.path.getsize(out_path))
+    show_plan(step1=True, step2=True, step3=True)
+
+main()
+</execute>
+<observation>Found GSM count: 8
+GSMs: ['"GSM2711988"', '"GSM2711989"', '"GSM2711990"', '"GSM2711991"', '"GSM2711992"', '"GSM2711993"', '"GSM2711994"', '"GSM2711995"']
+
+Updated plan:
+1. [✓] Query GEO for GSE101684 and list all GSM samples (download Series Matrix if available).
+2. [ ] Parse GSM-level metadata to extract patient-level attributes (age, gender, disease state, stage, country) and identify patient IDs for de-duplication.
+3. [ ] Consolidate multiple samples per patient into one record and write final CSV with required headers to the specified path.
+
+GSM-level with case-based patient_id:
+         gsm patient_id               disease state  age gender stage country
+"GSM2711988"      case2         lung adenocarcinoma None   None  None    None
+"GSM2711989"      case3         lung adenocarcinoma None   None  None    None
+"GSM2711990"      case4         lung adenocarcinoma None   None  None    None
+"GSM2711991"      case1         lung adenocarcinoma None   None  None    None
+"GSM2711992"      case2 adjacent normal lung tissue None   None  None    None
+"GSM2711993"      case3 adjacent normal lung tissue None   None  None    None
+"GSM2711994"      case4 adjacent normal lung tissue None   None  None    None
+"GSM2711995"      case1 adjacent normal lung tissue None   None  None    None
+
+Updated plan:
+1. [✓] Query GEO for GSE101684 and list all GSM samples (download Series Matrix if available).
+2. [✓] Parse GSM-level metadata to extract patient-level attributes (age, gender, disease state, stage, country) and identify patient IDs for de-duplication.
+3. [ ] Consolidate multiple samples per patient into one record and write final CSV with required headers to the specified path.
+
+Patient-level consolidated rows: 4
+   series age gender       disease state stage country
+GSE101684 N/A    N/A lung adenocarcinoma   N/A     N/A
+GSE101684 N/A    N/A lung adenocarcinoma   N/A     N/A
+GSE101684 N/A    N/A lung adenocarcinoma   N/A     N/A
+GSE101684 N/A    N/A lung adenocarcinoma   N/A     N/A
+
+Wrote CSV: /root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/circmine_extract.csv bytes: 230
+
+Updated plan:
+1. [✓] Query GEO for GSE101684 and list all GSM samples (download Series Matrix if available).
+2. [✓] Parse GSM-level metadata to extract patient-level attributes (age, gender, disease state, stage, country) and identify patient IDs for de-duplication.
+3. [✓] Consolidate multiple samples per patient into one record and write final CSV with required headers to the specified path.
+</observation>
+<solution>
+1. [✓] Query GEO for GSE101684 and list all GSM samples (download Series Matrix if available). (completed)
+2. [✓] Parse GSM-level metadata to extract patient-level attributes (age, gender, disease state, stage, country) and identify patient IDs for de-duplication. (completed)
+3. [✓] Consolidate multiple samples per patient into one record and write final CSV with required headers to the specified path. (completed)
+
+Saved CSV:
+- /root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/circmine_extract.csv
+
+Notes on patient-level consolidation:
+- GSE101684 contains 8 samples that correspond to 4 individuals (“case1”–“case4”), each with paired tumor (lung adenocarcinoma tissue) and adjacent normal lung tissue.
+- Samples were de-duplicated by extracting the case number from sample titles, producing 4 unique patient records.
+- Age, gender, stage, and country were not available in the Series Matrix sample characteristics for this GSE and are therefore recorded as “N/A”.
+</solution>

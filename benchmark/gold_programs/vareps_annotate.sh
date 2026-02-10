@@ -1,0 +1,1 @@
+python ./operation_env/SAAMBE-3D-master/saambe-3d.py -i ./benchmark/dataset/VarEPS/4KMN.pdb -f ./benchmark/dataset/VarEPS/mutation_list.txt -d 1

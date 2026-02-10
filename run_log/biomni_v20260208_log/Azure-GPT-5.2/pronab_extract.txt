@@ -1,0 +1,2180 @@
+# Core Task
+Extract protein-nucleic acid binding data from the provided literature, specifically identifying Key fields including UniProt ID, protein mutation(s), nucleic acid name, nucleic acid type, PDB complex ID, experimental method, and thermodynamic parameters (dG and Kd).
+Literature to analyze: `dataset/ProNAB/10383437.pdf`
+
+# Output Requirements & File Path
+- Output format: A CSV file with the following columns (exactly matching the ground truth CSV headers):
+  - `UniProt Id`: The UniProt ID of the protein.
+  - `Mutation Protein`: The mutation(s) in the protein (e.g., 'R355A' or 'wild').
+  - `Nucleic Acid Name`: The name of the nucleic acid.
+  - `Type Nuc`: The type of nucleic acid (e.g., 'DNA').
+  - `PBD Compelx`: The PDB ID of the complex.
+  - `Method`: The experimental method used.
+  - `dG wild(Kcal/mol)`: The dG value for the wild type.
+  - `Kd wild(M)`: The Kd value for the wild type.
+- Save Path: Save the result to: `/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/pronab_extract.csv`
+- Intermediate Storage Path: All intermediate code generated during execution, downloaded files, and temporary results must be stored in `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/`
+
+# Output Example (For Reference Only)
+UniProt Id,Mutation Protein,Nucleic Acid Name,Type Nuc,PBD Compelx,Method,dG wild(Kcal/mol),Kd wild(M)
+P99999,wild,"Generic Promoter Region",DNA,9xyz,"Fluorescence Anisotropy",-9.5,1.5e-08
+P99999,H100A,"Generic Promoter Region",DNA,9xyz,"Fluorescence Anisotropy",-10.2,2.1e-09
+
+<execute>#!/usr/bin/env python3
+import os, re, csv, math, pandas as pd
+from pathlib import Path
+
+# Paths
+pdf_path = Path("dataset/ProNAB/10383437.pdf")
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/")
+out_csv = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/pronab_extract.csv")
+tmp_dir.mkdir(parents=True, exist_ok=True)
+out_csv.parent.mkdir(parents=True, exist_ok=True)
+
+print("Research log")
+print("PDF exists:", pdf_path.exists(), pdf_path)
+
+# Step 1: Extract text from PDF
+import pdfplumber
+
+all_text = []
+pages_text = {}
+with pdfplumber.open(str(pdf_path)) as pdf:
+    for i, page in enumerate(pdf.pages, start=1):
+        txt = page.extract_text() or ""
+        pages_text[i] = txt
+        all_text.append(f"\n\n--- PAGE {i} ---\n{txt}")
+full_text = "\n".join(all_text)
+
+txt_file = tmp_dir / "full_text.txt"
+txt_file.write_text(full_text)
+print("Saved extracted text to:", txt_file)
+print("Total pages:", len(pages_text), "Total chars:", len(full_text))
+
+# Step 2: Quick scan for key patterns: PDB IDs, Kd, ΔG, UniProt, method terms
+pdb_ids = sorted(set(re.findall(r"\b[0-9][A-Za-z0-9]{3}\b", full_text)))
+# filter common false positives by checking context "PDB" nearby
+pdb_ids_ctx = set()
+for m in re.finditer(r"\b([0-9][A-Za-z0-9]{3})\b", full_text):
+    pid = m.group(1)
+    start = max(0, m.start()-40); end = min(len(full_text), m.end()+40)
+    ctx = full_text[start:end].lower()
+    if "pdb" in ctx or "protein data bank" in ctx:
+        pdb_ids_ctx.add(pid)
+pdb_ids_ctx = sorted(pdb_ids_ctx)
+
+kd_hits = re.findall(r"\bK[dD]\s*(?:=|:)?\s*([0-9]*\.?[0-9]+)\s*(pM|nM|uM|µM|mM|M)\b", full_text)
+dg_hits = re.findall(r"(?:ΔG|dG)\s*(?:=|:)?\s*(-?\d+\.?\d*)\s*(kcal/mol|kcal\s*mol-1|kcal\s*mol\^-1)", full_text, flags=re.IGNORECASE)
+
+uniprot_like = sorted(set(re.findall(r"\b[OPQ][0-9][A-Z0-9]{3}[0-9]\b|\b[A-NR-Z][0-9]{5}\b", full_text)))
+method_terms = []
+for term in ["surface plasmon resonance", "spr", "isothermal titration calorimetry", "itc",
+             "fluorescence anisotropy", "gel shift", "electrophoretic mobility shift", "emsa",
+             "filter binding", "stopped-flow", "calorimetry"]:
+    if term in full_text.lower():
+        method_terms.append(term)
+method_terms = sorted(set(method_terms))
+
+print("Candidate PDB IDs (contextual):", pdb_ids_ctx[:50], "count:", len(pdb_ids_ctx))
+print("Kd hits count:", len(kd_hits), "sample:", kd_hits[:10])
+print("dG hits count:", len(dg_hits), "sample:", dg_hits[:10])
+print("UniProt-like IDs count:", len(uniprot_like), "sample:", uniprot_like[:20])
+print("Method terms found:", method_terms)
+
+# Step 3: Find the most relevant pages containing binding constants
+pages_with_kd = [p for p,t in pages_text.items() if re.search(r"\bK[dD]\b", t)]
+pages_with_table = [p for p,t in pages_text.items() if "Table" in t]
+pages_with_dg = [p for p,t in pages_text.items() if re.search(r"(ΔG|dG)", t)]
+print("Pages with 'Kd':", pages_with_kd)
+print("Pages with 'Table':", pages_with_table[:20])
+print("Pages with 'dG/ΔG':", pages_with_dg)
+
+# Save page texts for those pages
+for p in sorted(set(pages_with_kd + pages_with_dg + pages_with_table)):
+    (tmp_dir / f"page_{p}.txt").write_text(pages_text[p])
+
+# Step 4: Attempt to locate the protein/nucleic acid system by scanning for known names
+# We'll extract key paragraphs around "Kd" occurrences
+contexts = []
+for m in re.finditer(r"\bK[dD]\b", full_text):
+    start = max(0, m.start()-300); end = min(len(full_text), m.end()+500)
+    contexts.append(full_text[start:end])
+contexts = contexts[:50]
+ctx_file = tmp_dir / "kd_contexts.txt"
+ctx_file.write_text("\n\n====\n\n".join(contexts))
+print("Saved Kd contexts:", ctx_file)
+
+print("\nChecklist plan:")
+print("1. [✓] Extract PDF text to intermediate files")
+print("2. [✓] Scan for candidate PDB IDs, Kd/ΔG values, UniProt IDs, and methods")
+print("3. [✓] Identify pages/contexts likely containing binding tables and parameters")
+print("4. [ ] Parse the binding data into structured rows (UniProt, mutations, nucleic acid, PDB, method, dG, Kd)")
+print("5. [ ] Write final CSV to required path")</execute>
+<observation>ModuleNotFoundError("No module named 'pdfplumber'")</observation>
+<execute>#!/usr/bin/env python3
+import os, re, csv
+from pathlib import Path
+
+pdf_path = Path("dataset/ProNAB/10383437.pdf")
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/")
+out_csv = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/pronab_extract.csv")
+tmp_dir.mkdir(parents=True, exist_ok=True)
+out_csv.parent.mkdir(parents=True, exist_ok=True)
+
+print("Research log")
+print("PDF exists:", pdf_path.exists(), pdf_path)
+
+print("\nPlan checklist:")
+plan = [
+"1. [ ] Extract text from PDF (switch to available tools: pdftotext or PyMuPDF) into intermediate files",
+"2. [ ] Scan extracted text for PDB IDs, Kd/ΔG values, UniProt IDs, methods, nucleic acid info",
+"3. [ ] Locate binding tables/sections and parse rows (mutations, Kd, ΔG, etc.)",
+"4. [ ] Build output table with required headers and write CSV to the specified path"
+]
+print("\n".join(plan))
+
+# Step 1: Try pdftotext (poppler) first
+txt_path = tmp_dir / "full_text.txt"
+extracted = False
+
+import subprocess, shlex
+
+def run(cmd):
+    print("\n$ " + cmd)
+    p = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    print("returncode:", p.returncode)
+    if p.stdout.strip():
+        print("stdout:", p.stdout[:5000])
+    if p.stderr.strip():
+        print("stderr:", p.stderr[:5000])
+    return p
+
+res = run(f"pdftotext -layout {shlex.quote(str(pdf_path))} {shlex.quote(str(txt_path))}")
+if res.returncode == 0 and txt_path.exists() and txt_path.stat().st_size > 0:
+    extracted = True
+    print("pdftotext extracted text size:", txt_path.stat().st_size)
+
+# If pdftotext not available, try PyMuPDF (fitz)
+if not extracted:
+    try:
+        import fitz  # PyMuPDF
+        doc = fitz.open(str(pdf_path))
+        full = []
+        for i in range(doc.page_count):
+            full.append(f"\n\n--- PAGE {i+1} ---\n" + doc.load_page(i).get_text("text"))
+        txt_path.write_text("".join(full))
+        extracted = True
+        print("PyMuPDF extracted pages:", doc.page_count, "chars:", txt_path.stat().st_size)
+    except Exception as e:
+        print("PyMuPDF extraction failed:", repr(e))
+
+if not extracted:
+    raise RuntimeError("Could not extract PDF text: neither pdftotext nor PyMuPDF worked.")
+
+print("\nUpdated checklist:")
+print("1. [✓] Extract text from PDF (using pdftotext or PyMuPDF) into intermediate files")
+print("2. [ ] Scan extracted text for PDB IDs, Kd/ΔG values, UniProt IDs, methods, nucleic acid info")
+print("3. [ ] Locate binding tables/sections and parse rows (mutations, Kd, ΔG, etc.)")
+print("4. [ ] Build output table with required headers and write CSV to the specified path")</execute>
+<observation>NameError("name 'subprocess' is not defined")</observation>
+<execute>#!/usr/bin/env python3
+import os, re, csv, math, subprocess, shlex
+from pathlib import Path
+
+pdf_path = Path("dataset/ProNAB/10383437.pdf")
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/")
+out_csv = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/pronab_extract.csv")
+tmp_dir.mkdir(parents=True, exist_ok=True)
+out_csv.parent.mkdir(parents=True, exist_ok=True)
+
+print("Research log")
+print("PDF exists:", pdf_path.exists(), pdf_path)
+
+print("\nPlan checklist:")
+plan = [
+"1. [ ] Extract text from PDF (pdftotext or PyMuPDF) into intermediate files",
+"2. [ ] Scan extracted text for PDB IDs, Kd/ΔG values, UniProt IDs, methods, nucleic acid info",
+"3. [ ] Locate binding tables/sections and parse rows (mutations, Kd, ΔG, etc.)",
+"4. [ ] Build output table with required headers and write CSV to the specified path"
+]
+print("\n".join(plan))
+
+def run(cmd):
+    print("\n$ " + cmd)
+    p = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    print("returncode:", p.returncode)
+    if p.stdout.strip():
+        print("stdout:", p.stdout[:2000])
+    if p.stderr.strip():
+        print("stderr:", p.stderr[:2000])
+    return p
+
+# Step 1: Extract text
+txt_path = tmp_dir / "full_text.txt"
+extracted = False
+
+res = run(f"pdftotext -layout {shlex.quote(str(pdf_path))} {shlex.quote(str(txt_path))}")
+if res.returncode == 0 and txt_path.exists() and txt_path.stat().st_size > 0:
+    extracted = True
+    print("pdftotext extracted text size:", txt_path.stat().st_size)
+
+if not extracted:
+    try:
+        import fitz  # PyMuPDF
+        doc = fitz.open(str(pdf_path))
+        full = []
+        for i in range(doc.page_count):
+            full.append(f"\n\n--- PAGE {i+1} ---\n" + doc.load_page(i).get_text("text"))
+        txt_path.write_text("".join(full))
+        extracted = True
+        print("PyMuPDF extracted pages:", doc.page_count, "chars:", txt_path.stat().st_size)
+    except Exception as e:
+        print("PyMuPDF extraction failed:", repr(e))
+
+if not extracted:
+    raise RuntimeError("Could not extract PDF text: neither pdftotext nor PyMuPDF worked.")
+
+full_text = txt_path.read_text(errors="ignore")
+print("Loaded extracted text chars:", len(full_text))
+
+print("\nUpdated checklist:")
+print("1. [✓] Extract text from PDF (pdftotext or PyMuPDF) into intermediate files")
+print("2. [ ] Scan extracted text for PDB IDs, Kd/ΔG values, UniProt IDs, methods, nucleic acid info")
+print("3. [ ] Locate binding tables/sections and parse rows (mutations, Kd, ΔG, etc.)")
+print("4. [ ] Build output table with required headers and write CSV to the specified path")
+
+# Step 2: Scan patterns
+pdb_ids_ctx = set()
+for m in re.finditer(r"\b([0-9][A-Za-z0-9]{3})\b", full_text):
+    pid = m.group(1)
+    start = max(0, m.start()-60); end = min(len(full_text), m.end()+60)
+    ctx = full_text[start:end].lower()
+    if "pdb" in ctx or "protein data bank" in ctx:
+        pdb_ids_ctx.add(pid)
+pdb_ids_ctx = sorted(pdb_ids_ctx)
+
+kd_patterns = [
+r"\bK[dD]\s*(?:=|:)?\s*([0-9]*\.?[0-9]+)\s*(pM|nM|uM|µM|mM|M)\b",
+r"\bK[dD]\s*(?:=|:)?\s*([0-9]*\.?[0-9]+)\s*(?:x|×)\s*10\^?(-?\d+)\s*M\b",
+]
+kd_hits = []
+for pat in kd_patterns:
+    for m in re.finditer(pat, full_text):
+        kd_hits.append(m.group(0))
+
+dg_hits = []
+for m in re.finditer(r"(?:ΔG|dG)\s*(?:=|:)?\s*(-?\d+\.?\d*)\s*(?:kcal/mol|kcal\s*mol-1|kcal\s*mol\^-1)", full_text, flags=re.IGNORECASE):
+    dg_hits.append(m.group(0))
+
+uniprot_like = sorted(set(re.findall(r"\b[OPQ][0-9][A-Z0-9]{3}[0-9]\b|\b[A-NR-Z][0-9]{5}\b", full_text)))
+method_terms = []
+for term in ["surface plasmon resonance", "spr", "isothermal titration calorimetry", "itc",
+             "fluorescence anisotropy", "gel shift", "electrophoretic mobility shift", "emsa",
+             "filter binding", "stopped-flow", "calorimetry"]:
+    if term in full_text.lower():
+        method_terms.append(term)
+method_terms = sorted(set(method_terms))
+
+print("\nScan results:")
+print("Candidate PDB IDs (contextual):", pdb_ids_ctx, "count:", len(pdb_ids_ctx))
+print("Kd hit snippets count:", len(kd_hits), "sample:", kd_hits[:10])
+print("dG hit snippets count:", len(dg_hits), "sample:", dg_hits[:10])
+print("UniProt-like IDs count:", len(uniprot_like), "sample:", uniprot_like[:20])
+print("Method terms found:", method_terms)
+
+# Save scan summary
+(tmp_dir / "scan_summary.txt").write_text(
+    "PDB IDs:\n" + "\n".join(pdb_ids_ctx) + "\n\n" +
+    "Kd snippets:\n" + "\n".join(kd_hits[:200]) + "\n\n" +
+    "dG snippets:\n" + "\n".join(dg_hits[:200]) + "\n\n" +
+    "UniProt-like:\n" + "\n".join(uniprot_like) + "\n\n" +
+    "Methods:\n" + "\n".join(method_terms) + "\n"
+)
+print("Saved scan summary to:", tmp_dir / "scan_summary.txt")
+
+print("\nUpdated checklist:")
+print("1. [✓] Extract text from PDF (pdftotext or PyMuPDF) into intermediate files")
+print("2. [✓] Scan extracted text for PDB IDs, Kd/ΔG values, UniProt IDs, methods, nucleic acid info")
+print("3. [ ] Locate binding tables/sections and parse rows (mutations, Kd, ΔG, etc.)")
+print("4. [ ] Build output table with required headers and write CSV to the specified path")</execute>
+<observation>NameError("name 'subprocess' is not defined")</observation>
+<execute>#!/usr/bin/env python3
+import os, re, csv, math
+import subprocess, shlex
+from pathlib import Path
+
+pdf_path = Path("dataset/ProNAB/10383437.pdf")
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/")
+out_csv = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/pronab_extract.csv")
+tmp_dir.mkdir(parents=True, exist_ok=True)
+out_csv.parent.mkdir(parents=True, exist_ok=True)
+
+print("Research log")
+print("PDF exists:", pdf_path.exists(), pdf_path)
+
+print("\nPlan checklist:")
+print("1. [ ] Extract text from PDF (pdftotext or PyMuPDF) into intermediate files")
+print("2. [ ] Scan extracted text for PDB IDs, Kd/ΔG values, UniProt IDs, methods, nucleic acid info")
+print("3. [ ] Locate binding tables/sections and parse rows (mutations, Kd, ΔG, etc.)")
+print("4. [ ] Build output table with required headers and write CSV to the specified path")
+
+def run(cmd):
+    print("\n$ " + cmd)
+    p = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    print("returncode:", p.returncode)
+    if p.stdout.strip():
+        print("stdout:", p.stdout[:2000])
+    if p.stderr.strip():
+        print("stderr:", p.stderr[:2000])
+    return p
+
+# Step 1: Extract text
+txt_path = tmp_dir / "full_text.txt"
+extracted = False
+
+res = run(f"pdftotext -layout {shlex.quote(str(pdf_path))} {shlex.quote(str(txt_path))}")
+if res.returncode == 0 and txt_path.exists() and txt_path.stat().st_size > 0:
+    extracted = True
+    print("pdftotext extracted text size:", txt_path.stat().st_size)
+
+if not extracted:
+    try:
+        import fitz  # PyMuPDF
+        doc = fitz.open(str(pdf_path))
+        full = []
+        for i in range(doc.page_count):
+            full.append(f"\n\n--- PAGE {i+1} ---\n" + doc.load_page(i).get_text("text"))
+        txt_path.write_text("".join(full))
+        extracted = True
+        print("PyMuPDF extracted pages:", doc.page_count, "chars:", txt_path.stat().st_size)
+    except Exception as e:
+        print("PyMuPDF extraction failed:", repr(e))
+
+if not extracted:
+    raise RuntimeError("Could not extract PDF text: neither pdftotext nor PyMuPDF worked.")
+
+full_text = txt_path.read_text(errors="ignore")
+print("Loaded extracted text chars:", len(full_text))
+
+print("\nUpdated checklist:")
+print("1. [✓] Extract text from PDF (pdftotext or PyMuPDF) into intermediate files")
+print("2. [ ] Scan extracted text for PDB IDs, Kd/ΔG values, UniProt IDs, methods, nucleic acid info")
+print("3. [ ] Locate binding tables/sections and parse rows (mutations, Kd, ΔG, etc.)")
+print("4. [ ] Build output table with required headers and write CSV to the specified path")
+
+# Step 2: Scan patterns
+pdb_ids_ctx = set()
+for m in re.finditer(r"\b([0-9][A-Za-z0-9]{3})\b", full_text):
+    pid = m.group(1)
+    start = max(0, m.start()-60); end = min(len(full_text), m.end()+60)
+    ctx = full_text[start:end].lower()
+    if "pdb" in ctx or "protein data bank" in ctx:
+        pdb_ids_ctx.add(pid)
+pdb_ids_ctx = sorted(pdb_ids_ctx)
+
+kd_hits = []
+for m in re.finditer(r"\bK[dD]\s*(?:=|:)?\s*([0-9]*\.?[0-9]+)\s*(pM|nM|uM|µM|mM|M)\b", full_text):
+    kd_hits.append(m.group(0))
+for m in re.finditer(r"\bK[dD]\s*(?:=|:)?\s*([0-9]*\.?[0-9]+)\s*(?:x|×)\s*10\^?(-?\d+)\s*M\b", full_text):
+    kd_hits.append(m.group(0))
+
+dg_hits = [m.group(0) for m in re.finditer(
+    r"(?:ΔG|dG)\s*(?:=|:)?\s*(-?\d+\.?\d*)\s*(?:kcal/mol|kcal\s*mol-1|kcal\s*mol\^-1)",
+    full_text, flags=re.IGNORECASE
+)]
+
+uniprot_like = sorted(set(re.findall(r"\b[OPQ][0-9][A-Z0-9]{3}[0-9]\b|\b[A-NR-Z][0-9]{5}\b", full_text)))
+method_terms = []
+for term in ["surface plasmon resonance", "spr", "isothermal titration calorimetry", "itc",
+             "fluorescence anisotropy", "gel shift", "electrophoretic mobility shift", "emsa",
+             "filter binding", "stopped-flow", "calorimetry"]:
+    if term in full_text.lower():
+        method_terms.append(term)
+method_terms = sorted(set(method_terms))
+
+print("\nScan results:")
+print("Candidate PDB IDs (contextual):", pdb_ids_ctx, "count:", len(pdb_ids_ctx))
+print("Kd hit snippets count:", len(kd_hits), "sample:", kd_hits[:10])
+print("dG hit snippets count:", len(dg_hits), "sample:", dg_hits[:10])
+print("UniProt-like IDs count:", len(uniprot_like), "sample:", uniprot_like[:20])
+print("Method terms found:", method_terms)
+
+(tmp_dir / "scan_summary.txt").write_text(
+    "PDB IDs:\n" + "\n".join(pdb_ids_ctx) + "\n\n" +
+    "Kd snippets:\n" + "\n".join(kd_hits[:200]) + "\n\n" +
+    "dG snippets:\n" + "\n".join(dg_hits[:200]) + "\n\n" +
+    "UniProt-like:\n" + "\n".join(uniprot_like) + "\n\n" +
+    "Methods:\n" + "\n".join(method_terms) + "\n"
+)
+print("Saved scan summary to:", tmp_dir / "scan_summary.txt")
+
+print("\nUpdated checklist:")
+print("1. [✓] Extract text from PDF (pdftotext or PyMuPDF) into intermediate files")
+print("2. [✓] Scan extracted text for PDB IDs, Kd/ΔG values, UniProt IDs, methods, nucleic acid info")
+print("3. [ ] Locate binding tables/sections and parse rows (mutations, Kd, ΔG, etc.)")
+print("4. [ ] Build output table with required headers and write CSV to the specified path")</execute>
+<observation>NameError("name 'subprocess' is not defined")</observation>
+<execute>import builtins, sys, types, os, re, csv, math, shlex, subprocess
+print("subprocess in globals:", "subprocess" in globals())
+print("subprocess module:", subprocess)
+print("python:", sys.version)</execute>
+<observation>subprocess in globals: False
+subprocess module: <module 'subprocess' from '/root/miniconda3/envs/biomni_e1/lib/python3.11/subprocess.py'>
+python: 3.11.14 | packaged by conda-forge | (main, Jan 26 2026, 23:48:32) [GCC 14.3.0]
+</observation>
+<execute>#!/usr/bin/env python3
+# NOTE: Work around environment quirk: later code cells may not preserve "import subprocess" into globals.
+# We'll import subprocess inside the run() function to guarantee availability.
+
+import os, re, csv, math, shlex
+from pathlib import Path
+
+pdf_path = Path("dataset/ProNAB/10383437.pdf")
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/")
+out_csv = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/pronab_extract.csv")
+tmp_dir.mkdir(parents=True, exist_ok=True)
+out_csv.parent.mkdir(parents=True, exist_ok=True)
+
+print("Plan checklist:")
+print("1. [ ] Extract text from PDF (pdftotext or PyMuPDF) into intermediate files")
+print("2. [ ] Scan extracted text for PDB IDs, Kd/ΔG values, UniProt IDs, methods, nucleic acid info")
+print("3. [ ] Locate binding tables/sections and parse rows (mutations, Kd, ΔG, etc.)")
+print("4. [ ] Build output table with required headers and write CSV to the specified path")
+
+def run(cmd):
+    import subprocess
+    print("\n$ " + cmd)
+    p = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    print("returncode:", p.returncode)
+    if p.stdout.strip():
+        print("stdout:", p.stdout[:2000])
+    if p.stderr.strip():
+        print("stderr:", p.stderr[:2000])
+    return p
+
+# Step 1: Extract text
+txt_path = tmp_dir / "full_text.txt"
+extracted = False
+
+res = run(f"pdftotext -layout {shlex.quote(str(pdf_path))} {shlex.quote(str(txt_path))}")
+if res.returncode == 0 and txt_path.exists() and txt_path.stat().st_size > 0:
+    extracted = True
+    print("pdftotext extracted text size:", txt_path.stat().st_size)
+
+if not extracted:
+    try:
+        import fitz  # PyMuPDF
+        doc = fitz.open(str(pdf_path))
+        full = []
+        for i in range(doc.page_count):
+            full.append(f"\n\n--- PAGE {i+1} ---\n" + doc.load_page(i).get_text("text"))
+        txt_path.write_text("".join(full))
+        extracted = True
+        print("PyMuPDF extracted pages:", doc.page_count, "chars:", txt_path.stat().st_size)
+    except Exception as e:
+        print("PyMuPDF extraction failed:", repr(e))
+
+if not extracted:
+    raise RuntimeError("Could not extract PDF text: neither pdftotext nor PyMuPDF worked.")
+
+full_text = txt_path.read_text(errors="ignore")
+print("Loaded extracted text chars:", len(full_text))
+
+print("\nUpdated checklist:")
+print("1. [✓] Extract text from PDF (pdftotext or PyMuPDF) into intermediate files")
+print("2. [ ] Scan extracted text for PDB IDs, Kd/ΔG values, UniProt IDs, methods, nucleic acid info")
+print("3. [ ] Locate binding tables/sections and parse rows (mutations, Kd, ΔG, etc.)")
+print("4. [ ] Build output table with required headers and write CSV to the specified path")
+
+# Step 2: Scan patterns
+pdb_ids_ctx = set()
+for m in re.finditer(r"\b([0-9][A-Za-z0-9]{3})\b", full_text):
+    pid = m.group(1)
+    start = max(0, m.start()-60); end = min(len(full_text), m.end()+60)
+    ctx = full_text[start:end].lower()
+    if "pdb" in ctx or "protein data bank" in ctx:
+        pdb_ids_ctx.add(pid)
+pdb_ids_ctx = sorted(pdb_ids_ctx)
+
+kd_hits = []
+for m in re.finditer(r"\bK[dD]\s*(?:=|:)?\s*([0-9]*\.?[0-9]+)\s*(pM|nM|uM|µM|mM|M)\b", full_text):
+    kd_hits.append(m.group(0))
+for m in re.finditer(r"\bK[dD]\s*(?:=|:)?\s*([0-9]*\.?[0-9]+)\s*(?:x|×)\s*10\^?(-?\d+)\s*M\b", full_text):
+    kd_hits.append(m.group(0))
+
+dg_hits = [m.group(0) for m in re.finditer(
+    r"(?:ΔG|dG)\s*(?:=|:)?\s*(-?\d+\.?\d*)\s*(?:kcal/mol|kcal\s*mol-1|kcal\s*mol\^-1)",
+    full_text, flags=re.IGNORECASE
+)]
+
+uniprot_like = sorted(set(re.findall(r"\b[OPQ][0-9][A-Z0-9]{3}[0-9]\b|\b[A-NR-Z][0-9]{5}\b", full_text)))
+method_terms = []
+for term in ["surface plasmon resonance", "spr", "isothermal titration calorimetry", "itc",
+             "fluorescence anisotropy", "gel shift", "electrophoretic mobility shift", "emsa",
+             "filter binding", "stopped-flow", "calorimetry"]:
+    if term in full_text.lower():
+        method_terms.append(term)
+method_terms = sorted(set(method_terms))
+
+print("\nScan results:")
+print("Candidate PDB IDs (contextual):", pdb_ids_ctx, "count:", len(pdb_ids_ctx))
+print("Kd hit snippets count:", len(kd_hits), "sample:", kd_hits[:10])
+print("dG hit snippets count:", len(dg_hits), "sample:", dg_hits[:10])
+print("UniProt-like IDs count:", len(uniprot_like), "sample:", uniprot_like[:20])
+print("Method terms found:", method_terms)
+
+(tmp_dir / "scan_summary.txt").write_text(
+    "PDB IDs:\n" + "\n".join(pdb_ids_ctx) + "\n\n" +
+    "Kd snippets:\n" + "\n".join(kd_hits[:200]) + "\n\n" +
+    "dG snippets:\n" + "\n".join(dg_hits[:200]) + "\n\n" +
+    "UniProt-like:\n" + "\n".join(uniprot_like) + "\n\n" +
+    "Methods:\n" + "\n".join(method_terms) + "\n"
+)
+
+print("Saved scan summary to:", tmp_dir / "scan_summary.txt")
+
+print("\nUpdated checklist:")
+print("1. [✓] Extract text from PDF (pdftotext or PyMuPDF) into intermediate files")
+print("2. [✓] Scan extracted text for PDB IDs, Kd/ΔG values, UniProt IDs, methods, nucleic acid info")
+print("3. [ ] Locate binding tables/sections and parse rows (mutations, Kd, ΔG, etc.)")
+print("4. [ ] Build output table with required headers and write CSV to the specified path")</execute>
+<observation>RuntimeError('Could not extract PDF text: neither pdftotext nor PyMuPDF worked.')</observation>
+<execute>#!/usr/bin/env python3
+import os, re, shlex
+from pathlib import Path
+import subprocess
+
+pdf_path = Path("dataset/ProNAB/10383437.pdf")
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/")
+tmp_dir.mkdir(parents=True, exist_ok=True)
+
+print("Plan checklist:")
+print("1. [ ] Diagnose PDF extraction failure and find an available extractor (pdftotext / mutool / qpdf / strings / OCR)")
+print("2. [ ] Extract text into intermediate files")
+print("3. [ ] Parse binding data into structured rows")
+print("4. [ ] Write final CSV")
+
+def run(cmd):
+    print("\n$ " + cmd)
+    p = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    print("returncode:", p.returncode)
+    if p.stdout:
+        print("stdout(head):", p.stdout[:2000])
+    if p.stderr:
+        print("stderr(head):", p.stderr[:2000])
+    return p
+
+print("\n[1] Diagnose file and tool availability")
+run(f"ls -lah {shlex.quote(str(pdf_path))}")
+run(f"file {shlex.quote(str(pdf_path))}")
+run("which pdftotext || true")
+run("pdftotext -v 2>/dev/null || true")
+run("python -c \"import importlib; print('fitz:', importlib.util.find_spec('fitz'))\"")
+
+# Check other possible CLI extractors
+run("which mutool || true")
+run("which qpdf || true")
+run("which pdfinfo || true")
+run("which pdftoppm || true")
+run("which tesseract || true")
+
+# Try pdfinfo if available
+run(f"pdfinfo {shlex.quote(str(pdf_path))} 2>/dev/null | head -n 50 || true")
+
+# Attempt pdftotext without -layout (sometimes -layout fails)
+txt_path = tmp_dir / "full_text_pdftotext.txt"
+run(f"pdftotext {shlex.quote(str(pdf_path))} {shlex.quote(str(txt_path))} 2>/dev/null || true")
+if txt_path.exists():
+    print("pdftotext output size:", txt_path.stat().st_size)
+
+# Attempt mutool (MuPDF) text extraction if available
+txt_path2 = tmp_dir / "full_text_mutool.txt"
+run(f"mutool draw -F txt {shlex.quote(str(pdf_path))} > {shlex.quote(str(txt_path2))} 2>/dev/null || true")
+if txt_path2.exists():
+    print("mutool output size:", txt_path2.stat().st_size)
+
+# Fallback: strings (crude) to see if any embedded text exists
+strings_path = tmp_dir / "strings_head.txt"
+run(f"strings -n 6 {shlex.quote(str(pdf_path))} | head -n 200 > {shlex.quote(str(strings_path))} || true")
+print("Saved strings head:", strings_path, "size:", strings_path.stat().st_size if strings_path.exists() else None)
+
+print("\nUpdated checklist:")
+print("1. [✓] Diagnose PDF extraction failure and find an available extractor (pdftotext / mutool / qpdf / strings / OCR)")
+print("2. [ ] Extract text into intermediate files")
+print("3. [ ] Parse binding data into structured rows")
+print("4. [ ] Write final CSV")</execute>
+<observation>NameError("name 'subprocess' is not defined")</observation>
+<execute>#!/usr/bin/env python3
+# Work around the environment quirk by importing subprocess inside run()
+
+import os, re, shlex
+from pathlib import Path
+
+pdf_path = Path("dataset/ProNAB/10383437.pdf")
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/")
+tmp_dir.mkdir(parents=True, exist_ok=True)
+
+print("Plan checklist:")
+print("1. [ ] Diagnose PDF extraction failure and find an available extractor (pdftotext / mutool / qpdf / strings / OCR)")
+print("2. [ ] Extract text into intermediate files")
+print("3. [ ] Parse binding data into structured rows")
+print("4. [ ] Write final CSV")
+
+def run(cmd):
+    import subprocess
+    print("\n$ " + cmd)
+    p = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    print("returncode:", p.returncode)
+    if p.stdout:
+        print("stdout(head):", p.stdout[:2000])
+    if p.stderr:
+        print("stderr(head):", p.stderr[:2000])
+    return p
+
+print("\n[1] Diagnose file and tool availability")
+run(f"ls -lah {shlex.quote(str(pdf_path))}")
+run(f"file {shlex.quote(str(pdf_path))}")
+run("which pdftotext || true")
+run("pdftotext -v 2>/dev/null || true")
+run("python -c \"import importlib; print('fitz:', importlib.util.find_spec('fitz'))\"")
+
+run("which mutool || true")
+run("which qpdf || true")
+run("which pdfinfo || true")
+run("which pdftoppm || true")
+run("which tesseract || true")
+
+run(f"pdfinfo {shlex.quote(str(pdf_path))} 2>/dev/null | head -n 60 || true")
+
+# Attempt pdftotext without -layout
+txt_path = tmp_dir / "full_text_pdftotext.txt"
+run(f"pdftotext {shlex.quote(str(pdf_path))} {shlex.quote(str(txt_path))} 2>/dev/null || true")
+if txt_path.exists():
+    print("pdftotext output size:", txt_path.stat().st_size)
+
+# Attempt mutool extraction if available
+txt_path2 = tmp_dir / "full_text_mutool.txt"
+run(f"mutool draw -F txt {shlex.quote(str(pdf_path))} > {shlex.quote(str(txt_path2))} 2>/dev/null || true")
+if txt_path2.exists():
+    print("mutool output size:", txt_path2.stat().st_size)
+
+# Fallback: strings head
+strings_path = tmp_dir / "strings_head.txt"
+run(f"strings -n 6 {shlex.quote(str(pdf_path))} | head -n 200 > {shlex.quote(str(strings_path))} || true")
+print("Saved strings head:", strings_path, "size:", strings_path.stat().st_size if strings_path.exists() else None)
+
+print("\nUpdated checklist:")
+print("1. [✓] Diagnose PDF extraction failure and find an available extractor (pdftotext / mutool / qpdf / strings / OCR)")
+print("2. [ ] Extract text into intermediate files")
+print("3. [ ] Parse binding data into structured rows")
+print("4. [ ] Write final CSV")</execute>
+<observation>Plan checklist:
+1. [ ] Diagnose PDF extraction failure and find an available extractor (pdftotext / mutool / qpdf / strings / OCR)
+2. [ ] Extract text into intermediate files
+3. [ ] Parse binding data into structured rows
+4. [ ] Write final CSV
+
+[1] Diagnose file and tool availability
+
+$ ls -lah dataset/ProNAB/10383437.pdf
+returncode: 2
+stderr(head): ls: cannot access 'dataset/ProNAB/10383437.pdf': No such file or directory
+
+
+$ file dataset/ProNAB/10383437.pdf
+returncode: 0
+stdout(head): dataset/ProNAB/10383437.pdf: cannot open `dataset/ProNAB/10383437.pdf' (No such file or directory)
+
+
+$ which pdftotext || true
+returncode: 0
+
+$ pdftotext -v 2>/dev/null || true
+returncode: 0
+
+$ python -c "import importlib; print('fitz:', importlib.util.find_spec('fitz'))"
+returncode: 1
+stderr(head): Traceback (most recent call last):
+  File "<string>", line 1, in <module>
+AttributeError: module 'importlib' has no attribute 'util'
+
+
+$ which mutool || true
+returncode: 0
+
+$ which qpdf || true
+returncode: 0
+
+$ which pdfinfo || true
+returncode: 0
+
+$ which pdftoppm || true
+returncode: 0
+
+$ which tesseract || true
+returncode: 0
+
+$ pdfinfo dataset/ProNAB/10383437.pdf 2>/dev/null | head -n 60 || true
+returncode: 0
+
+$ pdftotext dataset/ProNAB/10383437.pdf /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/full_text_pdftotext.txt 2>/dev/null || true
+returncode: 0
+
+$ mutool draw -F txt dataset/ProNAB/10383437.pdf > /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/full_text_mutool.txt 2>/dev/null || true
+returncode: 0
+mutool output size: 0
+
+$ strings -n 6 dataset/ProNAB/10383437.pdf | head -n 200 > /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/strings_head.txt || true
+returncode: 0
+stderr(head): strings: 'dataset/ProNAB/10383437.pdf': No such file
+
+Saved strings head: /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/strings_head.txt size: 0
+
+Updated checklist:
+1. [✓] Diagnose PDF extraction failure and find an available extractor (pdftotext / mutool / qpdf / strings / OCR)
+2. [ ] Extract text into intermediate files
+3. [ ] Parse binding data into structured rows
+4. [ ] Write final CSV
+</observation>
+<execute>#!/usr/bin/env python3
+import os, re, shlex
+from pathlib import Path
+
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/")
+tmp_dir.mkdir(parents=True, exist_ok=True)
+
+print("Plan checklist:")
+print("1. [✓] Diagnose PDF extraction failure and find an available extractor (pdftotext / mutool / qpdf / strings / OCR)")
+print("2. [ ] Locate the provided PDF in the filesystem and copy/link it into the intermediate directory")
+print("3. [ ] Extract text into intermediate files")
+print("4. [ ] Parse binding data into structured rows")
+print("5. [ ] Write final CSV")
+
+def run(cmd):
+    import subprocess
+    print("\n$ " + cmd)
+    p = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    print("returncode:", p.returncode)
+    if p.stdout:
+        print("stdout(head):", p.stdout[:4000])
+    if p.stderr:
+        print("stderr(head):", p.stderr[:2000])
+    return p
+
+# Step 2: locate the PDF
+print("\n[2] Locating 10383437.pdf ...")
+run("ls -lah dataset || true")
+run("ls -lah dataset/ProNAB || true")
+run("find . -maxdepth 4 -type f -name '10383437.pdf' -print || true")
+run("find / -maxdepth 6 -type f -name '10383437.pdf' -print 2>/dev/null | head -n 20 || true")
+
+print("\nUpdated checklist:")
+print("1. [✓] Diagnose PDF extraction failure and find an available extractor (pdftotext / mutool / qpdf / strings / OCR)")
+print("2. [ ] Locate the provided PDF in the filesystem and copy/link it into the intermediate directory")
+print("3. [ ] Extract text into intermediate files")
+print("4. [ ] Parse binding data into structured rows")
+print("5. [ ] Write final CSV")</execute>
+<observation>Plan checklist:
+1. [✓] Diagnose PDF extraction failure and find an available extractor (pdftotext / mutool / qpdf / strings / OCR)
+2. [ ] Locate the provided PDF in the filesystem and copy/link it into the intermediate directory
+3. [ ] Extract text into intermediate files
+4. [ ] Parse binding data into structured rows
+5. [ ] Write final CSV
+
+[2] Locating 10383437.pdf ...
+
+$ ls -lah dataset || true
+returncode: 0
+stderr(head): ls: cannot access 'dataset': No such file or directory
+
+
+$ ls -lah dataset/ProNAB || true
+returncode: 0
+stderr(head): ls: cannot access 'dataset/ProNAB': No such file or directory
+
+
+$ find . -maxdepth 4 -type f -name '10383437.pdf' -print || true
+returncode: 0
+stdout(head): ./benchmark/dataset/ProNAB/10383437.pdf
+
+
+$ find / -maxdepth 6 -type f -name '10383437.pdf' -print 2>/dev/null | head -n 20 || true
+returncode: 0
+stdout(head): /root/biodatalab/benchmark/dataset/ProNAB/10383437.pdf
+
+
+Updated checklist:
+1. [✓] Diagnose PDF extraction failure and find an available extractor (pdftotext / mutool / qpdf / strings / OCR)
+2. [ ] Locate the provided PDF in the filesystem and copy/link it into the intermediate directory
+3. [ ] Extract text into intermediate files
+4. [ ] Parse binding data into structured rows
+5. [ ] Write final CSV
+</observation>
+<execute>#!/usr/bin/env python3
+import os, re, csv, math, shlex
+from pathlib import Path
+
+src_pdf = Path("./benchmark/dataset/ProNAB/10383437.pdf")
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/")
+tmp_dir.mkdir(parents=True, exist_ok=True)
+pdf_path = tmp_dir / "10383437.pdf"
+
+out_csv = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/pronab_extract.csv")
+out_csv.parent.mkdir(parents=True, exist_ok=True)
+
+def run(cmd):
+    import subprocess
+    print("\n$ " + cmd)
+    p = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    print("returncode:", p.returncode)
+    if p.stdout:
+        print("stdout(head):", p.stdout[:2000])
+    if p.stderr:
+        print("stderr(head):", p.stderr[:2000])
+    return p
+
+print("Plan checklist:")
+print("1. [✓] Diagnose PDF extraction failure and find an available extractor (pdftotext / mutool / qpdf / strings / OCR)")
+print("2. [ ] Locate the provided PDF and copy/link it into the intermediate directory")
+print("3. [ ] Extract text into intermediate files")
+print("4. [ ] Parse binding data into structured rows")
+print("5. [ ] Write final CSV")
+
+# Step 2: copy PDF into tmp
+print("\n[2] Copying PDF into intermediate directory")
+print("Source exists:", src_pdf.exists(), src_pdf)
+if not src_pdf.exists():
+    raise FileNotFoundError(f"Cannot find source PDF at {src_pdf}")
+pdf_path.write_bytes(src_pdf.read_bytes())
+print("Copied to:", pdf_path, "size:", pdf_path.stat().st_size)
+
+print("\nUpdated checklist:")
+print("1. [✓] Diagnose PDF extraction failure and find an available extractor (pdftotext / mutool / qpdf / strings / OCR)")
+print("2. [✓] Locate the provided PDF and copy/link it into the intermediate directory")
+print("3. [ ] Extract text into intermediate files")
+print("4. [ ] Parse binding data into structured rows")
+print("5. [ ] Write final CSV")
+
+# Step 3: Extract text (try pdftotext, then mutool; if empty, OCR)
+txt_path = tmp_dir / "full_text.txt"
+extracted = False
+
+print("\n[3] Text extraction attempts")
+res = run(f"pdftotext -layout {shlex.quote(str(pdf_path))} {shlex.quote(str(txt_path))}")
+if txt_path.exists() and txt_path.stat().st_size > 1000:
+    extracted = True
+    print("pdftotext success. size:", txt_path.stat().st_size)
+
+if not extracted:
+    res = run(f"mutool draw -F txt {shlex.quote(str(pdf_path))} > {shlex.quote(str(txt_path))}")
+    if txt_path.exists() and txt_path.stat().st_size > 1000:
+        extracted = True
+        print("mutool success. size:", txt_path.stat().st_size)
+
+# OCR fallback: pdftoppm + tesseract (only if needed)
+if not extracted:
+    print("Direct text extraction seems empty; trying OCR on first few pages to confirm...")
+    ocr_dir = tmp_dir / "ocr_pages"
+    ocr_dir.mkdir(exist_ok=True)
+    run(f"pdftoppm -f 1 -l 3 -r 200 -png {shlex.quote(str(pdf_path))} {shlex.quote(str(ocr_dir/'page'))}")
+    # run tesseract on produced images
+    ocr_texts = []
+    for img in sorted(ocr_dir.glob("page-*.png")):
+        base = img.with_suffix("")
+        run(f"tesseract {shlex.quote(str(img))} {shlex.quote(str(base))} -l eng 1>/dev/null 2>/dev/null || true")
+        txt = base.with_suffix(".txt")
+        if txt.exists():
+            ocr_texts.append(txt.read_text(errors="ignore"))
+    ocr_preview = "\n".join(ocr_texts)
+    (tmp_dir / "ocr_preview_pages1-3.txt").write_text(ocr_preview)
+    print("OCR preview chars (pages 1-3):", len(ocr_preview))
+    # If OCR has content, do full OCR (may take time but necessary)
+    if len(ocr_preview) > 500:
+        print("Proceeding with full OCR (all pages at 200dpi)...")
+        # determine page count
+        info = run(f"pdfinfo {shlex.quote(str(pdf_path))} | grep -i pages || true")
+        m = re.search(r"Pages:\s*(\d+)", info.stdout or "")
+        n_pages = int(m.group(1)) if m else 1
+        run(f"pdftoppm -r 200 -png {shlex.quote(str(pdf_path))} {shlex.quote(str(ocr_dir/'pagefull'))}")
+        ocr_all = []
+        for img in sorted(ocr_dir.glob("pagefull-*.png")):
+            base = img.with_suffix("")
+            run(f"tesseract {shlex.quote(str(img))} {shlex.quote(str(base))} -l eng 1>/dev/null 2>/dev/null || true")
+            txt = base.with_suffix(".txt")
+            if txt.exists():
+                ocr_all.append(txt.read_text(errors="ignore"))
+        txt_path.write_text("\n\n".join([f"--- OCR PAGE {i+1} ---\n"+t for i,t in enumerate(ocr_all)]))
+        if txt_path.exists() and txt_path.stat().st_size > 1000:
+            extracted = True
+            print("Full OCR success. size:", txt_path.stat().st_size)
+
+if not extracted:
+    raise RuntimeError("Failed to extract text even with OCR preview (no readable content).")
+
+print("\nUpdated checklist:")
+print("1. [✓] Diagnose PDF extraction failure and find an available extractor (pdftotext / mutool / qpdf / strings / OCR)")
+print("2. [✓] Locate the provided PDF and copy/link it into the intermediate directory")
+print("3. [✓] Extract text into intermediate files")
+print("4. [ ] Parse binding data into structured rows")
+print("5. [ ] Write final CSV")
+
+# Load extracted text
+full_text = txt_path.read_text(errors="ignore")
+print("\nExtracted text loaded. chars:", len(full_text))
+
+# Step 4+5 will be done next (parse + write)
+# For now, save a small head preview
+(tmp_dir / "full_text_head.txt").write_text(full_text[:20000])
+print("Saved head preview:", tmp_dir / "full_text_head.txt")</execute>
+<observation>RuntimeError('Failed to extract text even with OCR preview (no readable content).')</observation>
+<execute>#!/usr/bin/env python3
+import shlex, re
+from pathlib import Path
+
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/")
+pdf_path = tmp_dir / "10383437.pdf"
+tmp_dir.mkdir(parents=True, exist_ok=True)
+
+def run(cmd):
+    import subprocess
+    print("\n$ " + cmd)
+    p = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    print("returncode:", p.returncode)
+    if p.stdout:
+        print("stdout(head):", p.stdout[:4000])
+    if p.stderr:
+        print("stderr(head):", p.stderr[:2000])
+    return p
+
+print("Plan checklist:")
+print("1. [ ] Inspect PDF integrity/encryption and confirm rasterization/OCR viability")
+print("2. [ ] If encrypted, try qpdf decrypt; if image-based, increase dpi and preprocess before OCR")
+print("3. [ ] Extract text robustly")
+print("4. [ ] Parse binding data and write CSV")
+
+# Step 1: inspect PDF
+print("\n[1] Inspect PDF")
+run(f"ls -lah {shlex.quote(str(pdf_path))}")
+run(f"file {shlex.quote(str(pdf_path))}")
+run(f"pdfinfo {shlex.quote(str(pdf_path))} | head -n 80 || true")
+run(f"qpdf --show-encryption {shlex.quote(str(pdf_path))} 2>/dev/null || true")
+
+# Try to render a single page at higher dpi and see if image is produced
+img_dir = tmp_dir / "render_test"
+img_dir.mkdir(exist_ok=True)
+run(f"rm -f {shlex.quote(str(img_dir/'test-1.png'))} || true")
+run(f"pdftoppm -f 1 -l 1 -r 400 -png {shlex.quote(str(pdf_path))} {shlex.quote(str(img_dir/'test'))}")
+run(f"ls -lah {shlex.quote(str(img_dir))} || true")
+
+# If image exists, run tesseract and show raw output head
+img = next(iter(sorted(img_dir.glob('test-*.png'))), None)
+if img:
+    base = img.with_suffix("")
+    run(f"tesseract {shlex.quote(str(img))} {shlex.quote(str(base))} -l eng 2>/dev/null || true")
+    txt = base.with_suffix(".txt")
+    if txt.exists():
+        content = txt.read_text(errors="ignore")
+        print("\n[OCR OUTPUT HEAD]\n", content[:2000])
+    else:
+        print("No tesseract txt produced.")
+else:
+    print("No rendered PNG produced; pdftoppm may have failed or PDF has issues.")
+
+print("\nUpdated checklist:")
+print("1. [✓] Inspect PDF integrity/encryption and confirm rasterization/OCR viability")
+print("2. [ ] If encrypted, try qpdf decrypt; if image-based, increase dpi and preprocess before OCR")
+print("3. [ ] Extract text robustly")
+print("4. [ ] Parse binding data and write CSV")</execute>
+<observation>Plan checklist:
+1. [ ] Inspect PDF integrity/encryption and confirm rasterization/OCR viability
+2. [ ] If encrypted, try qpdf decrypt; if image-based, increase dpi and preprocess before OCR
+3. [ ] Extract text robustly
+4. [ ] Parse binding data and write CSV
+
+[1] Inspect PDF
+
+$ ls -lah /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/10383437.pdf
+returncode: 0
+stdout(head): -rw-r--r-- 1 root root 794K Feb  8 21:31 /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/10383437.pdf
+
+
+$ file /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/10383437.pdf
+returncode: 0
+stdout(head): /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/10383437.pdf: PDF document, version 1.7, 6 pages
+
+
+$ pdfinfo /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/10383437.pdf | head -n 80 || true
+returncode: 0
+stderr(head): /bin/sh: 1: pdfinfo: not found
+
+
+$ qpdf --show-encryption /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/10383437.pdf 2>/dev/null || true
+returncode: 0
+
+$ rm -f /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/render_test/test-1.png || true
+returncode: 0
+
+$ pdftoppm -f 1 -l 1 -r 400 -png /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/10383437.pdf /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/render_test/test
+returncode: 127
+stderr(head): /bin/sh: 1: pdftoppm: not found
+
+
+$ ls -lah /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/render_test || true
+returncode: 0
+stdout(head): total 0
+drwxr-xr-x 2 root root   6 Feb  8 21:32 .
+drwxr-xr-x 4 root root 167 Feb  8 21:32 ..
+
+No rendered PNG produced; pdftoppm may have failed or PDF has issues.
+
+Updated checklist:
+1. [✓] Inspect PDF integrity/encryption and confirm rasterization/OCR viability
+2. [ ] If encrypted, try qpdf decrypt; if image-based, increase dpi and preprocess before OCR
+3. [ ] Extract text robustly
+4. [ ] Parse binding data and write CSV
+</observation>
+<execute>#!/usr/bin/env python3
+import shlex, os, re
+from pathlib import Path
+
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/")
+pdf_path = tmp_dir / "10383437.pdf"
+
+def run(cmd):
+    import subprocess
+    print("\n$ " + cmd)
+    p = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    print("returncode:", p.returncode)
+    if p.stdout:
+        print("stdout(head):", p.stdout[:4000])
+    if p.stderr:
+        print("stderr(head):", p.stderr[:2000])
+    return p
+
+print("Plan checklist:")
+print("1. [✓] Inspect PDF integrity/encryption and confirm rasterization/OCR viability")
+print("2. [ ] Extract text using available tools (mutool, pdftotext) and validate output")
+print("3. [ ] If no extractable text, attempt alternate rendering/OCR path available in environment")
+print("4. [ ] Parse binding data and write CSV")
+
+print("\n[2] Check tool availability precisely")
+run("command -v pdftotext || true")
+run("command -v mutool || true")
+run("command -v pdfinfo || true")
+run("command -v pdftoppm || true")
+run("command -v tesseract || true")
+run("mutool -v 2>/dev/null | head -n 2 || true")
+run("pdftotext -v 2>/dev/null | head -n 2 || true")
+
+print("\nTry qpdf decompress/linearize to help extractors")
+decomp_pdf = tmp_dir / "10383437.decompressed.pdf"
+run(f"qpdf --qdf --object-streams=disable {shlex.quote(str(pdf_path))} {shlex.quote(str(decomp_pdf))} 2>/dev/null || true")
+print("Decompressed exists:", decomp_pdf.exists(), "size:", decomp_pdf.stat().st_size if decomp_pdf.exists() else None)
+
+print("\nTry text extraction variants")
+txt1 = tmp_dir / "pdftotext_layout.txt"
+txt2 = tmp_dir / "pdftotext_raw.txt"
+txt3 = tmp_dir / "mutool_txt.txt"
+txt4 = tmp_dir / "mutool_text.txt"
+
+run(f"pdftotext -layout {shlex.quote(str(pdf_path))} {shlex.quote(str(txt1))} 2>/dev/null || true")
+run(f"pdftotext {shlex.quote(str(pdf_path))} {shlex.quote(str(txt2))} 2>/dev/null || true")
+if decomp_pdf.exists():
+    run(f"pdftotext -layout {shlex.quote(str(decomp_pdf))} {shlex.quote(str(tmp_dir/'pdftotext_layout_decomp.txt'))} 2>/dev/null || true")
+    run(f"pdftotext {shlex.quote(str(decomp_pdf))} {shlex.quote(str(tmp_dir/'pdftotext_raw_decomp.txt'))} 2>/dev/null || true")
+
+run(f"mutool draw -F txt {shlex.quote(str(pdf_path))} > {shlex.quote(str(txt3))} 2>/dev/null || true")
+run(f"mutool convert -o {shlex.quote(str(txt4))} {shlex.quote(str(pdf_path))} 2>/dev/null || true")
+
+def size(p):
+    return p.stat().st_size if p.exists() else 0
+
+candidates = [txt1, txt2, txt3, txt4, tmp_dir/'pdftotext_layout_decomp.txt', tmp_dir/'pdftotext_raw_decomp.txt']
+sizes = {str(p): size(p) for p in candidates}
+print("\nExtracted text file sizes:")
+for k,v in sizes.items():
+    print(f"{v:8d}  {k}")
+
+best = max(candidates, key=lambda p: size(p))
+print("\nBest candidate:", best, "size:", size(best))
+if size(best) > 200:
+    head = best.read_text(errors="ignore")[:2000]
+    print("\n[TEXT HEAD]\n", head)
+else:
+    print("\nNo meaningful text extracted yet (all outputs tiny). Will need OCR, but pdftoppm is missing.")
+
+print("\nUpdated checklist:")
+print("1. [✓] Inspect PDF integrity/encryption and confirm rasterization/OCR viability")
+print("2. [✓] Extract text using available tools (mutool, pdftotext) and validate output")
+print("3. [ ] If no extractable text, attempt alternate rendering/OCR path available in environment")
+print("4. [ ] Parse binding data and write CSV")</execute>
+<observation>NameError("name 'size' is not defined")</observation>
+<execute>#!/usr/bin/env python3
+import shlex
+from pathlib import Path
+
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/")
+pdf_path = tmp_dir / "10383437.pdf"
+decomp_pdf = tmp_dir / "10383437.decompressed.pdf"
+
+def run(cmd):
+    import subprocess
+    print("\n$ " + cmd)
+    p = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    print("returncode:", p.returncode)
+    if p.stdout:
+        print("stdout(head):", p.stdout[:4000])
+    if p.stderr:
+        print("stderr(head):", p.stderr[:2000])
+    return p
+
+def fsize(p: Path) -> int:
+    return p.stat().st_size if p.exists() else 0
+
+print("Plan checklist:")
+print("1. [✓] Inspect PDF integrity/encryption and confirm rasterization/OCR viability")
+print("2. [ ] Extract text using available tools (mutool, pdftotext) and validate output")
+print("3. [ ] If no extractable text, attempt alternate rendering/OCR path available in environment")
+print("4. [ ] Parse binding data and write CSV")
+
+print("\n[2] Tool availability")
+run("command -v pdftotext || true")
+run("command -v mutool || true")
+run("command -v qpdf || true")
+run("command -v tesseract || true")
+run("command -v pdftoppm || true")
+run("command -v pdfinfo || true")
+
+print("\nDecompress PDF to help extractors")
+run(f"qpdf --qdf --object-streams=disable {shlex.quote(str(pdf_path))} {shlex.quote(str(decomp_pdf))} 2>/dev/null || true")
+print("Decompressed exists:", decomp_pdf.exists(), "size:", fsize(decomp_pdf))
+
+print("\nExtract text variants")
+txt1 = tmp_dir / "pdftotext_layout.txt"
+txt2 = tmp_dir / "pdftotext_raw.txt"
+txt3 = tmp_dir / "mutool_draw_txt.txt"
+txt4 = tmp_dir / "mutool_convert.txt"
+txt5 = tmp_dir / "pdftotext_layout_decomp.txt"
+txt6 = tmp_dir / "pdftotext_raw_decomp.txt"
+
+run(f"pdftotext -layout {shlex.quote(str(pdf_path))} {shlex.quote(str(txt1))} 2>/dev/null || true")
+run(f"pdftotext {shlex.quote(str(pdf_path))} {shlex.quote(str(txt2))} 2>/dev/null || true")
+run(f"mutool draw -F txt {shlex.quote(str(pdf_path))} > {shlex.quote(str(txt3))} 2>/dev/null || true")
+run(f"mutool convert -o {shlex.quote(str(txt4))} {shlex.quote(str(pdf_path))} 2>/dev/null || true")
+
+if decomp_pdf.exists():
+    run(f"pdftotext -layout {shlex.quote(str(decomp_pdf))} {shlex.quote(str(txt5))} 2>/dev/null || true")
+    run(f"pdftotext {shlex.quote(str(decomp_pdf))} {shlex.quote(str(txt6))} 2>/dev/null || true")
+
+candidates = [txt1, txt2, txt3, txt4, txt5, txt6]
+print("\nExtracted text file sizes:")
+for p in candidates:
+    print(f"{fsize(p):8d}  {p}")
+
+best = max(candidates, key=lambda p: fsize(p))
+print("\nBest candidate:", best, "size:", fsize(best))
+if fsize(best) > 200:
+    head = best.read_text(errors="ignore")[:2000]
+    print("\n[TEXT HEAD]\n", head)
+else:
+    print("\nNo meaningful text extracted yet (all outputs tiny). Next step: alternate rendering/OCR path (pdftoppm missing).")
+
+print("\nUpdated checklist:")
+print("1. [✓] Inspect PDF integrity/encryption and confirm rasterization/OCR viability")
+print("2. [✓] Extract text using available tools (mutool, pdftotext) and validate output")
+print("3. [ ] If no extractable text, attempt alternate rendering/OCR path available in environment")
+print("4. [ ] Parse binding data and write CSV")</execute>
+<observation>NameError("name 'fsize' is not defined")</observation>
+<execute>#!/usr/bin/env python3
+from pathlib import Path
+import shlex
+
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/")
+pdf_path = tmp_dir / "10383437.pdf"
+decomp_pdf = tmp_dir / "10383437.decompressed.pdf"
+
+def run(cmd):
+    import subprocess
+    print("\n$ " + cmd)
+    p = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    print("returncode:", p.returncode)
+    if p.stdout:
+        print("stdout(head):", p.stdout[:2000])
+    if p.stderr:
+        print("stderr(head):", p.stderr[:2000])
+    return p
+
+print("Plan checklist:")
+print("1. [✓] Inspect PDF integrity/encryption and confirm rasterization/OCR viability")
+print("2. [ ] Extract text using available tools (mutool, pdftotext) and validate output")
+print("3. [ ] If no extractable text, attempt alternate rendering/OCR path available in environment")
+print("4. [ ] Parse binding data and write CSV")
+
+print("\n[2] Recompute file sizes with shell (avoid python state issues)")
+run(f"ls -lah {shlex.quote(str(tmp_dir))} | head -n 200")
+run(f"ls -lah {shlex.quote(str(tmp_dir/'pdftotext_layout.txt'))} {shlex.quote(str(tmp_dir/'pdftotext_raw.txt'))} "
+    f"{shlex.quote(str(tmp_dir/'mutool_draw_txt.txt'))} {shlex.quote(str(tmp_dir/'mutool_convert.txt'))} "
+    f"{shlex.quote(str(tmp_dir/'pdftotext_layout_decomp.txt'))} {shlex.quote(str(tmp_dir/'pdftotext_raw_decomp.txt'))} 2>/dev/null || true")
+
+print("\nShow heads of any non-empty candidates")
+for name in ["pdftotext_layout.txt","pdftotext_raw.txt","mutool_draw_txt.txt","mutool_convert.txt","pdftotext_layout_decomp.txt","pdftotext_raw_decomp.txt"]:
+    p = tmp_dir / name
+    if p.exists() and p.stat().st_size > 0:
+        print(f"\n--- HEAD {name} (bytes={p.stat().st_size}) ---")
+        print(p.read_text(errors="ignore")[:1500])
+
+print("\nUpdated checklist:")
+print("1. [✓] Inspect PDF integrity/encryption and confirm rasterization/OCR viability")
+print("2. [✓] Extract text using available tools (mutool, pdftotext) and validate output")
+print("3. [ ] If no extractable text, attempt alternate rendering/OCR path available in environment")
+print("4. [ ] Parse binding data and write CSV")</execute>
+<observation>Plan checklist:
+1. [✓] Inspect PDF integrity/encryption and confirm rasterization/OCR viability
+2. [ ] Extract text using available tools (mutool, pdftotext) and validate output
+3. [ ] If no extractable text, attempt alternate rendering/OCR path available in environment
+4. [ ] Parse binding data and write CSV
+
+[2] Recompute file sizes with shell (avoid python state issues)
+
+$ ls -lah /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract | head -n 200
+returncode: 0
+stdout(head): total 800K
+drwxr-xr-x  4 root root  216 Feb  8 21:32 .
+drwxr-xr-x 41 root root 4.0K Feb  8 21:32 ..
+-rw-r--r--  1 root root 794K Feb  8 21:31 10383437.pdf
+-rw-r--r--  1 root root    0 Feb  8 21:31 full_text.txt
+-rw-r--r--  1 root root    0 Feb  8 21:31 full_text_mutool.txt
+-rw-r--r--  1 root root    0 Feb  8 21:32 mutool_draw_txt.txt
+-rw-r--r--  1 root root    0 Feb  8 21:32 mutool_txt.txt
+drwxr-xr-x  2 root root    6 Feb  8 21:31 ocr_pages
+-rw-r--r--  1 root root    0 Feb  8 21:31 ocr_preview_pages1-3.txt
+drwxr-xr-x  2 root root    6 Feb  8 21:32 render_test
+-rw-r--r--  1 root root    0 Feb  8 21:31 strings_head.txt
+
+
+$ ls -lah /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/pdftotext_layout.txt /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/pdftotext_raw.txt /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/mutool_draw_txt.txt /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/mutool_convert.txt /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/pdftotext_layout_decomp.txt /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/pdftotext_raw_decomp.txt 2>/dev/null || true
+returncode: 0
+stdout(head): -rw-r--r-- 1 root root 0 Feb  8 21:32 /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/mutool_draw_txt.txt
+
+
+Show heads of any non-empty candidates
+
+Updated checklist:
+1. [✓] Inspect PDF integrity/encryption and confirm rasterization/OCR viability
+2. [✓] Extract text using available tools (mutool, pdftotext) and validate output
+3. [ ] If no extractable text, attempt alternate rendering/OCR path available in environment
+4. [ ] Parse binding data and write CSV
+</observation>
+<execute>#!/usr/bin/env python3
+import shlex, re
+from pathlib import Path
+
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/")
+pdf_path = tmp_dir / "10383437.pdf"
+
+def run(cmd):
+    import subprocess
+    print("\n$ " + cmd)
+    p = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    print("returncode:", p.returncode)
+    if p.stdout:
+        print("stdout(head):", p.stdout[:4000])
+    if p.stderr:
+        print("stderr(head):", p.stderr[:2000])
+    return p
+
+print("Plan checklist:")
+print("1. [✓] Inspect PDF integrity/encryption and confirm rasterization/OCR viability")
+print("2. [✓] Extract text using available tools (mutool, pdftotext) and validate output (failed: empty)")
+print("3. [ ] Use an alternate rendering/OCR path available in environment (try ImageMagick convert / Ghostscript / mutool draw PNG)")
+print("4. [ ] Parse binding data and write CSV")
+
+print("\n[3] Find available renderers")
+run("command -v gs || true")
+run("gs --version 2>/dev/null || true")
+run("command -v convert || true")
+run("convert -version 2>/dev/null | head -n 5 || true")
+run("command -v magick || true")
+run("command -v mupdf-gl || true")
+run("mutool help 2>/dev/null | head -n 40 || true")
+
+# Try mutool to render page images (PNG) then OCR
+render_dir = tmp_dir / "mutool_render"
+render_dir.mkdir(exist_ok=True)
+
+print("\nTry mutool draw to PNG (page 1 at 300 dpi)")
+run(f"rm -f {shlex.quote(str(render_dir/'p1.png'))} || true")
+# mutool draw: -r resolution, -o output, -F format
+run(f"mutool draw -r 300 -o {shlex.quote(str(render_dir/'p1.png'))} -F png {shlex.quote(str(pdf_path))} 1 2>/dev/null || true")
+run(f"ls -lah {shlex.quote(str(render_dir))} || true")
+
+# If PNG produced, run tesseract
+imgs = sorted(render_dir.glob("*.png"))
+if imgs:
+    img = imgs[0]
+    base = img.with_suffix("")
+    print("\nOCR with tesseract on:", img)
+    run(f"tesseract {shlex.quote(str(img))} {shlex.quote(str(base))} -l eng 2>/dev/null || true")
+    txt = base.with_suffix(".txt")
+    if txt.exists():
+        text = txt.read_text(errors="ignore")
+        (tmp_dir / "ocr_mutool_p1.txt").write_text(text)
+        print("\n[OCR TEXT HEAD]\n", text[:2000])
+    else:
+        print("Tesseract did not produce output txt.")
+else:
+    print("No PNG produced by mutool draw; will try Ghostscript or ImageMagick if available.")
+
+print("\nUpdated checklist:")
+print("1. [✓] Inspect PDF integrity/encryption and confirm rasterization/OCR viability")
+print("2. [✓] Extract text using available tools (mutool, pdftotext) and validate output (failed: empty)")
+print("3. [ ] Use an alternate rendering/OCR path available in environment (try ImageMagick convert / Ghostscript / mutool draw PNG)")
+print("4. [ ] Parse binding data and write CSV")</execute>
+<observation>Plan checklist:
+1. [✓] Inspect PDF integrity/encryption and confirm rasterization/OCR viability
+2. [✓] Extract text using available tools (mutool, pdftotext) and validate output (failed: empty)
+3. [ ] Use an alternate rendering/OCR path available in environment (try ImageMagick convert / Ghostscript / mutool draw PNG)
+4. [ ] Parse binding data and write CSV
+
+[3] Find available renderers
+
+$ command -v gs || true
+returncode: 0
+stdout(head): /usr/bin/gs
+
+
+$ gs --version 2>/dev/null || true
+returncode: 0
+stdout(head): 9.55.0
+
+
+$ command -v convert || true
+returncode: 0
+stdout(head): /usr/bin/convert
+
+
+$ convert -version 2>/dev/null | head -n 5 || true
+returncode: 0
+stdout(head): Version: ImageMagick 6.9.11-60 Q16 x86_64 2021-01-25 https://imagemagick.org
+Copyright: (C) 1999-2021 ImageMagick Studio LLC
+License: https://imagemagick.org/script/license.php
+Features: Cipher DPC Modules OpenMP(4.5) 
+Delegates (built-in): bzlib djvu fftw fontconfig freetype heic jbig jng jp2 jpeg lcms lqr ltdl lzma openexr pangocairo png tiff webp wmf x xml zlib
+
+
+$ command -v magick || true
+returncode: 0
+
+$ command -v mupdf-gl || true
+returncode: 0
+
+$ mutool help 2>/dev/null | head -n 40 || true
+returncode: 0
+
+Try mutool draw to PNG (page 1 at 300 dpi)
+
+$ rm -f /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/mutool_render/p1.png || true
+returncode: 0
+
+$ mutool draw -r 300 -o /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/mutool_render/p1.png -F png /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/10383437.pdf 1 2>/dev/null || true
+returncode: 0
+
+$ ls -lah /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/mutool_render || true
+returncode: 0
+stdout(head): total 0
+drwxr-xr-x 2 root root   6 Feb  8 21:32 .
+drwxr-xr-x 5 root root 237 Feb  8 21:32 ..
+
+No PNG produced by mutool draw; will try Ghostscript or ImageMagick if available.
+
+Updated checklist:
+1. [✓] Inspect PDF integrity/encryption and confirm rasterization/OCR viability
+2. [✓] Extract text using available tools (mutool, pdftotext) and validate output (failed: empty)
+3. [ ] Use an alternate rendering/OCR path available in environment (try ImageMagick convert / Ghostscript / mutool draw PNG)
+4. [ ] Parse binding data and write CSV
+</observation>
+<execute>#!/usr/bin/env python3
+import shlex
+from pathlib import Path
+
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/")
+pdf_path = tmp_dir / "10383437.pdf"
+render_dir = tmp_dir / "gs_render"
+render_dir.mkdir(exist_ok=True)
+
+def run(cmd):
+    import subprocess
+    print("\n$ " + cmd)
+    p = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    print("returncode:", p.returncode)
+    if p.stdout:
+        print("stdout(head):", p.stdout[:2000])
+    if p.stderr:
+        print("stderr(head):", p.stderr[:2000])
+    return p
+
+print("Plan checklist:")
+print("1. [✓] Inspect PDF integrity/encryption and confirm rasterization/OCR viability")
+print("2. [✓] Extract text using available tools (mutool, pdftotext) and validate output (failed: empty)")
+print("3. [ ] Use Ghostscript/ImageMagick to render pages to images, then OCR with tesseract")
+print("4. [ ] Parse binding data and write CSV")
+
+print("\n[3] Render page 1 with Ghostscript to PNG and OCR")
+p1_png = render_dir / "p1.png"
+run(f"rm -f {shlex.quote(str(p1_png))} || true")
+# -dFirstPage/-dLastPage for page selection
+gs_cmd = (
+    "gs -dSAFER -dBATCH -dNOPAUSE "
+    "-sDEVICE=pnggray -r400 "
+    f"-dFirstPage=1 -dLastPage=1 "
+    f"-sOutputFile={shlex.quote(str(p1_png))} "
+    f"{shlex.quote(str(pdf_path))}"
+)
+run(gs_cmd)
+run(f"ls -lah {shlex.quote(str(render_dir))} || true")
+
+if p1_png.exists() and p1_png.stat().st_size > 0:
+    base = p1_png.with_suffix("")
+    run(f"tesseract {shlex.quote(str(p1_png))} {shlex.quote(str(base))} -l eng 2>/dev/null || true")
+    p1_txt = base.with_suffix(".txt")
+    if p1_txt.exists():
+        txt = p1_txt.read_text(errors="ignore")
+        (tmp_dir / "ocr_gs_p1.txt").write_text(txt)
+        print("\n[OCR TEXT HEAD]\n", txt[:2500])
+    else:
+        print("No OCR txt produced for page 1.")
+else:
+    print("Ghostscript did not produce a PNG; trying ImageMagick convert as fallback...")
+    run(f"convert -density 400 {shlex.quote(str(pdf_path))}[0] {shlex.quote(str(p1_png))} 2>/dev/null || true")
+    run(f"ls -lah {shlex.quote(str(render_dir))} || true")
+
+print("\nUpdated checklist:")
+print("1. [✓] Inspect PDF integrity/encryption and confirm rasterization/OCR viability")
+print("2. [✓] Extract text using available tools (mutool, pdftotext) and validate output (failed: empty)")
+print("3. [ ] Use Ghostscript/ImageMagick to render pages to images, then OCR with tesseract")
+print("4. [ ] Parse binding data and write CSV")</execute>
+<observation>Plan checklist:
+1. [✓] Inspect PDF integrity/encryption and confirm rasterization/OCR viability
+2. [✓] Extract text using available tools (mutool, pdftotext) and validate output (failed: empty)
+3. [ ] Use Ghostscript/ImageMagick to render pages to images, then OCR with tesseract
+4. [ ] Parse binding data and write CSV
+
+[3] Render page 1 with Ghostscript to PNG and OCR
+
+$ rm -f /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/gs_render/p1.png || true
+returncode: 0
+
+$ gs -dSAFER -dBATCH -dNOPAUSE -sDEVICE=pnggray -r400 -dFirstPage=1 -dLastPage=1 -sOutputFile=/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/gs_render/p1.png /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/10383437.pdf
+returncode: 0
+stdout(head): GPL Ghostscript 9.55.0 (2021-09-27)
+Copyright (C) 2021 Artifex Software, Inc.  All rights reserved.
+This software is supplied under the GNU AGPLv3 and comes with NO WARRANTY:
+see the file COPYING for details.
+Processing pages 1 through 1.
+Page 1
+
+
+$ ls -lah /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/gs_render || true
+returncode: 0
+stdout(head): total 512K
+drwxr-xr-x 2 root root   20 Feb  8 21:33 .
+drwxr-xr-x 6 root root  254 Feb  8 21:33 ..
+-rw-r--r-- 1 root root 301K Feb  8 21:33 p1.png
+
+
+$ tesseract /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/gs_render/p1.png /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/gs_render/p1 -l eng 2>/dev/null || true
+returncode: 0
+No OCR txt produced for page 1.
+
+Updated checklist:
+1. [✓] Inspect PDF integrity/encryption and confirm rasterization/OCR viability
+2. [✓] Extract text using available tools (mutool, pdftotext) and validate output (failed: empty)
+3. [ ] Use Ghostscript/ImageMagick to render pages to images, then OCR with tesseract
+4. [ ] Parse binding data and write CSV
+</observation>
+<execute>#!/usr/bin/env python3
+import shlex
+from pathlib import Path
+
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/")
+render_dir = tmp_dir / "gs_render"
+p1_png = render_dir / "p1.png"
+
+def run(cmd):
+    import subprocess
+    print("\n$ " + cmd)
+    p = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    print("returncode:", p.returncode)
+    if p.stdout:
+        print("stdout(head):", p.stdout[:3000])
+    if p.stderr:
+        print("stderr(head):", p.stderr[:3000])
+    return p
+
+print("Plan checklist:")
+print("1. [✓] Inspect PDF integrity/encryption and confirm rasterization/OCR viability")
+print("2. [✓] Extract text using available tools (mutool, pdftotext) and validate output (failed: empty)")
+print("3. [ ] Use Ghostscript to render pages and OCR with tesseract (fix tesseract output path)")
+print("4. [ ] Parse binding data and write CSV")
+
+print("\n[3] Diagnose why tesseract produced no .txt")
+run("tesseract --version 2>/dev/null | head -n 5 || true")
+run(f"ls -lah {shlex.quote(str(render_dir))} || true")
+
+# Tesseract output base must be without extension; it will create base + ".txt".
+# We'll write into tmp_dir directly to avoid permission/path quirks.
+outbase = tmp_dir / "tess_p1_out"
+run(f"rm -f {shlex.quote(str(outbase))}.txt || true")
+run(f"tesseract {shlex.quote(str(p1_png))} {shlex.quote(str(outbase))} -l eng --psm 6 2>/dev/null || true")
+run(f"ls -lah {shlex.quote(str(tmp_dir))} | head -n 50 || true")
+txt = Path(str(outbase) + ".txt")
+if txt.exists():
+    content = txt.read_text(errors="ignore")
+    (tmp_dir / "ocr_gs_p1.txt").write_text(content)
+    print("\n[OCR TEXT HEAD]\n", content[:2500])
+else:
+    print("Still no OCR output text file created; will capture stderr explicitly next.")
+    run(f"tesseract {shlex.quote(str(p1_png))} {shlex.quote(str(outbase))} -l eng --psm 6")
+
+print("\nUpdated checklist:")
+print("1. [✓] Inspect PDF integrity/encryption and confirm rasterization/OCR viability")
+print("2. [✓] Extract text using available tools (mutool, pdftotext) and validate output (failed: empty)")
+print("3. [ ] Use Ghostscript to render pages and OCR with tesseract (fix tesseract output path)")
+print("4. [ ] Parse binding data and write CSV")</execute>
+<observation>Plan checklist:
+1. [✓] Inspect PDF integrity/encryption and confirm rasterization/OCR viability
+2. [✓] Extract text using available tools (mutool, pdftotext) and validate output (failed: empty)
+3. [ ] Use Ghostscript to render pages and OCR with tesseract (fix tesseract output path)
+4. [ ] Parse binding data and write CSV
+
+[3] Diagnose why tesseract produced no .txt
+
+$ tesseract --version 2>/dev/null | head -n 5 || true
+returncode: 0
+
+$ ls -lah /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/gs_render || true
+returncode: 0
+stdout(head): total 512K
+drwxr-xr-x 2 root root   20 Feb  8 21:33 .
+drwxr-xr-x 6 root root  254 Feb  8 21:33 ..
+-rw-r--r-- 1 root root 301K Feb  8 21:33 p1.png
+
+
+$ rm -f /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/tess_p1_out.txt || true
+returncode: 0
+
+$ tesseract /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/gs_render/p1.png /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/tess_p1_out -l eng --psm 6 2>/dev/null || true
+returncode: 0
+
+$ ls -lah /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract | head -n 50 || true
+returncode: 0
+stdout(head): total 800K
+drwxr-xr-x  6 root root  254 Feb  8 21:33 .
+drwxr-xr-x 42 root root 4.0K Feb  8 21:32 ..
+-rw-r--r--  1 root root 794K Feb  8 21:31 10383437.pdf
+-rw-r--r--  1 root root    0 Feb  8 21:31 full_text.txt
+-rw-r--r--  1 root root    0 Feb  8 21:31 full_text_mutool.txt
+drwxr-xr-x  2 root root   20 Feb  8 21:33 gs_render
+-rw-r--r--  1 root root    0 Feb  8 21:32 mutool_draw_txt.txt
+drwxr-xr-x  2 root root    6 Feb  8 21:32 mutool_render
+-rw-r--r--  1 root root    0 Feb  8 21:32 mutool_txt.txt
+drwxr-xr-x  2 root root    6 Feb  8 21:31 ocr_pages
+-rw-r--r--  1 root root    0 Feb  8 21:31 ocr_preview_pages1-3.txt
+drwxr-xr-x  2 root root    6 Feb  8 21:32 render_test
+-rw-r--r--  1 root root    0 Feb  8 21:31 strings_head.txt
+
+Still no OCR output text file created; will capture stderr explicitly next.
+
+$ tesseract /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/gs_render/p1.png /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/tess_p1_out -l eng --psm 6
+returncode: 127
+stderr(head): /bin/sh: 1: tesseract: not found
+
+
+Updated checklist:
+1. [✓] Inspect PDF integrity/encryption and confirm rasterization/OCR viability
+2. [✓] Extract text using available tools (mutool, pdftotext) and validate output (failed: empty)
+3. [ ] Use Ghostscript to render pages and OCR with tesseract (fix tesseract output path)
+4. [ ] Parse binding data and write CSV
+</observation>
+<execute>#!/usr/bin/env python3
+import shlex
+from pathlib import Path
+
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/")
+pdf_path = tmp_dir / "10383437.pdf"
+render_dir = tmp_dir / "gs_render_all"
+render_dir.mkdir(exist_ok=True)
+
+def run(cmd):
+    import subprocess
+    print("\n$ " + cmd)
+    p = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    print("returncode:", p.returncode)
+    if p.stdout:
+        print("stdout(head):", p.stdout[:3000])
+    if p.stderr:
+        print("stderr(head):", p.stderr[:3000])
+    return p
+
+print("Plan checklist:")
+print("1. [✓] Inspect PDF integrity/encryption and confirm rasterization/OCR viability")
+print("2. [✓] Determine that embedded text extraction is empty; need OCR")
+print("3. [ ] Fix OCR dependency: locate tesseract binary / run via absolute path")
+print("4. [ ] OCR all pages to a text file")
+print("5. [ ] Parse binding data and write CSV")
+
+print("\n[3] Locate tesseract binary reliably")
+run("command -v tesseract || true")
+run("which tesseract || true")
+run("ls -lah /usr/bin/tesseract /bin/tesseract /usr/local/bin/tesseract 2>/dev/null || true")
+# also check conda env
+run("python -c \"import sys; import os; print(sys.executable); print(os.environ.get('PATH',''))\" | head -n 5 || true")
+run("find / -maxdepth 4 -type f -name 'tesseract' 2>/dev/null | head -n 20 || true")
+
+# render all pages with gs to PNGs (even without OCR, ensures we can access images)
+print("\n[Render] Ghostscript render all pages to numbered PNGs")
+# output pattern with %d
+out_pattern = render_dir / "page-%02d.png"
+run(f"rm -f {shlex.quote(str(render_dir/'page-*.png'))} 2>/dev/null || true")
+gs_cmd = (
+    "gs -dSAFER -dBATCH -dNOPAUSE "
+    "-sDEVICE=pnggray -r400 "
+    f"-sOutputFile={shlex.quote(str(out_pattern))} "
+    f"{shlex.quote(str(pdf_path))}"
+)
+run(gs_cmd)
+run(f"ls -lah {shlex.quote(str(render_dir))} || true")
+
+print("\nUpdated checklist:")
+print("1. [✓] Inspect PDF integrity/encryption and confirm rasterization/OCR viability")
+print("2. [✓] Determine that embedded text extraction is empty; need OCR")
+print("3. [ ] Fix OCR dependency: locate tesseract binary / run via absolute path")
+print("4. [ ] OCR all pages to a text file")
+print("5. [ ] Parse binding data and write CSV")</execute>
+<observation>Plan checklist:
+1. [✓] Inspect PDF integrity/encryption and confirm rasterization/OCR viability
+2. [✓] Determine that embedded text extraction is empty; need OCR
+3. [ ] Fix OCR dependency: locate tesseract binary / run via absolute path
+4. [ ] OCR all pages to a text file
+5. [ ] Parse binding data and write CSV
+
+[3] Locate tesseract binary reliably
+
+$ command -v tesseract || true
+returncode: 0
+
+$ which tesseract || true
+returncode: 0
+
+$ ls -lah /usr/bin/tesseract /bin/tesseract /usr/local/bin/tesseract 2>/dev/null || true
+returncode: 0
+
+$ python -c "import sys; import os; print(sys.executable); print(os.environ.get('PATH',''))" | head -n 5 || true
+returncode: 0
+stdout(head): /root/miniconda3/envs/biomni_e1/bin/python
+/root/miniconda3/envs/biomni_e1/bin.AVX2_256:/root/miniconda3/envs/biomni_e1/bin.AVX2_256:/root/miniconda3/envs/biomni_e1/bin:/root/miniconda3/condabin:/root/.vscode-server/cli/servers/Stable-e54c774e0add60467559eb0d1e229c6452cf8447/server/bin/remote-cli:/root/miniconda3/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.volc/bin
+
+
+$ find / -maxdepth 4 -type f -name 'tesseract' 2>/dev/null | head -n 20 || true
+returncode: 0
+
+[Render] Ghostscript render all pages to numbered PNGs
+
+$ rm -f '/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/gs_render_all/page-*.png' 2>/dev/null || true
+returncode: 0
+
+$ gs -dSAFER -dBATCH -dNOPAUSE -sDEVICE=pnggray -r400 -sOutputFile=/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/gs_render_all/page-%02d.png /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/10383437.pdf
+returncode: 0
+stdout(head): GPL Ghostscript 9.55.0 (2021-09-27)
+Copyright (C) 2021 Artifex Software, Inc.  All rights reserved.
+This software is supplied under the GNU AGPLv3 and comes with NO WARRANTY:
+see the file COPYING for details.
+Processing pages 1 through 5.
+Page 1
+Page 2
+Page 3
+Page 4
+Page 5
+
+
+$ ls -lah /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/gs_render_all || true
+returncode: 0
+stdout(head): total 2.4M
+drwxr-xr-x 2 root root  101 Feb  8 21:33 .
+drwxr-xr-x 7 root root  275 Feb  8 21:33 ..
+-rw-r--r-- 1 root root 301K Feb  8 21:33 page-01.png
+-rw-r--r-- 1 root root 867K Feb  8 21:33 page-02.png
+-rw-r--r-- 1 root root 245K Feb  8 21:33 page-03.png
+-rw-r--r-- 1 root root 256K Feb  8 21:33 page-04.png
+-rw-r--r-- 1 root root 116K Feb  8 21:33 page-05.png
+
+
+Updated checklist:
+1. [✓] Inspect PDF integrity/encryption and confirm rasterization/OCR viability
+2. [✓] Determine that embedded text extraction is empty; need OCR
+3. [ ] Fix OCR dependency: locate tesseract binary / run via absolute path
+4. [ ] OCR all pages to a text file
+5. [ ] Parse binding data and write CSV
+</observation>
+<execute>#!/usr/bin/env python3
+import os, re, csv, math, shlex
+from pathlib import Path
+
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/")
+render_dir = tmp_dir / "gs_render_all"
+out_csv = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/pronab_extract.csv")
+out_csv.parent.mkdir(parents=True, exist_ok=True)
+
+def run(cmd):
+    import subprocess
+    print("\n$ " + cmd)
+    p = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    print("returncode:", p.returncode)
+    if p.stdout:
+        print("stdout(head):", p.stdout[:2000])
+    if p.stderr:
+        print("stderr(head):", p.stderr[:2000])
+    return p
+
+print("Plan checklist:")
+print("1. [✓] Inspect PDF integrity/encryption and confirm rasterization/OCR viability")
+print("2. [✓] Determine that embedded text extraction is empty; need OCR")
+print("3. [ ] Fix OCR dependency: locate tesseract binary / run via absolute path")
+print("4. [ ] OCR all pages to a text file")
+print("5. [ ] Parse binding data and write CSV")
+
+print("\n[3] Resolve tesseract path and run OCR")
+which = run("which tesseract || true").stdout.strip()
+tess = which.splitlines()[-1].strip() if which else ""
+if not tess:
+    # fallback common location
+    for cand in ["/usr/bin/tesseract", "/usr/local/bin/tesseract", "/bin/tesseract"]:
+        if Path(cand).exists():
+            tess = cand
+            break
+print("tesseract resolved to:", tess)
+
+if not tess or not Path(tess).exists():
+    raise RuntimeError("tesseract binary not found although command -v returned success earlier.")
+
+# Step 4: OCR all pages
+ocr_txt_path = tmp_dir / "full_text_ocr.txt"
+parts = []
+imgs = sorted(render_dir.glob("page-*.png"))
+print("Found rendered pages:", len(imgs), [p.name for p in imgs])
+
+for img in imgs:
+    base = tmp_dir / f"ocr_{img.stem}"
+    # remove any previous
+    for ext in [".txt"]:
+        p = Path(str(base) + ext)
+        if p.exists(): p.unlink()
+    cmd = f"{shlex.quote(tess)} {shlex.quote(str(img))} {shlex.quote(str(base))} -l eng --psm 6"
+    r = run(cmd)
+    txt_file = Path(str(base) + ".txt")
+    txt = txt_file.read_text(errors="ignore") if txt_file.exists() else ""
+    parts.append(f"\n\n--- OCR {img.name} ---\n{txt}")
+    print(img.name, "ocr_chars:", len(txt))
+
+ocr_txt_path.write_text("".join(parts))
+print("Saved OCR full text:", ocr_txt_path, "chars:", ocr_txt_path.stat().st_size)
+
+print("\nUpdated checklist:")
+print("1. [✓] Inspect PDF integrity/encryption and confirm rasterization/OCR viability")
+print("2. [✓] Determine that embedded text extraction is empty; need OCR")
+print("3. [✓] Fix OCR dependency: locate tesseract binary / run via absolute path")
+print("4. [✓] OCR all pages to a text file")
+print("5. [ ] Parse binding data and write CSV")
+
+# Step 5: Parse data
+text = ocr_txt_path.read_text(errors="ignore")
+
+# Helper: convert Kd to M
+unit_map = {"pM":1e-12, "nM":1e-9, "uM":1e-6, "µM":1e-6, "mM":1e-3, "M":1.0,
+            "pm":1e-12,"nm":1e-9,"um":1e-6,"mm":1e-3}
+def kd_to_M(val, unit):
+    return float(val) * unit_map[unit]
+
+# Detect method (simple)
+method = ""
+for term in ["surface plasmon resonance", "SPR", "isothermal titration calorimetry", "ITC",
+             "fluorescence anisotropy", "EMSA", "gel shift", "filter binding"]:
+    if term.lower() in text.lower():
+        method = term if term in ["SPR","ITC","EMSA"] else term.title()
+        break
+if not method:
+    method = "unknown"
+
+# Find PDB IDs
+pdbs = sorted(set(re.findall(r"\b([0-9][A-Za-z0-9]{3})\b", text)))
+# keep those near PDB keyword
+pdb_ctx = set()
+for m in re.finditer(r"\b([0-9][A-Za-z0-9]{3})\b", text):
+    pid = m.group(1)
+    ctx = text[max(0,m.start()-40):min(len(text),m.end()+40)].lower()
+    if "pdb" in ctx:
+        pdb_ctx.add(pid)
+pdbs = sorted(pdb_ctx) if pdb_ctx else []
+
+# Kd values
+kd_matches = []
+for m in re.finditer(r"\bK[dD]\s*(?:=|:)?\s*([0-9]*\.?[0-9]+)\s*(pM|nM|uM|µM|mM|M)\b", text):
+    kd_matches.append((m.group(1), m.group(2), m.group(0)))
+
+# ΔG values
+dg_matches = []
+for m in re.finditer(r"(?:ΔG|dG)\s*(?:=|:)?\s*(-?\d+\.?\d*)\s*(?:kcal/mol|kcal\s*mol-1|kcal\s*mol\^-1)",
+                     text, flags=re.IGNORECASE):
+    dg_matches.append((m.group(1), m.group(0)))
+
+print("\nParsed candidates:")
+print("Method:", method)
+print("PDBs:", pdbs)
+print("Kd matches:", kd_matches[:20], "count:", len(kd_matches))
+print("dG matches:", dg_matches[:20], "count:", len(dg_matches))
+
+# Try to infer protein and nucleic acid names: look for DNA/RNA keywords and any named operator/promoter
+type_nuc = "DNA" if "dna" in text.lower() else ("RNA" if "rna" in text.lower() else "")
+nuc_name = ""
+# naive: capture phrases like "operator", "promoter", "duplex", "oligonucleotide"
+m = re.search(r"([A-Za-z0-9\- ]{0,40}(?:operator|promoter|oligonucleotide|duplex|hairpin)[A-Za-z0-9\- ]{0,40})",
+              text, flags=re.IGNORECASE)
+if m:
+    nuc_name = " ".join(m.group(1).split())
+else:
+    nuc_name = "unknown"
+
+# UniProt: not reliably OCR; leave blank if not found
+uniprot = ""
+up = re.findall(r"\b[OPQ][0-9][A-Z0-9]{3}[0-9]\b|\b[A-NR-Z][0-9]{5}\b", text)
+if up:
+    uniprot = sorted(set(up))[0]
+
+# Mutations: detect patterns like R55A, K12E etc.
+mutations = sorted(set(re.findall(r"\b([A-Z]\d{1,4}[A-Z])\b", text)))
+# Exclude obvious DNA bases, etc.
+mutations = [m for m in mutations if m not in ["A1A","C1C","G1G","T1T"]]
+
+# Build rows:
+# If multiple Kd values present, create one row per Kd; otherwise single wild row.
+rows = []
+if kd_matches:
+    for val, unit, snippet in kd_matches:
+        kdM = kd_to_M(val, unit)
+        rows.append({
+            "UniProt Id": uniprot if uniprot else "",
+            "Mutation Protein": "wild",  # OCR parsing for mutant-specific association is unreliable; default wild
+            "Nucleic Acid Name": nuc_name,
+            "Type Nuc": type_nuc if type_nuc else "",
+            "PBD Compelx": pdbs[0] if pdbs else "",
+            "Method": method,
+            "dG wild(Kcal/mol)": dg_matches[0][0] if dg_matches else "",
+            "Kd wild(M)": f"{kdM:.3e}",
+        })
+else:
+    rows.append({
+        "UniProt Id": uniprot if uniprot else "",
+        "Mutation Protein": "wild",
+        "Nucleic Acid Name": nuc_name,
+        "Type Nuc": type_nuc if type_nuc else "",
+        "PBD Compelx": pdbs[0] if pdbs else "",
+        "Method": method,
+        "dG wild(Kcal/mol)": dg_matches[0][0] if dg_matches else "",
+        "Kd wild(M)": "",
+    })
+
+# Write CSV
+headers = ["UniProt Id","Mutation Protein","Nucleic Acid Name","Type Nuc","PBD Compelx","Method","dG wild(Kcal/mol)","Kd wild(M)"]
+with out_csv.open("w", newline="") as f:
+    w = csv.DictWriter(f, fieldnames=headers)
+    w.writeheader()
+    for r in rows:
+        w.writerow(r)
+
+print("\nWrote CSV:", out_csv)
+print(out_csv.read_text()[:1000])
+
+print("\nUpdated checklist:")
+print("1. [✓] Inspect PDF integrity/encryption and confirm rasterization/OCR viability")
+print("2. [✓] Determine that embedded text extraction is empty; need OCR")
+print("3. [✓] Fix OCR dependency: locate tesseract binary / run via absolute path")
+print("4. [✓] OCR all pages to a text file")
+print("5. [✓] Parse binding data and write CSV")</execute>
+<observation>RuntimeError('tesseract binary not found although command -v returned success earlier.')</observation>
+<execute>#!/usr/bin/env python3
+import shlex
+from pathlib import Path
+
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/")
+
+def run(cmd):
+    import subprocess
+    print("\n$ " + cmd)
+    p = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    print("returncode:", p.returncode)
+    if p.stdout:
+        print("stdout:", p.stdout[:4000])
+    if p.stderr:
+        print("stderr:", p.stderr[:4000])
+    return p
+
+print("Plan checklist:")
+print("1. [ ] Resolve why 'tesseract' is intermittently not found (shell vs python PATH) and lock to absolute path")
+print("2. [ ] OCR rendered page images to text")
+print("3. [ ] Parse binding data and write CSV")
+
+print("\n[1] Investigate PATH and tesseract resolution")
+run("echo $PATH")
+run("command -v tesseract || true")
+run("which -a tesseract || true")
+run("type -a tesseract || true")
+run("ls -lah $(command -v tesseract) 2>/dev/null || true")
+run("python -c \"import os; import shutil; print('PATH=',os.environ.get('PATH')); print('which=',shutil.which('tesseract'))\"")
+
+# Hardcode a likely location and verify
+for cand in ["/usr/bin/tesseract", "/usr/local/bin/tesseract", "/bin/tesseract", "/root/miniconda3/envs/biomni_e1/bin/tesseract"]:
+    run(f"ls -lah {cand} 2>/dev/null || true")
+
+print("\nUpdated checklist:")
+print("1. [ ] Resolve why 'tesseract' is intermittently not found (shell vs python PATH) and lock to absolute path")
+print("2. [ ] OCR rendered page images to text")
+print("3. [ ] Parse binding data and write CSV")</execute>
+<observation>Plan checklist:
+1. [ ] Resolve why 'tesseract' is intermittently not found (shell vs python PATH) and lock to absolute path
+2. [ ] OCR rendered page images to text
+3. [ ] Parse binding data and write CSV
+
+[1] Investigate PATH and tesseract resolution
+
+$ echo $PATH
+returncode: 0
+stdout: /root/miniconda3/envs/biomni_e1/bin.AVX2_256:/root/miniconda3/envs/biomni_e1/bin.AVX2_256:/root/miniconda3/envs/biomni_e1/bin:/root/miniconda3/condabin:/root/.vscode-server/cli/servers/Stable-e54c774e0add60467559eb0d1e229c6452cf8447/server/bin/remote-cli:/root/miniconda3/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.volc/bin
+
+
+$ command -v tesseract || true
+returncode: 0
+
+$ which -a tesseract || true
+returncode: 0
+
+$ type -a tesseract || true
+returncode: 0
+stdout: -a: not found
+tesseract: not found
+
+
+$ ls -lah $(command -v tesseract) 2>/dev/null || true
+returncode: 0
+stdout: total 2.8G
+drwxr-xr-x  9 root root 4.0K Feb  8 21:33 .
+drwx------ 17 root root 4.0K Feb  8 21:25 ..
+-rw-r--r--  1 root root   60 Feb  6 19:43 .env
+drwxr-xr-x 11 root root  301 Jan 27 16:17 assistant
+-rw-r--r--  1 root root 2.1M Feb  8 20:41 assistant.tar.gz
+drwxr-xr-x  7 root root  215 Feb  8 14:46 benchmark
+-rw-r--r--  1 root root 2.8G Feb  8 20:37 benchmark.tar.gz
+-rw-r--r--  1 root root  322 Feb  6 19:57 benchmark_results.json
+-rw-r--r--  1 root root  947 Feb  8 19:30 env.yml
+drwxr-xr-x  2 root root 4.0K Feb  8 21:19 evaluate_bash_scripts
+drwxr-xr-x  4 root root   35 Feb  8 21:34 evaluate_results
+drwxr-xr-x  9 root root  202 Feb  8 21:34 log
+-rw-r--r--  1 root root 5.5K Feb  8 21:32 pdb_to_file_module.py
+drwxr-xr-x  4 root root   35 Feb  8 21:34 pred_results_new
+-rw-r--r--  1 root root 3.5K Feb  8 21:17 run_evaluate_batch_biomni.py
+-rw-r--r--  1 root root 3.0K Feb  8 21:23 run_evaluate_batch_biomni_for_bash.py
+-rw-r--r--  1 root root 2.2K Feb  8 21:34 run_evaluate_case_biomni.py
+-rw-r--r--  1 root root 2.5K Feb  8 21:21 run_only_evaluate.py
+-rw-r--r--  1 root root 4.1K Feb  8 21:21 run_only_split_valid_evaluate.py
+-rw-r--r--  1 root root  451 Feb  8 21:33 sitecustomize.py
+-rw-r--r--  1 root root  904 Feb  6 19:49 test_key.py
+drwxr-xr-x  4 root root   35 Feb  8 21:34 tmp_new
+
+
+$ python -c "import os; import shutil; print('PATH=',os.environ.get('PATH')); print('which=',shutil.which('tesseract'))"
+returncode: 0
+stdout: PATH= /root/miniconda3/envs/biomni_e1/bin.AVX2_256:/root/miniconda3/envs/biomni_e1/bin.AVX2_256:/root/miniconda3/envs/biomni_e1/bin:/root/miniconda3/condabin:/root/.vscode-server/cli/servers/Stable-e54c774e0add60467559eb0d1e229c6452cf8447/server/bin/remote-cli:/root/miniconda3/bin:/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.volc/bin
+which= None
+
+
+$ ls -lah /usr/bin/tesseract 2>/dev/null || true
+returncode: 0
+
+$ ls -lah /usr/local/bin/tesseract 2>/dev/null || true
+returncode: 0
+
+$ ls -lah /bin/tesseract 2>/dev/null || true
+returncode: 0
+
+$ ls -lah /root/miniconda3/envs/biomni_e1/bin/tesseract 2>/dev/null || true
+returncode: 0
+
+Updated checklist:
+1. [ ] Resolve why 'tesseract' is intermittently not found (shell vs python PATH) and lock to absolute path
+2. [ ] OCR rendered page images to text
+3. [ ] Parse binding data and write CSV
+</observation>
+<execute>#!/usr/bin/env python3
+import os, re, csv, math, shlex
+from pathlib import Path
+
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pronab_extract/")
+render_dir = tmp_dir / "gs_render_all"
+ocr_txt_path = tmp_dir / "full_text_ocr.txt"
+out_csv = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/pronab_extract.csv")
+out_csv.parent.mkdir(parents=True, exist_ok=True)
+
+def run(cmd):
+    import subprocess
+    print("\n$ " + cmd)
+    p = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    print("returncode:", p.returncode)
+    if p.stdout:
+        print("stdout(head):", p.stdout[:2000])
+    if p.stderr:
+        print("stderr(head):", p.stderr[:2000])
+    return p
+
+print("Plan checklist:")
+print("1. [ ] Resolve why 'tesseract' is not actually installed; switch to OCR via pytesseract if available, else stop")
+print("2. [ ] OCR rendered page images to text")
+print("3. [ ] Parse binding data and write CSV")
+
+# Step 1: confirm tesseract truly missing
+print("\n[1] Confirm tesseract binary presence")
+run("ls -lah /usr/bin/tesseract /usr/local/bin/tesseract /bin/tesseract /root/miniconda3/envs/biomni_e1/bin/tesseract 2>/dev/null || true")
+
+# Try pytesseract with explicit failure messaging
+print("\nCheck pytesseract availability and whether it can locate tesseract")
+try:
+    import pytesseract
+    from PIL import Image
+    print("pytesseract version:", pytesseract.get_tesseract_version() if hasattr(pytesseract, "get_tesseract_version") else "unknown")
+    # pytesseract will fail if binary missing; so just try a simple call on one image if exists
+    imgs = sorted(render_dir.glob("page-01.png"))
+    if imgs:
+        img = imgs[0]
+        try:
+            txt = pytesseract.image_to_string(Image.open(img))
+            print("pytesseract produced chars:", len(txt))
+            (tmp_dir / "ocr_pytesseract_p1.txt").write_text(txt)
+        except Exception as e:
+            print("pytesseract OCR failed:", repr(e))
+    else:
+        print("No rendered images found to OCR.")
+except Exception as e:
+    print("pytesseract not usable:", repr(e))
+
+# If we cannot OCR at all, we must output an empty/unknown row to satisfy CSV format.
+# (But we'll still try to parse if OCR file already exists from another run.)
+if ocr_txt_path.exists() and ocr_txt_path.stat().st_size > 50:
+    text = ocr_txt_path.read_text(errors="ignore")
+else:
+    # attempt to build OCR text from any pytesseract page outputs we created
+    p1 = tmp_dir / "ocr_pytesseract_p1.txt"
+    text = p1.read_text(errors="ignore") if p1.exists() else ""
+
+if not text.strip():
+    print("\nNo OCR text available; writing placeholder CSV with unknown fields.")
+    headers = ["UniProt Id","Mutation Protein","Nucleic Acid Name","Type Nuc","PBD Compelx","Method","dG wild(Kcal/mol)","Kd wild(M)"]
+    row = {
+        "UniProt Id": "",
+        "Mutation Protein": "wild",
+        "Nucleic Acid Name": "unknown",
+        "Type Nuc": "",
+        "PBD Compelx": "",
+        "Method": "unknown",
+        "dG wild(Kcal/mol)": "",
+        "Kd wild(M)": "",
+    }
+    with out_csv.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=headers)
+        w.writeheader()
+        w.writerow(row)
+    print("Wrote CSV:", out_csv)
+    print(out_csv.read_text())
+    print("\nUpdated checklist:")
+    print("1. [✗] Resolve why 'tesseract' is not actually installed; switch to OCR via pytesseract if available, else stop (tesseract missing)")
+    print("2. [✗] OCR rendered page images to text (no OCR engine available)")
+    print("3. [✓] Parse binding data and write CSV (placeholder due to missing OCR)")
+else:
+    print("\nOCR text available; parsing...")
+    # minimal parse
+    method = "unknown"
+    for term in ["surface plasmon resonance","spr","isothermal titration calorimetry","itc","fluorescence anisotropy","emsa"]:
+        if term in text.lower():
+            method = term.upper() if term in ["spr","itc","emsa"] else term.title()
+            break
+    pdbs = []
+    for m in re.finditer(r"\b([0-9][A-Za-z0-9]{3})\b", text):
+        pid = m.group(1)
+        ctx = text[max(0,m.start()-40):min(len(text),m.end()+40)].lower()
+        if "pdb" in ctx:
+            pdbs.append(pid)
+    pdbs = sorted(set(pdbs))
+    kd = ""
+    m = re.search(r"\bK[dD]\s*(?:=|:)?\s*([0-9]*\.?[0-9]+)\s*(pM|nM|uM|µM|mM|M)\b", text)
+    if m:
+        val = float(m.group(1))
+        unit = m.group(2)
+        unit_map = {"pM":1e-12, "nM":1e-9, "uM":1e-6, "µM":1e-6, "mM":1e-3, "M":1.0}
+        kd = f"{val*unit_map[unit]:.3e}"
+    dg = ""
+    m = re.search(r"(?:ΔG|dG)\s*(?:=|:)?\s*(-?\d+\.?\d*)\s*(?:kcal/mol|kcal\s*mol-1|kcal\s*mol\^-1)", text, flags=re.I)
+    if m: dg = m.group(1)
+
+    headers = ["UniProt Id","Mutation Protein","Nucleic Acid Name","Type Nuc","PBD Compelx","Method","dG wild(Kcal/mol)","Kd wild(M)"]
+    row = {
+        "UniProt Id": "",
+        "Mutation Protein": "wild",
+        "Nucleic Acid Name": "unknown",
+        "Type Nuc": "DNA" if "dna" in text.lower() else ("RNA" if "rna" in text.lower() else ""),
+        "PBD Compelx": pdbs[0] if pdbs else "",
+        "Method": method,
+        "dG wild(Kcal/mol)": dg,
+        "Kd wild(M)": kd,
+    }
+    with out_csv.open("w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=headers)
+        w.writeheader()
+        w.writerow(row)
+    print("Wrote CSV:", out_csv)
+    print(out_csv.read_text()[:500])
+
+    print("\nUpdated checklist:")
+    print("1. [✓] Resolve why 'tesseract' is not actually installed; switch to OCR via pytesseract if available, else stop")
+    print("2. [✓] OCR rendered page images to text")
+    print("3. [✓] Parse binding data and write CSV")</execute>
+<observation>Plan checklist:
+1. [ ] Resolve why 'tesseract' is not actually installed; switch to OCR via pytesseract if available, else stop
+2. [ ] OCR rendered page images to text
+3. [ ] Parse binding data and write CSV
+
+[1] Confirm tesseract binary presence
+
+$ ls -lah /usr/bin/tesseract /usr/local/bin/tesseract /bin/tesseract /root/miniconda3/envs/biomni_e1/bin/tesseract 2>/dev/null || true
+returncode: 0
+
+Check pytesseract availability and whether it can locate tesseract
+pytesseract not usable: ModuleNotFoundError("No module named 'pytesseract'")
+
+No OCR text available; writing placeholder CSV with unknown fields.
+Wrote CSV: /root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/pronab_extract.csv
+UniProt Id,Mutation Protein,Nucleic Acid Name,Type Nuc,PBD Compelx,Method,dG wild(Kcal/mol),Kd wild(M)
+,wild,unknown,,,unknown,,
+
+
+Updated checklist:
+1. [✗] Resolve why 'tesseract' is not actually installed; switch to OCR via pytesseract if available, else stop (tesseract missing)
+2. [✗] OCR rendered page images to text (no OCR engine available)
+3. [✓] Parse binding data and write CSV (placeholder due to missing OCR)
+</observation>
+<solution>Unable to extract any readable text from `10383437.pdf` in this environment: embedded-text extractors (`pdftotext`, `mutool`) produced empty outputs, and OCR could not be performed because the `tesseract` binary is not present and the `pytesseract` Python package is not available. As a result, the required fields (UniProt ID, mutations, nucleic acid name/type, PDB ID, method, dG, Kd) could not be recovered from the paper content here.
+
+A placeholder CSV (with correct headers) has been written to:
+`/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/pronab_extract.csv`
+
+Contents:
+```csv
+UniProt Id,Mutation Protein,Nucleic Acid Name,Type Nuc,PBD Compelx,Method,dG wild(Kcal/mol),Kd wild(M)
+,wild,unknown,,,unknown,,
+```</solution>

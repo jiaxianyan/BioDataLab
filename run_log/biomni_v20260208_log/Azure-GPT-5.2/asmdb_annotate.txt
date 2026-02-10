@@ -1,0 +1,397 @@
+Identify the top 100 genes that most frequently exhibit Allele-Specific Methylation (ASM) across a population of samples. 
+
+Given detected ASM sites across multiple biological samples `benchmark/dataset/ASMdb/mock/mock_asm_sites.csv` and genomic coordinates for all genes `benchmark/dataset/ASMdb/mock/mock_genes.csv`.
+
+For each sample, quantified the number of ASM sites within each gene body and its $3~\mathrm{kb}$ upstream region. The frequency of genes covered by ASM was then aggregated across all samples. 
+
+Finally, identified the top 100 genes with the highest ASM frequency, and save the result into a csv file `/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/asmdb_annotate.csv`
+
+Output example for reference:
+gene_id,frequency
+GENE_1,15
+GENE_2,14
+GENE_3,13
+GENE_4,12
+...
+
+All intermediate code generated during execution, downloaded files, and temporary results must be stored in `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/asmdb_annotate`
+
+1. [ ] Set up workspace directories and load input CSVs  
+2. [ ] Build per-gene regions (gene body + 3kb upstream) and find overlaps with ASM sites per sample  
+3. [ ] Aggregate gene ASM coverage frequency across samples and write top 100 to output CSV  
+
+<execute>
+import os
+import pandas as pd
+
+# Research log helper
+def log(msg):
+    print(f"[asmdb_annotate] {msg}")
+
+# Step 1: setup paths
+tmp_dir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/asmdb_annotate"
+out_path = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/asmdb_annotate.csv"
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+asm_path = "benchmark/dataset/ASMdb/mock/mock_asm_sites.csv"
+genes_path = "benchmark/dataset/ASMdb/mock/mock_genes.csv"
+
+log(f"Temporary workspace: {tmp_dir}")
+log(f"Reading ASM sites: {asm_path}")
+asm = pd.read_csv(asm_path)
+log(f"ASM sites shape: {asm.shape}; columns: {list(asm.columns)}")
+
+log(f"Reading genes: {genes_path}")
+genes = pd.read_csv(genes_path)
+log(f"Genes shape: {genes.shape}; columns: {list(genes.columns)}")
+
+# Save snapshots to tmp for traceability
+asm_head_path = os.path.join(tmp_dir, "asm_sites_head.csv")
+genes_head_path = os.path.join(tmp_dir, "genes_head.csv")
+asm.head(50).to_csv(asm_head_path, index=False)
+genes.head(50).to_csv(genes_head_path, index=False)
+log(f"Wrote snapshots: {asm_head_path}, {genes_head_path}")
+
+# Show updated plan after step 1
+print("\nPLAN UPDATE")
+print("1. [✓] Set up workspace directories and load input CSVs (completed)")
+print("2. [ ] Build per-gene regions (gene body + 3kb upstream) and find overlaps with ASM sites per sample")
+print("3. [ ] Aggregate gene ASM coverage frequency across samples and write top 100 to output CSV")
+</execute>
+<observation>[asmdb_annotate] Temporary workspace: /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/asmdb_annotate
+[asmdb_annotate] Reading ASM sites: benchmark/dataset/ASMdb/mock/mock_asm_sites.csv
+[asmdb_annotate] ASM sites shape: (5000, 4); columns: ['sample_id', 'chrom', 'pos', 'asm_score']
+[asmdb_annotate] Reading genes: benchmark/dataset/ASMdb/mock/mock_genes.csv
+[asmdb_annotate] Genes shape: (1000, 5); columns: ['gene_id', 'chrom', 'start', 'end', 'strand']
+[asmdb_annotate] Wrote snapshots: /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/asmdb_annotate/asm_sites_head.csv, /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/asmdb_annotate/genes_head.csv
+
+PLAN UPDATE
+1. [✓] Set up workspace directories and load input CSVs (completed)
+2. [ ] Build per-gene regions (gene body + 3kb upstream) and find overlaps with ASM sites per sample
+3. [ ] Aggregate gene ASM coverage frequency across samples and write top 100 to output CSV
+</observation>
+2. [ ] Build per-gene regions (gene body + 3kb upstream) and find overlaps with ASM sites per sample  
+3. [ ] Aggregate gene ASM coverage frequency across samples and write top 100 to output CSV  
+
+<execute>
+import os
+import pandas as pd
+import numpy as np
+
+def log(msg):
+    print(f"[asmdb_annotate] {msg}")
+
+tmp_dir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/asmdb_annotate"
+out_path = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/asmdb_annotate.csv"
+
+asm_path = "benchmark/dataset/ASMdb/mock/mock_asm_sites.csv"
+genes_path = "benchmark/dataset/ASMdb/mock/mock_genes.csv"
+asm = pd.read_csv(asm_path)
+genes = pd.read_csv(genes_path)
+
+# Step 2: build per-gene interval = gene body + 3kb upstream (strand-aware)
+genes = genes.copy()
+genes["start"] = genes["start"].astype(int)
+genes["end"] = genes["end"].astype(int)
+
+up = 3000
+
+# upstream depends on strand:
+# '+' upstream: [start-up, start-1]; combined with body -> [start-up, end]
+# '-' upstream: [end+1, end+up]; combined with body -> [start, end+up]
+genes["region_start"] = np.where(genes["strand"] == "+", genes["start"] - up, genes["start"])
+genes["region_end"]   = np.where(genes["strand"] == "+", genes["end"], genes["end"] + up)
+genes["region_start"] = genes["region_start"].clip(lower=1)
+
+log(f"Constructed gene regions (gene body + {up}bp upstream) with strand awareness.")
+log(f"Region start/end summary: start[min={genes['region_start'].min()}, max={genes['region_start'].max()}], "
+    f"end[min={genes['region_end'].min()}, max={genes['region_end'].max()}]")
+
+# Overlap counting per sample:
+# For each chromosome, sort genes by region_start, and for each ASM pos find candidate genes by binary search.
+asm = asm.copy()
+asm["pos"] = asm["pos"].astype(int)
+
+def count_overlaps_per_chr(genes_chr, asm_chr):
+    # genes_chr: columns gene_id, region_start, region_end
+    g = genes_chr.sort_values("region_start").reset_index(drop=True)
+    starts = g["region_start"].to_numpy()
+    ends = g["region_end"].to_numpy()
+    gene_ids = g["gene_id"].to_numpy()
+
+    # Count overlaps per sample_id, gene_id
+    # For each ASM site: find all genes with start <= pos; then filter pos <= end.
+    records = []
+    for sample_id, sub in asm_chr.groupby("sample_id", sort=False):
+        gene_counts = {}
+        positions = sub["pos"].to_numpy()
+        for pos in positions:
+            # indices with start <= pos
+            hi = np.searchsorted(starts, pos, side="right")
+            if hi == 0:
+                continue
+            # candidate indices [0, hi)
+            cand = np.where(ends[:hi] >= pos)[0]
+            if cand.size == 0:
+                continue
+            for idx in cand:
+                gid = gene_ids[idx]
+                gene_counts[gid] = gene_counts.get(gid, 0) + 1
+        if gene_counts:
+            for gid, cnt in gene_counts.items():
+                records.append((sample_id, gid, cnt))
+    if not records:
+        return pd.DataFrame(columns=["sample_id", "gene_id", "asm_site_count"])
+    return pd.DataFrame(records, columns=["sample_id", "gene_id", "asm_site_count"])
+
+log("Counting ASM-site overlaps within gene regions per sample (chromosome-wise).")
+per_sample_gene_counts = []
+for chrom, genes_chr in genes.groupby("chrom", sort=False):
+    asm_chr = asm[asm["chrom"] == chrom]
+    if asm_chr.empty:
+        continue
+    df_chr = count_overlaps_per_chr(genes_chr[["gene_id","region_start","region_end"]], asm_chr[["sample_id","pos"]])
+    if not df_chr.empty:
+        per_sample_gene_counts.append(df_chr)
+
+if per_sample_gene_counts:
+    per_sample_gene_counts = pd.concat(per_sample_gene_counts, ignore_index=True)
+else:
+    per_sample_gene_counts = pd.DataFrame(columns=["sample_id","gene_id","asm_site_count"])
+
+# Save intermediate
+intermediate_path = os.path.join(tmp_dir, "per_sample_gene_asm_counts.csv")
+per_sample_gene_counts.to_csv(intermediate_path, index=False)
+log(f"Per-sample gene ASM counts computed: {per_sample_gene_counts.shape}. Saved: {intermediate_path}")
+log(f"Nonzero sample-gene pairs: {per_sample_gene_counts[['sample_id','gene_id']].drop_duplicates().shape[0]}")
+
+print("\nPLAN UPDATE")
+print("1. [✓] Set up workspace directories and load input CSVs (completed)")
+print("2. [✓] Build per-gene regions (gene body + 3kb upstream) and find overlaps with ASM sites per sample (completed)")
+print("3. [ ] Aggregate gene ASM coverage frequency across samples and write top 100 to output CSV")
+</execute>
+<observation>NameError("name 'np' is not defined")</observation>
+1. [✓] Set up workspace directories and load input CSVs (completed)  
+2. [✗] Build per-gene regions (gene body + 3kb upstream) and find overlaps with ASM sites per sample (failed because `numpy` alias `np` was not defined in the execution context)  
+3. [ ] Re-run step 2 with explicit imports and persist intermediate results  
+4. [ ] Aggregate gene ASM coverage frequency across samples and write top 100 to output CSV  
+
+<execute>
+import os
+import pandas as pd
+import numpy as np
+
+def log(msg):
+    print(f"[asmdb_annotate] {msg}")
+
+tmp_dir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/asmdb_annotate"
+out_path = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/asmdb_annotate.csv"
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+asm_path = "benchmark/dataset/ASMdb/mock/mock_asm_sites.csv"
+genes_path = "benchmark/dataset/ASMdb/mock/mock_genes.csv"
+asm = pd.read_csv(asm_path)
+genes = pd.read_csv(genes_path)
+
+# Step 3 (re-run step 2): build per-gene interval = gene body + 3kb upstream (strand-aware)
+genes = genes.copy()
+genes["start"] = genes["start"].astype(int)
+genes["end"] = genes["end"].astype(int)
+
+up = 3000
+genes["region_start"] = np.where(genes["strand"] == "+", genes["start"] - up, genes["start"])
+genes["region_end"]   = np.where(genes["strand"] == "+", genes["end"], genes["end"] + up)
+genes["region_start"] = genes["region_start"].clip(lower=1)
+
+asm = asm.copy()
+asm["pos"] = asm["pos"].astype(int)
+
+def count_overlaps_per_chr(genes_chr, asm_chr):
+    g = genes_chr.sort_values("region_start").reset_index(drop=True)
+    starts = g["region_start"].to_numpy()
+    ends = g["region_end"].to_numpy()
+    gene_ids = g["gene_id"].to_numpy()
+
+    records = []
+    for sample_id, sub in asm_chr.groupby("sample_id", sort=False):
+        gene_counts = {}
+        positions = sub["pos"].to_numpy()
+        for pos in positions:
+            hi = np.searchsorted(starts, pos, side="right")
+            if hi == 0:
+                continue
+            cand = np.where(ends[:hi] >= pos)[0]
+            if cand.size == 0:
+                continue
+            for idx in cand:
+                gid = gene_ids[idx]
+                gene_counts[gid] = gene_counts.get(gid, 0) + 1
+        for gid, cnt in gene_counts.items():
+            records.append((sample_id, gid, cnt))
+
+    if not records:
+        return pd.DataFrame(columns=["sample_id", "gene_id", "asm_site_count"])
+    return pd.DataFrame(records, columns=["sample_id", "gene_id", "asm_site_count"])
+
+log("Counting ASM-site overlaps within gene regions per sample (chromosome-wise).")
+per_sample_gene_counts = []
+for chrom, genes_chr in genes.groupby("chrom", sort=False):
+    asm_chr = asm[asm["chrom"] == chrom]
+    if asm_chr.empty:
+        continue
+    df_chr = count_overlaps_per_chr(
+        genes_chr[["gene_id", "region_start", "region_end"]],
+        asm_chr[["sample_id", "pos"]]
+    )
+    if not df_chr.empty:
+        per_sample_gene_counts.append(df_chr)
+
+if per_sample_gene_counts:
+    per_sample_gene_counts = pd.concat(per_sample_gene_counts, ignore_index=True)
+else:
+    per_sample_gene_counts = pd.DataFrame(columns=["sample_id", "gene_id", "asm_site_count"])
+
+intermediate_path = os.path.join(tmp_dir, "per_sample_gene_asm_counts.csv")
+per_sample_gene_counts.to_csv(intermediate_path, index=False)
+
+log(f"Computed per-sample gene ASM counts: shape={per_sample_gene_counts.shape}")
+log(f"Saved intermediate: {intermediate_path}")
+log("Preview (top 10 rows):")
+print(per_sample_gene_counts.head(10).to_string(index=False))
+
+print("\nPLAN UPDATE")
+print("1. [✓] Set up workspace directories and load input CSVs (completed)")
+print("2. [✗] Build per-gene regions (gene body + 3kb upstream) and find overlaps with ASM sites per sample (failed because `numpy` alias `np` was not defined)")
+print("3. [✓] Re-run step 2 with explicit imports and persist intermediate results (completed)")
+print("4. [ ] Aggregate gene ASM coverage frequency across samples and write top 100 to output CSV")
+</execute>
+<observation>NameError("name 'np' is not defined")</observation>
+1. [ ] Set up workspace directories and load input CSVs  
+2. [ ] Build per-gene regions (gene body + 3kb upstream) and find overlaps with ASM sites per sample  
+3. [ ] Aggregate gene ASM coverage frequency across samples and write top 100 to output CSV  
+
+<execute>
+import os
+import pandas as pd
+
+def log(msg):
+    print(f"[asmdb_annotate] {msg}")
+
+# Paths
+tmp_dir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/asmdb_annotate"
+out_path = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/asmdb_annotate.csv"
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+asm_path = "benchmark/dataset/ASMdb/mock/mock_asm_sites.csv"
+genes_path = "benchmark/dataset/ASMdb/mock/mock_genes.csv"
+
+# Step 1
+asm = pd.read_csv(asm_path)
+genes = pd.read_csv(genes_path)
+log(f"Loaded ASM: {asm.shape} cols={list(asm.columns)}")
+log(f"Loaded genes: {genes.shape} cols={list(genes.columns)}")
+
+# Step 2 (no numpy): build region_start/region_end using pure pandas
+up = 3000
+genes = genes.copy()
+genes["start"] = genes["start"].astype(int)
+genes["end"] = genes["end"].astype(int)
+
+plus = genes["strand"] == "+"
+genes["region_start"] = genes["start"]
+genes.loc[plus, "region_start"] = genes.loc[plus, "start"] - up
+genes["region_start"] = genes["region_start"].clip(lower=1)
+
+genes["region_end"] = genes["end"]
+genes.loc[~plus, "region_end"] = genes.loc[~plus, "end"] + up
+
+asm = asm.copy()
+asm["pos"] = asm["pos"].astype(int)
+
+log(f"Constructed regions: gene body + {up}bp upstream (strand-aware).")
+
+# Overlap counting per sample/gene using interval join via per-chromosome filtering (kept simple for mock sizes)
+# Approach:
+#  - For each chromosome: for each gene region, find ASM sites with region_start<=pos<=region_end, then count per sample.
+records = []
+for chrom, gchr in genes.groupby("chrom", sort=False):
+    achr = asm[asm["chrom"] == chrom]
+    if achr.empty:
+        continue
+    # For each gene, filter ASM positions in range, then groupby sample_id
+    for row in gchr.itertuples(index=False):
+        # row fields: gene_id, chrom, start, end, strand, region_start, region_end (order depends on columns)
+        gene_id = row.gene_id
+        rstart = int(row.region_start)
+        rend = int(row.region_end)
+        sub = achr[(achr["pos"] >= rstart) & (achr["pos"] <= rend)]
+        if sub.empty:
+            continue
+        counts = sub.groupby("sample_id").size()
+        for sample_id, cnt in counts.items():
+            records.append((sample_id, gene_id, int(cnt)))
+
+per_sample_gene_counts = pd.DataFrame(records, columns=["sample_id", "gene_id", "asm_site_count"])
+intermediate_path = os.path.join(tmp_dir, "per_sample_gene_asm_counts.csv")
+per_sample_gene_counts.to_csv(intermediate_path, index=False)
+log(f"Per-sample gene counts: {per_sample_gene_counts.shape}. Saved: {intermediate_path}")
+
+# Step 3: frequency = number of samples with >=1 ASM site in gene region
+if per_sample_gene_counts.empty:
+    freq = pd.DataFrame({"gene_id": [], "frequency": []})
+else:
+    freq = (per_sample_gene_counts[["sample_id", "gene_id"]]
+            .drop_duplicates()
+            .groupby("gene_id")
+            .size()
+            .reset_index(name="frequency"))
+
+top100 = freq.sort_values(["frequency", "gene_id"], ascending=[False, True]).head(100)
+top100.to_csv(out_path, index=False)
+log(f"Wrote top100 gene frequencies to: {out_path}")
+log("Preview (top 10):")
+print(top100.head(10).to_string(index=False))
+
+print("\nPLAN UPDATE")
+print("1. [✓] Set up workspace directories and load input CSVs (completed)")
+print("2. [✓] Build per-gene regions (gene body + 3kb upstream) and find overlaps with ASM sites per sample (completed)")
+print("3. [✓] Aggregate gene ASM coverage frequency across samples and write top 100 to output CSV (completed)")
+</execute>
+<observation>[asmdb_annotate] Loaded ASM: (5000, 4) cols=['sample_id', 'chrom', 'pos', 'asm_score']
+[asmdb_annotate] Loaded genes: (1000, 5) cols=['gene_id', 'chrom', 'start', 'end', 'strand']
+[asmdb_annotate] Constructed regions: gene body + 3000bp upstream (strand-aware).
+[asmdb_annotate] Per-sample gene counts: (2695, 3). Saved: /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/asmdb_annotate/per_sample_gene_asm_counts.csv
+[asmdb_annotate] Wrote top100 gene frequencies to: /root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/asmdb_annotate.csv
+[asmdb_annotate] Preview (top 10):
+  gene_id  frequency
+GENE_0085         20
+GENE_0252         20
+GENE_0413         20
+GENE_0563         20
+GENE_0581         20
+GENE_0683         20
+GENE_0899         20
+GENE_0920         20
+GENE_0012         19
+GENE_0037         19
+
+PLAN UPDATE
+1. [✓] Set up workspace directories and load input CSVs (completed)
+2. [✓] Build per-gene regions (gene body + 3kb upstream) and find overlaps with ASM sites per sample (completed)
+3. [✓] Aggregate gene ASM coverage frequency across samples and write top 100 to output CSV (completed)
+</observation>
+<solution>
+1. [✓] Set up workspace directories and load input CSVs (completed)  
+2. [✓] Build per-gene regions (gene body + 3kb upstream) and find overlaps with ASM sites per sample (completed)  
+3. [✓] Aggregate gene ASM coverage frequency across samples and write top 100 to output CSV (completed)  
+
+Saved results (top 100 genes by ASM coverage frequency across samples) to:
+`/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/asmdb_annotate.csv`
+
+Intermediate outputs stored in:
+`/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/asmdb_annotate/`
+(includes `per_sample_gene_asm_counts.csv`)
+</solution>

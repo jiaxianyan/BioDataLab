@@ -1,0 +1,984 @@
+Identify high-quality RNA-seq Runs from three Runs in `benchmark/dataset/MetazExp/toy_srr1`, `benchmark/dataset/MetazExp/toy_srr2`, and `benchmark/dataset/MetazExp/toy_srr3`.
+
+High-quality RNA-seq Runs should meet all of the following criteria: (i) Paired-end sequencing; (ii) Read length ≥ 100 bp; (iii) Uniquely mapped read rate ≥ 50% for the reference genome `benchmark/dataset/MetazExp/ncbi_dataset/data/GCF_001039355.2/GCF_001039355.2_LinAna2.0_genomic.fna`. 
+
+Output the directory nname of high-qualit Runs to `/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/metazexp_refinement.json`.
+
+Output Format (Only for Reference):
+[
+  "toy_srr2"
+]
+
+All temp data should be save in `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/etazexp_refinemen`.
+
+Plan:
+1. [ ] Inspect the three run directories to determine whether data are paired-end and assess read lengths from FASTQ headers/sequences.
+2. [ ] Build an index for the provided reference genome and map reads for each run.
+3. [ ] Compute uniquely mapped read rate per run and filter runs meeting all criteria.
+4. [ ] Write the list of qualifying run directory names to the required JSON output path, storing all intermediates in the specified tmp directory.
+<execute>#!/usr/bin/env bash
+set -euo pipefail
+
+echo "Research log: Identify high-quality RNA-seq runs"
+BASE="benchmark/dataset/MetazExp"
+RUNS=("toy_srr1" "toy_srr2" "toy_srr3")
+REF="${BASE}/ncbi_dataset/data/GCF_001039355.2/GCF_001039355.2_LinAna2.0_genomic.fna"
+
+TMPROOT="/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/etazexp_refinemen"
+OUT="/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/metazexp_refinement.json"
+
+mkdir -p "$TMPROOT"
+mkdir -p "$(dirname "$OUT")"
+
+echo "Step 1: Inspect run directories and FASTQ layout"
+for r in "${RUNS[@]}"; do
+  echo "---- ${r} ----"
+  ls -lah "${BASE}/${r}" | sed -n '1,200p'
+done
+
+echo "Locate FASTQ(.gz) files and infer paired-end"
+for r in "${RUNS[@]}"; do
+  echo "---- ${r} FASTQ candidates ----"
+  find "${BASE}/${r}" -maxdepth 2 -type f \( -iname "*.fastq" -o -iname "*.fq" -o -iname "*.fastq.gz" -o -iname "*.fq.gz" \) -print | sort
+done
+
+echo "Updated plan after Step 1:"
+cat <<'PLAN'
+1. [✓] Inspect the three run directories to determine whether data are paired-end and assess read lengths from FASTQ headers/sequences.
+2. [ ] Build an index for the provided reference genome and map reads for each run.
+3. [ ] Compute uniquely mapped read rate per run and filter runs meeting all criteria.
+4. [ ] Write the list of qualifying run directory names to the required JSON output path, storing all intermediates in the specified tmp directory.
+PLAN</execute>
+<observation>SyntaxError('invalid syntax', ('<string>', 2, 10, 'set -euo pipefail\n', 2, 18))</observation>
+<execute>#!/usr/bin/env python3
+import os, json, glob, subprocess, textwrap, re, gzip
+from pathlib import Path
+
+print("Research log: Identify high-quality RNA-seq runs (fixing previous shell-as-python issue)")
+
+BASE = Path("benchmark/dataset/MetazExp")
+RUNS = ["toy_srr1", "toy_srr2", "toy_srr3"]
+REF = BASE / "ncbi_dataset/data/GCF_001039355.2/GCF_001039355.2_LinAna2.0_genomic.fna"
+
+TMPROOT = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/etazexp_refinemen")
+OUT = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/metazexp_refinement.json")
+TMPROOT.mkdir(parents=True, exist_ok=True)
+OUT.parent.mkdir(parents=True, exist_ok=True)
+
+plan = [
+"1. [ ] Inspect the three run directories to determine whether data are paired-end and assess read lengths from FASTQ headers/sequences.",
+"2. [ ] Build an index for the provided reference genome and map reads for each run.",
+"3. [ ] Compute uniquely mapped read rate per run and filter runs meeting all criteria.",
+"4. [ ] Write the list of qualifying run directory names to the required JSON output path, storing all intermediates in the specified tmp directory.",
+]
+print("Plan:\n" + "\n".join(plan))
+
+def find_fastqs(run_dir: Path):
+    pats = ["*.fastq", "*.fq", "*.fastq.gz", "*.fq.gz"]
+    files = []
+    for p in pats:
+        files.extend(sorted(run_dir.rglob(p)))
+    return files
+
+def sample_read_length(fq_path: Path, n=2000):
+    # return median length across up to n reads
+    lengths = []
+    opener = gzip.open if fq_path.suffix == ".gz" else open
+    with opener(fq_path, "rt", encoding="utf-8", errors="ignore") as f:
+        i = 0
+        while True:
+            h = f.readline()
+            if not h:
+                break
+            seq = f.readline().rstrip("\n")
+            plus = f.readline()
+            qual = f.readline()
+            if not qual:
+                break
+            if seq:
+                lengths.append(len(seq))
+                i += 1
+                if i >= n:
+                    break
+    if not lengths:
+        return None
+    lengths_sorted = sorted(lengths)
+    med = lengths_sorted[len(lengths_sorted)//2]
+    return med
+
+print("\nStep 1: Inspect run directories; infer paired-end; estimate read length (median of first reads)")
+run_info = {}
+for r in RUNS:
+    rdir = BASE / r
+    fastqs = find_fastqs(rdir)
+    print(f"\n---- {r} ----")
+    print(f"Directory: {rdir}")
+    print("FASTQ files found:")
+    for fp in fastqs[:50]:
+        print(" ", fp)
+    if len(fastqs) > 50:
+        print(f"  ... ({len(fastqs)-50} more)")
+    # Heuristic paired-end detection
+    # Look for common patterns: _1/_2, R1/R2, .1/.2
+    names = [f.name for f in fastqs]
+    r1 = [f for f in fastqs if re.search(r'(_R?1\b|_1\b|\.1\b|R1)', f.name)]
+    r2 = [f for f in fastqs if re.search(r'(_R?2\b|_2\b|\.2\b|R2)', f.name)]
+    paired = bool(r1) and bool(r2)
+    # If not obvious, if exactly 2 fastqs and not single-end naming, assume paired
+    if not paired and len(fastqs) == 2:
+        paired = True
+        r1, r2 = [fastqs[0]], [fastqs[1]]
+    # Pick candidate R1 for read length estimation
+    candidate = r1[0] if r1 else (fastqs[0] if fastqs else None)
+    medlen = sample_read_length(candidate) if candidate else None
+    run_info[r] = {
+        "fastqs": [str(f) for f in fastqs],
+        "paired_end": paired,
+        "r1": str(r1[0]) if r1 else None,
+        "r2": str(r2[0]) if r2 else None,
+        "median_read_length": medlen
+    }
+    print(f"Paired-end inferred: {paired}")
+    print(f"Median read length (from {candidate.name if candidate else 'NA'}): {medlen}")
+
+plan[0] = "1. [✓] Inspect the three run directories to determine whether data are paired-end and assess read lengths from FASTQ headers/sequences."
+print("\nUpdated plan after Step 1:\n" + "\n".join(plan))
+
+# Save run_info for later steps
+with open(TMPROOT / "step1_run_info.json", "w") as f:
+    json.dump(run_info, f, indent=2)
+print(f"\nSaved Step 1 metadata to: {TMPROOT / 'step1_run_info.json'}")</execute>
+<observation>NameError("name 're' is not defined")</observation>
+<execute>#!/usr/bin/env python3
+import os, json, glob, subprocess, textwrap, gzip, re
+from pathlib import Path
+
+print("Research log: Identify high-quality RNA-seq runs (rerun Step 1 after importing re)")
+
+BASE = Path("benchmark/dataset/MetazExp")
+RUNS = ["toy_srr1", "toy_srr2", "toy_srr3"]
+TMPROOT = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/etazexp_refinemen")
+TMPROOT.mkdir(parents=True, exist_ok=True)
+
+def find_fastqs(run_dir: Path):
+    pats = ["*.fastq", "*.fq", "*.fastq.gz", "*.fq.gz"]
+    files = []
+    for p in pats:
+        files.extend(sorted(run_dir.rglob(p)))
+    return files
+
+def sample_read_length(fq_path: Path, n=2000):
+    lengths = []
+    opener = gzip.open if fq_path.suffix == ".gz" else open
+    with opener(fq_path, "rt", encoding="utf-8", errors="ignore") as f:
+        i = 0
+        while True:
+            h = f.readline()
+            if not h:
+                break
+            seq = f.readline().rstrip("\n")
+            plus = f.readline()
+            qual = f.readline()
+            if not qual:
+                break
+            if seq:
+                lengths.append(len(seq))
+                i += 1
+                if i >= n:
+                    break
+    if not lengths:
+        return None
+    lengths.sort()
+    return lengths[len(lengths)//2]
+
+print("\nStep 1: Inspect run directories; infer paired-end; estimate read length")
+run_info = {}
+for r in RUNS:
+    rdir = BASE / r
+    fastqs = find_fastqs(rdir)
+    print(f"\n---- {r} ----")
+    print(f"FASTQ files found ({len(fastqs)}):")
+    for fp in fastqs[:50]:
+        print(" ", fp)
+    if len(fastqs) > 50:
+        print(f"  ... ({len(fastqs)-50} more)")
+    r1 = [f for f in fastqs if re.search(r'(_R?1\b|_1\b|\.1\b|R1)', f.name)]
+    r2 = [f for f in fastqs if re.search(r'(_R?2\b|_2\b|\.2\b|R2)', f.name)]
+    paired = bool(r1) and bool(r2)
+    if not paired and len(fastqs) == 2:
+        paired = True
+        r1, r2 = [fastqs[0]], [fastqs[1]]
+    candidate = r1[0] if r1 else (fastqs[0] if fastqs else None)
+    medlen = sample_read_length(candidate) if candidate else None
+    run_info[r] = {
+        "fastqs": [str(f) for f in fastqs],
+        "paired_end": paired,
+        "r1": str(r1[0]) if r1 else None,
+        "r2": str(r2[0]) if r2 else None,
+        "median_read_length": medlen
+    }
+    print(f"Paired-end inferred: {paired}")
+    print(f"Median read length (from {candidate.name if candidate else 'NA'}): {medlen}")
+
+with open(TMPROOT / "step1_run_info.json", "w") as f:
+    json.dump(run_info, f, indent=2)
+print(f"\nSaved Step 1 metadata to: {TMPROOT / 'step1_run_info.json'}")
+
+print("\nUpdated plan after Step 1:")
+print("1. [✓] Inspect the three run directories to determine whether data are paired-end and assess read lengths from FASTQ headers/sequences.")
+print("2. [ ] Build an index for the provided reference genome and map reads for each run.")
+print("3. [ ] Compute uniquely mapped read rate per run and filter runs meeting all criteria.")
+print("4. [ ] Write the list of qualifying run directory names to the required JSON output path, storing all intermediates in the specified tmp directory.")</execute>
+<observation>NameError("name 're' is not defined")</observation>
+<execute>#!/usr/bin/env python3
+# NOTE: being extra defensive: explicitly bind re into globals()
+import importlib
+re = importlib.import_module("re")
+
+import json, gzip
+from pathlib import Path
+
+print("Research log: Identify high-quality RNA-seq runs (Step 1; ensure re is available)")
+
+BASE = Path("benchmark/dataset/MetazExp")
+RUNS = ["toy_srr1", "toy_srr2", "toy_srr3"]
+TMPROOT = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/etazexp_refinemen")
+TMPROOT.mkdir(parents=True, exist_ok=True)
+
+def find_fastqs(run_dir: Path):
+    pats = ["*.fastq", "*.fq", "*.fastq.gz", "*.fq.gz"]
+    files = []
+    for p in pats:
+        files.extend(sorted(run_dir.rglob(p)))
+    return files
+
+def sample_read_length(fq_path: Path, n=2000):
+    lengths = []
+    opener = gzip.open if fq_path.suffix == ".gz" else open
+    with opener(fq_path, "rt", encoding="utf-8", errors="ignore") as f:
+        i = 0
+        while True:
+            h = f.readline()
+            if not h:
+                break
+            seq = f.readline().rstrip("\n")
+            _ = f.readline()
+            qual = f.readline()
+            if not qual:
+                break
+            lengths.append(len(seq))
+            i += 1
+            if i >= n:
+                break
+    if not lengths:
+        return None
+    lengths.sort()
+    return lengths[len(lengths)//2]
+
+print("\nStep 1: Inspect run directories; infer paired-end; estimate read length")
+run_info = {}
+for r in RUNS:
+    rdir = BASE / r
+    fastqs = find_fastqs(rdir)
+    print(f"\n---- {r} ----")
+    print(f"FASTQ files found ({len(fastqs)}):")
+    for fp in fastqs[:50]:
+        print(" ", fp)
+    if len(fastqs) > 50:
+        print(f"  ... ({len(fastqs)-50} more)")
+    r1 = [f for f in fastqs if re.search(r'(_R?1\b|_1\b|\.1\b|R1)', f.name)]
+    r2 = [f for f in fastqs if re.search(r'(_R?2\b|_2\b|\.2\b|R2)', f.name)]
+    paired = bool(r1) and bool(r2)
+    if not paired and len(fastqs) == 2:
+        paired = True
+        r1, r2 = [fastqs[0]], [fastqs[1]]
+    candidate = r1[0] if r1 else (fastqs[0] if fastqs else None)
+    medlen = sample_read_length(candidate) if candidate else None
+    run_info[r] = {
+        "fastqs": [str(f) for f in fastqs],
+        "paired_end": paired,
+        "r1": str(r1[0]) if r1 else None,
+        "r2": str(r2[0]) if r2 else None,
+        "median_read_length": medlen
+    }
+    print(f"Paired-end inferred: {paired}")
+    print(f"Median read length (from {candidate.name if candidate else 'NA'}): {medlen}")
+
+with open(TMPROOT / "step1_run_info.json", "w") as f:
+    json.dump(run_info, f, indent=2)
+print(f"\nSaved Step 1 metadata to: {TMPROOT / 'step1_run_info.json'}")
+
+print("\nUpdated plan after Step 1:")
+print("1. [✓] Inspect the three run directories to determine whether data are paired-end and assess read lengths from FASTQ headers/sequences.")
+print("2. [ ] Build an index for the provided reference genome and map reads for each run.")
+print("3. [ ] Compute uniquely mapped read rate per run and filter runs meeting all criteria.")
+print("4. [ ] Write the list of qualifying run directory names to the required JSON output path, storing all intermediates in the specified tmp directory.")</execute>
+<observation>NameError("name 're' is not defined")</observation>
+<execute>#!/usr/bin/env python3
+import os, json, gzip
+from pathlib import Path
+
+print("Research log: Identify high-quality RNA-seq runs (Step 1 without regex to avoid 're' NameError)")
+
+BASE = Path("benchmark/dataset/MetazExp")
+RUNS = ["toy_srr1", "toy_srr2", "toy_srr3"]
+TMPROOT = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/etazexp_refinemen")
+TMPROOT.mkdir(parents=True, exist_ok=True)
+
+def find_fastqs(run_dir: Path):
+    pats = ("*.fastq", "*.fq", "*.fastq.gz", "*.fq.gz")
+    files = []
+    for pat in pats:
+        files.extend(sorted(run_dir.rglob(pat)))
+    return files
+
+def looks_like_r1(name: str) -> bool:
+    u = name.upper()
+    return ("R1" in u) or u.endswith("_1.FQ") or u.endswith("_1.FQ.GZ") or u.endswith("_1.FASTQ") or u.endswith("_1.FASTQ.GZ") or ("_1_" in u) or (".1." in u)
+
+def looks_like_r2(name: str) -> bool:
+    u = name.upper()
+    return ("R2" in u) or u.endswith("_2.FQ") or u.endswith("_2.FQ.GZ") or u.endswith("_2.FASTQ") or u.endswith("_2.FASTQ.GZ") or ("_2_" in u) or (".2." in u)
+
+def sample_read_length(fq_path: Path, n=2000):
+    opener = gzip.open if fq_path.suffix == ".gz" else open
+    lens = []
+    with opener(fq_path, "rt", encoding="utf-8", errors="ignore") as f:
+        for _ in range(n):
+            h = f.readline()
+            if not h:
+                break
+            seq = f.readline().rstrip("\n")
+            f.readline()
+            q = f.readline()
+            if not q:
+                break
+            lens.append(len(seq))
+    if not lens:
+        return None
+    lens.sort()
+    return lens[len(lens)//2]
+
+plan = [
+"1. [ ] Inspect the three run directories to determine whether data are paired-end and assess read lengths from FASTQ headers/sequences.",
+"2. [ ] Build an index for the provided reference genome and map reads for each run.",
+"3. [ ] Compute uniquely mapped read rate per run and filter runs meeting all criteria.",
+"4. [ ] Write the list of qualifying run directory names to the required JSON output path, storing all intermediates in the specified tmp directory.",
+]
+print("Plan:\n" + "\n".join(plan))
+
+print("\nStep 1: Inspect run directories; infer paired-end; estimate read length")
+run_info = {}
+for r in RUNS:
+    rdir = BASE / r
+    fastqs = find_fastqs(rdir)
+    print(f"\n---- {r} ----")
+    print(f"FASTQ files found ({len(fastqs)}):")
+    for fp in fastqs:
+        print(" ", fp)
+
+    r1 = [f for f in fastqs if looks_like_r1(f.name)]
+    r2 = [f for f in fastqs if looks_like_r2(f.name)]
+    paired = (len(r1) >= 1 and len(r2) >= 1)
+    if not paired and len(fastqs) == 2:
+        paired = True
+        r1, r2 = [fastqs[0]], [fastqs[1]]
+
+    candidate = r1[0] if r1 else (fastqs[0] if fastqs else None)
+    medlen = sample_read_length(candidate) if candidate else None
+
+    run_info[r] = {
+        "fastqs": [str(f) for f in fastqs],
+        "paired_end": paired,
+        "r1": str(r1[0]) if r1 else None,
+        "r2": str(r2[0]) if r2 else None,
+        "median_read_length": medlen
+    }
+    print(f"Paired-end inferred: {paired}")
+    print(f"Median read length (from {candidate.name if candidate else 'NA'}): {medlen}")
+
+with open(TMPROOT / "step1_run_info.json", "w") as f:
+    json.dump(run_info, f, indent=2)
+print(f"\nSaved Step 1 metadata to: {TMPROOT / 'step1_run_info.json'}")
+
+plan[0] = "1. [✓] Inspect the three run directories to determine whether data are paired-end and assess read lengths from FASTQ headers/sequences."
+print("\nUpdated plan after Step 1:\n" + "\n".join(plan))</execute>
+<observation>NameError("name 'looks_like_r1' is not defined")</observation>
+<execute>#!/usr/bin/env python3
+import json, gzip
+from pathlib import Path
+
+print("Research log: Identify high-quality RNA-seq runs (Step 1; redefine everything in one cell)")
+
+BASE = Path("benchmark/dataset/MetazExp")
+RUNS = ["toy_srr1", "toy_srr2", "toy_srr3"]
+TMPROOT = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/etazexp_refinemen")
+TMPROOT.mkdir(parents=True, exist_ok=True)
+
+plan = [
+"1. [ ] Inspect the three run directories to determine whether data are paired-end and assess read lengths from FASTQ headers/sequences.",
+"2. [ ] Build an index for the provided reference genome and map reads for each run.",
+"3. [ ] Compute uniquely mapped read rate per run and filter runs meeting all criteria.",
+"4. [ ] Write the list of qualifying run directory names to the required JSON output path, storing all intermediates in the specified tmp directory.",
+]
+print("Plan:\n" + "\n".join(plan))
+
+def find_fastqs(run_dir: Path):
+    pats = ("*.fastq", "*.fq", "*.fastq.gz", "*.fq.gz")
+    out = []
+    for pat in pats:
+        out.extend(sorted(run_dir.rglob(pat)))
+    return out
+
+def looks_like_r1(name: str) -> bool:
+    u = name.upper()
+    return ("R1" in u) or u.endswith("_1.FQ") or u.endswith("_1.FQ.GZ") or u.endswith("_1.FASTQ") or u.endswith("_1.FASTQ.GZ") or ("_1_" in u) or (".1." in u)
+
+def looks_like_r2(name: str) -> bool:
+    u = name.upper()
+    return ("R2" in u) or u.endswith("_2.FQ") or u.endswith("_2.FQ.GZ") or u.endswith("_2.FASTQ") or u.endswith("_2.FASTQ.GZ") or ("_2_" in u) or (".2." in u)
+
+def sample_read_length(fq_path: Path, n=2000):
+    opener = gzip.open if fq_path.suffix == ".gz" else open
+    lens = []
+    with opener(fq_path, "rt", encoding="utf-8", errors="ignore") as f:
+        for _ in range(n):
+            h = f.readline()
+            if not h:
+                break
+            seq = f.readline().rstrip("\n")
+            f.readline()
+            q = f.readline()
+            if not q:
+                break
+            lens.append(len(seq))
+    if not lens:
+        return None
+    lens.sort()
+    return lens[len(lens)//2]
+
+print("\nStep 1: Inspect run directories; infer paired-end; estimate read length")
+run_info = {}
+for r in RUNS:
+    rdir = BASE / r
+    fastqs = find_fastqs(rdir)
+    print(f"\n---- {r} ----")
+    print(f"FASTQ files found ({len(fastqs)}):")
+    for fp in fastqs:
+        print(" ", fp)
+
+    r1 = [f for f in fastqs if looks_like_r1(f.name)]
+    r2 = [f for f in fastqs if looks_like_r2(f.name)]
+    paired = (len(r1) >= 1 and len(r2) >= 1)
+    if not paired and len(fastqs) == 2:
+        paired = True
+        r1, r2 = [fastqs[0]], [fastqs[1]]
+
+    candidate = r1[0] if r1 else (fastqs[0] if fastqs else None)
+    medlen = sample_read_length(candidate) if candidate else None
+
+    run_info[r] = {
+        "fastqs": [str(f) for f in fastqs],
+        "paired_end": paired,
+        "r1": str(r1[0]) if r1 else None,
+        "r2": str(r2[0]) if r2 else None,
+        "median_read_length": medlen
+    }
+    print(f"Paired-end inferred: {paired}")
+    print(f"Median read length (from {candidate.name if candidate else 'NA'}): {medlen}")
+
+with open(TMPROOT / "step1_run_info.json", "w") as f:
+    json.dump(run_info, f, indent=2)
+print(f"\nSaved Step 1 metadata to: {TMPROOT / 'step1_run_info.json'}")
+
+plan[0] = "1. [✓] Inspect the three run directories to determine whether data are paired-end and assess read lengths from FASTQ headers/sequences."
+print("\nUpdated plan after Step 1:\n" + "\n".join(plan))</execute>
+<observation>NameError("name 'looks_like_r1' is not defined")</observation>
+<execute>#!/usr/bin/env bash
+set -euo pipefail
+
+echo "Plan:"
+echo "1. [ ] Inspect FASTQ files to determine paired-end and read length >=100"
+echo "2. [ ] Build reference index and map reads"
+echo "3. [ ] Compute uniquely mapped rate >=50% and filter"
+echo "4. [ ] Write qualifying run directory names to JSON output"
+
+BASE="benchmark/dataset/MetazExp"
+RUNS=("toy_srr1" "toy_srr2" "toy_srr3")
+REF="${BASE}/ncbi_dataset/data/GCF_001039355.2/GCF_001039355.2_LinAna2.0_genomic.fna"
+
+TMPROOT="/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/etazexp_refinemen"
+OUT="/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/metazexp_refinement.json"
+mkdir -p "$TMPROOT" "$(dirname "$OUT")"
+
+echo
+echo "Step 1: Inspect FASTQs (paired-end + read length)"
+declare -A R1 R2 MEDLEN PAIRED LENOK
+
+for r in "${RUNS[@]}"; do
+  echo "---- $r ----"
+  mapfile -t FQS < <(find "${BASE}/${r}" -maxdepth 3 -type f \( -iname "*.fastq" -o -iname "*.fq" -o -iname "*.fastq.gz" -o -iname "*.fq.gz" \) | sort)
+  printf "FASTQs found: %s\n" "${#FQS[@]}"
+  printf "%s\n" "${FQS[@]:-}" | sed 's/^/  /'
+
+  r1=""
+  r2=""
+  for f in "${FQS[@]:-}"; do
+    bn="$(basename "$f")"
+    up="$(echo "$bn" | tr '[:lower:]' '[:upper:]')"
+    if [[ -z "$r1" && ( "$up" == *"R1"* || "$up" == *"_1."* || "$up" == *"_1_"* ) ]]; then r1="$f"; fi
+    if [[ -z "$r2" && ( "$up" == *"R2"* || "$up" == *"_2."* || "$up" == *"_2_"* ) ]]; then r2="$f"; fi
+  done
+  if [[ -z "$r1" || -z "$r2" ]]; then
+    if [[ "${#FQS[@]}" -eq 2 ]]; then
+      r1="${FQS[0]}"; r2="${FQS[1]}"
+    fi
+  fi
+
+  if [[ -n "$r1" && -n "$r2" ]]; then
+    PAIRED["$r"]=1
+  else
+    PAIRED["$r"]=0
+  fi
+  R1["$r"]="$r1"
+  R2["$r"]="$r2"
+
+  # median-ish read length: take first 200 sequences from R1 (or first fastq if missing)
+  cand="$r1"
+  if [[ -z "$cand" && "${#FQS[@]}" -gt 0 ]]; then cand="${FQS[0]}"; fi
+  if [[ -z "$cand" ]]; then
+    MEDLEN["$r"]=0
+    LENOK["$r"]=0
+  else
+    if [[ "$cand" == *.gz ]]; then
+      med=$(zcat "$cand" | awk 'NR%4==2{print length($0); c++; if(c==200) exit}' | sort -n | awk 'NR==100{print $1}')
+    else
+      med=$(cat "$cand" | awk 'NR%4==2{print length($0); c++; if(c==200) exit}' | sort -n | awk 'NR==100{print $1}')
+    fi
+    med="${med:-0}"
+    MEDLEN["$r"]="$med"
+    if [[ "$med" -ge 100 ]]; then LENOK["$r"]=1; else LENOK["$r"]=0; fi
+  fi
+
+  echo "Paired-end inferred: ${PAIRED[$r]} (R1='${R1[$r]}' R2='${R2[$r]}')"
+  echo "Estimated read length (median of first 200 reads): ${MEDLEN[$r]}"
+done
+
+echo
+echo "Updated plan after Step 1:"
+echo "1. [✓] Inspect FASTQ files to determine paired-end and read length >=100"
+echo "2. [ ] Build reference index and map reads"
+echo "3. [ ] Compute uniquely mapped rate >=50% and filter"
+echo "4. [ ] Write qualifying run directory names to JSON output"
+
+echo
+echo "Step 2: Build minimap2 index (if needed) and map reads"
+IDX="${TMPROOT}/ref.mmi"
+if [[ ! -s "$IDX" ]]; then
+  minimap2 -d "$IDX" "$REF" > "${TMPROOT}/minimap2_index.log" 2>&1
+fi
+
+declare -A UNIQRATE MAPOK
+for r in "${RUNS[@]}"; do
+  echo "---- mapping $r ----"
+  if [[ "${PAIRED[$r]}" -ne 1 || "${LENOK[$r]}" -ne 1 ]]; then
+    echo "Skip mapping (fails paired or length): paired=${PAIRED[$r]} lenok=${LENOK[$r]}"
+    UNIQRATE["$r"]=0
+    MAPOK["$r"]=0
+    continue
+  fi
+
+  sam="${TMPROOT}/${r}.sam"
+  bam="${TMPROOT}/${r}.bam"
+  sorted="${TMPROOT}/${r}.sorted.bam"
+  log="${TMPROOT}/${r}.minimap2.log"
+
+  minimap2 -ax sr "$IDX" "${R1[$r]}" "${R2[$r]}" > "$sam" 2> "$log"
+  samtools view -bS "$sam" > "$bam"
+  samtools sort -o "$sorted" "$bam"
+  samtools index "$sorted"
+
+  # uniquely mapped: MAPQ>=1 (minimap2 uses MAPQ=0 for multimappers/ambiguous)
+  total=$(samtools view -c "$sorted")
+  uniq=$(samtools view -c -q 1 "$sorted")
+  if [[ "$total" -gt 0 ]]; then
+    rate=$(awk -v u="$uniq" -v t="$total" 'BEGIN{printf "%.2f", (u/t)*100}')
+  else
+    rate="0.00"
+  fi
+  UNIQRATE["$r"]="$rate"
+  awk -v rate="$rate" 'BEGIN{exit !(rate>=50.0)}' && MAPOK["$r"]=1 || MAPOK["$r"]=0
+  echo "Total mapped alignments: $total; Uniquely mapped (MAPQ>=1): $uniq; Unique rate (%): $rate; pass>=50%: ${MAPOK[$r]}"
+done
+
+echo
+echo "Updated plan after Step 2:"
+echo "1. [✓] Inspect FASTQ files to determine paired-end and read length >=100"
+echo "2. [✓] Build reference index and map reads"
+echo "3. [ ] Compute uniquely mapped rate >=50% and filter"
+echo "4. [ ] Write qualifying run directory names to JSON output"
+
+echo
+echo "Step 3: Filter runs meeting all criteria"
+HQ=()
+for r in "${RUNS[@]}"; do
+  if [[ "${PAIRED[$r]}" -eq 1 && "${LENOK[$r]}" -eq 1 && "${MAPOK[$r]}" -eq 1 ]]; then
+    HQ+=("$r")
+  fi
+done
+printf "High-quality runs: %s\n" "${HQ[*]:-<none>}"
+
+echo
+echo "Updated plan after Step 3:"
+echo "1. [✓] Inspect FASTQ files to determine paired-end and read length >=100"
+echo "2. [✓] Build reference index and map reads"
+echo "3. [✓] Compute uniquely mapped rate >=50% and filter"
+echo "4. [ ] Write qualifying run directory names to JSON output"
+
+echo
+echo "Step 4: Write JSON output"
+python3 - <<PY
+import json, os
+hq = ${HQ[@]+"["$(printf "\"%s\"," "${HQ[@]}" | sed 's/,$//')"]"}
+out = "${OUT}"
+os.makedirs(os.path.dirname(out), exist_ok=True)
+with open(out, "w") as f:
+    json.dump(hq, f, indent=2)
+print("Wrote:", out)
+print(json.dumps(hq, indent=2))
+PY
+
+echo
+echo "Updated plan after Step 4:"
+echo "1. [✓] Inspect FASTQ files to determine paired-end and read length >=100"
+echo "2. [✓] Build reference index and map reads"
+echo "3. [✓] Compute uniquely mapped rate >=50% and filter"
+echo "4. [✓] Write qualifying run directory names to JSON output"</execute>
+<observation>SyntaxError('invalid syntax', ('<string>', 2, 10, 'set -euo pipefail\n', 2, 18))</observation>
+<execute>#!/usr/bin/env python3
+import os, json, subprocess, shlex
+from pathlib import Path
+
+print("Research log: running bash pipeline via subprocess (previous error was bash executed as python)")
+
+plan = [
+"1. [ ] Inspect FASTQ files to determine paired-end and read length >=100",
+"2. [ ] Build reference index and map reads",
+"3. [ ] Compute uniquely mapped rate >=50% and filter",
+"4. [ ] Write qualifying run directory names to JSON output",
+]
+print("Plan:\n" + "\n".join(f"{i+1}. [ ] {s.split('] ',1)[1] if '] ' in s else s}" for i,s in enumerate(plan)))
+
+bash_script = r'''
+set -euo pipefail
+
+BASE="benchmark/dataset/MetazExp"
+RUNS=("toy_srr1" "toy_srr2" "toy_srr3")
+REF="${BASE}/ncbi_dataset/data/GCF_001039355.2/GCF_001039355.2_LinAna2.0_genomic.fna"
+
+TMPROOT="/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/etazexp_refinemen"
+OUT="/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/metazexp_refinement.json"
+mkdir -p "$TMPROOT" "$(dirname "$OUT")"
+
+echo "Step 1: Inspect FASTQs (paired-end + read length)"
+declare -A R1 R2 MEDLEN PAIRED LENOK
+
+for r in "${RUNS[@]}"; do
+  echo "---- $r ----"
+  mapfile -t FQS < <(find "${BASE}/${r}" -maxdepth 3 -type f \( -iname "*.fastq" -o -iname "*.fq" -o -iname "*.fastq.gz" -o -iname "*.fq.gz" \) | sort)
+  echo "FASTQs found: ${#FQS[@]}"
+  printf "%s\n" "${FQS[@]:-}" | sed 's/^/  /'
+
+  r1=""
+  r2=""
+  for f in "${FQS[@]:-}"; do
+    bn="$(basename "$f")"
+    up="$(echo "$bn" | tr '[:lower:]' '[:upper:]')"
+    if [[ -z "$r1" && ( "$up" == *"R1"* || "$up" == *"_1."* || "$up" == *"_1_"* ) ]]; then r1="$f"; fi
+    if [[ -z "$r2" && ( "$up" == *"R2"* || "$up" == *"_2."* || "$up" == *"_2_"* ) ]]; then r2="$f"; fi
+  done
+  if [[ -z "$r1" || -z "$r2" ]]; then
+    if [[ "${#FQS[@]}" -eq 2 ]]; then
+      r1="${FQS[0]}"; r2="${FQS[1]}"
+    fi
+  fi
+
+  if [[ -n "$r1" && -n "$r2" ]]; then PAIRED["$r"]=1; else PAIRED["$r"]=0; fi
+  R1["$r"]="$r1"
+  R2["$r"]="$r2"
+
+  cand="$r1"
+  if [[ -z "$cand" && "${#FQS[@]}" -gt 0 ]]; then cand="${FQS[0]}"; fi
+  if [[ -z "$cand" ]]; then
+    MEDLEN["$r"]=0
+    LENOK["$r"]=0
+  else
+    if [[ "$cand" == *.gz ]]; then
+      med=$(zcat "$cand" | awk 'NR%4==2{print length($0); c++; if(c==200) exit}' | sort -n | awk 'NR==100{print $1}')
+    else
+      med=$(cat "$cand" | awk 'NR%4==2{print length($0); c++; if(c==200) exit}' | sort -n | awk 'NR==100{print $1}')
+    fi
+    med="${med:-0}"
+    MEDLEN["$r"]="$med"
+    if [[ "$med" -ge 100 ]]; then LENOK["$r"]=1; else LENOK["$r"]=0; fi
+  fi
+
+  echo "Paired-end inferred: ${PAIRED[$r]} (R1='${R1[$r]}' R2='${R2[$r]}')"
+  echo "Estimated read length (median of first 200 reads): ${MEDLEN[$r]}"
+done
+
+echo "Step 2: Build minimap2 index and map"
+IDX="${TMPROOT}/ref.mmi"
+if [[ ! -s "$IDX" ]]; then
+  minimap2 -d "$IDX" "$REF" > "${TMPROOT}/minimap2_index.log" 2>&1
+fi
+
+declare -A MAPOK
+HQ=()
+for r in "${RUNS[@]}"; do
+  echo "---- mapping $r ----"
+  if [[ "${PAIRED[$r]}" -ne 1 || "${LENOK[$r]}" -ne 1 ]]; then
+    echo "Skip mapping (fails paired or length)"
+    MAPOK["$r"]=0
+    continue
+  fi
+
+  sam="${TMPROOT}/${r}.sam"
+  bam="${TMPROOT}/${r}.bam"
+  sorted="${TMPROOT}/${r}.sorted.bam"
+  log="${TMPROOT}/${r}.minimap2.log"
+
+  minimap2 -ax sr "$IDX" "${R1[$r]}" "${R2[$r]}" > "$sam" 2> "$log"
+  samtools view -bS "$sam" > "$bam"
+  samtools sort -o "$sorted" "$bam"
+  samtools index "$sorted"
+
+  total=$(samtools view -c "$sorted")
+  uniq=$(samtools view -c -q 1 "$sorted")
+  if [[ "$total" -gt 0 ]]; then
+    rate=$(awk -v u="$uniq" -v t="$total" 'BEGIN{printf "%.2f", (u/t)*100}')
+  else
+    rate="0.00"
+  fi
+  echo "Total mapped alignments: $total; Uniquely mapped (MAPQ>=1): $uniq; Unique rate (%): $rate"
+  awk -v rate="$rate" 'BEGIN{exit !(rate>=50.0)}' && MAPOK["$r"]=1 || MAPOK["$r"]=0
+
+  if [[ "${MAPOK[$r]}" -eq 1 ]]; then
+    HQ+=("$r")
+  fi
+done
+
+python3 - <<PY
+import json, os
+hq = ${HQ[@]+"["$(printf "\"%s\"," "${HQ[@]}" | sed 's/,$//')"]"}
+out = "${OUT}"
+os.makedirs(os.path.dirname(out), exist_ok=True)
+with open(out, "w") as f:
+    json.dump(hq, f, indent=2)
+print(out)
+print(json.dumps(hq, indent=2))
+PY
+'''
+
+print("\nExecuting bash workflow...")
+res = subprocess.run(["bash", "-lc", bash_script], capture_output=True, text=True)
+print("STDOUT:\n", res.stdout)
+print("STDERR:\n", res.stderr)
+print("Return code:", res.returncode)
+res.check_returncode()
+
+print("\nUpdated plan (all steps completed in bash workflow):")
+print("1. [✓] Inspect FASTQ files to determine paired-end and read length >=100")
+print("2. [✓] Build reference index and map reads")
+print("3. [✓] Compute uniquely mapped rate >=50% and filter")
+print("4. [✓] Write qualifying run directory names to JSON output")</execute>
+<observation>CalledProcessError(141, ['bash', '-lc', '\nset -euo pipefail\n\nBASE="benchmark/dataset/MetazExp"\nRUNS=("toy_srr1" "toy_srr2" "toy_srr3")\nREF="${BASE}/ncbi_dataset/data/GCF_001039355.2/GCF_001039355.2_LinAna2.0_genomic.fna"\n\nTMPROOT="/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/etazexp_refinemen"\nOUT="/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/metazexp_refinement.json"\nmkdir -p "$TMPROOT" "$(dirname "$OUT")"\n\necho "Step 1: Inspect FASTQs (paired-end + read length)"\ndeclare -A R1 R2 MEDLEN PAIRED LENOK\n\nfor r in "${RUNS[@]}"; do\n  echo "---- $r ----"\n  mapfile -t FQS < <(find "${BASE}/${r}" -maxdepth 3 -type f \\( -iname "*.fastq" -o -iname "*.fq" -o -iname "*.fastq.gz" -o -iname "*.fq.gz" \\) | sort)\n  echo "FASTQs found: ${#FQS[@]}"\n  printf "%s\\n" "${FQS[@]:-}" | sed \'s/^/  /\'\n\n  r1=""\n  r2=""\n  for f in "${FQS[@]:-}"; do\n    bn="$(basename "$f")"\n    up="$(echo "$bn" | tr \'[:lower:]\' \'[:upper:]\')"\n    if [[ -z "$r1" && ( "$up" == *"R1"* || "$up" == *"_1."* || "$up" == *"_1_"* ) ]]; then r1="$f"; fi\n    if [[ -z "$r2" && ( "$up" == *"R2"* || "$up" == *"_2."* || "$up" == *"_2_"* ) ]]; then r2="$f"; fi\n  done\n  if [[ -z "$r1" || -z "$r2" ]]; then\n    if [[ "${#FQS[@]}" -eq 2 ]]; then\n      r1="${FQS[0]}"; r2="${FQS[1]}"\n    fi\n  fi\n\n  if [[ -n "$r1" && -n "$r2" ]]; then PAIRED["$r"]=1; else PAIRED["$r"]=0; fi\n  R1["$r"]="$r1"\n  R2["$r"]="$r2"\n\n  cand="$r1"\n  if [[ -z "$cand" && "${#FQS[@]}" -gt 0 ]]; then cand="${FQS[0]}"; fi\n  if [[ -z "$cand" ]]; then\n    MEDLEN["$r"]=0\n    LENOK["$r"]=0\n  else\n    if [[ "$cand" == *.gz ]]; then\n      med=$(zcat "$cand" | awk \'NR%4==2{print length($0); c++; if(c==200) exit}\' | sort -n | awk \'NR==100{print $1}\')\n    else\n      med=$(cat "$cand" | awk \'NR%4==2{print length($0); c++; if(c==200) exit}\' | sort -n | awk \'NR==100{print $1}\')\n    fi\n    med="${med:-0}"\n    MEDLEN["$r"]="$med"\n    if [[ "$med" -ge 100 ]]; then LENOK["$r"]=1; else LENOK["$r"]=0; fi\n  fi\n\n  echo "Paired-end inferred: ${PAIRED[$r]} (R1=\'${R1[$r]}\' R2=\'${R2[$r]}\')"\n  echo "Estimated read length (median of first 200 reads): ${MEDLEN[$r]}"\ndone\n\necho "Step 2: Build minimap2 index and map"\nIDX="${TMPROOT}/ref.mmi"\nif [[ ! -s "$IDX" ]]; then\n  minimap2 -d "$IDX" "$REF" > "${TMPROOT}/minimap2_index.log" 2>&1\nfi\n\ndeclare -A MAPOK\nHQ=()\nfor r in "${RUNS[@]}"; do\n  echo "---- mapping $r ----"\n  if [[ "${PAIRED[$r]}" -ne 1 || "${LENOK[$r]}" -ne 1 ]]; then\n    echo "Skip mapping (fails paired or length)"\n    MAPOK["$r"]=0\n    continue\n  fi\n\n  sam="${TMPROOT}/${r}.sam"\n  bam="${TMPROOT}/${r}.bam"\n  sorted="${TMPROOT}/${r}.sorted.bam"\n  log="${TMPROOT}/${r}.minimap2.log"\n\n  minimap2 -ax sr "$IDX" "${R1[$r]}" "${R2[$r]}" > "$sam" 2> "$log"\n  samtools view -bS "$sam" > "$bam"\n  samtools sort -o "$sorted" "$bam"\n  samtools index "$sorted"\n\n  total=$(samtools view -c "$sorted")\n  uniq=$(samtools view -c -q 1 "$sorted")\n  if [[ "$total" -gt 0 ]]; then\n    rate=$(awk -v u="$uniq" -v t="$total" \'BEGIN{printf "%.2f", (u/t)*100}\')\n  else\n    rate="0.00"\n  fi\n  echo "Total mapped alignments: $total; Uniquely mapped (MAPQ>=1): $uniq; Unique rate (%): $rate"\n  awk -v rate="$rate" \'BEGIN{exit !(rate>=50.0)}\' && MAPOK["$r"]=1 || MAPOK["$r"]=0\n\n  if [[ "${MAPOK[$r]}" -eq 1 ]]; then\n    HQ+=("$r")\n  fi\ndone\n\npython3 - <<PY\nimport json, os\nhq = ${HQ[@]+"["$(printf "\\"%s\\"," "${HQ[@]}" | sed \'s/,$//\')"]"}\nout = "${OUT}"\nos.makedirs(os.path.dirname(out), exist_ok=True)\nwith open(out, "w") as f:\n    json.dump(hq, f, indent=2)\nprint(out)\nprint(json.dumps(hq, indent=2))\nPY\n'], 'Step 1: Inspect FASTQs (paired-end + read length)\n---- toy_srr1 ----\nFASTQs found: 2\n  benchmark/dataset/MetazExp/toy_srr1/SRR2131217_1.fastq\n  benchmark/dataset/MetazExp/toy_srr1/SRR2131217_2.fastq\n', '')</observation>
+<execute>#!/usr/bin/env python3
+import subprocess, os, json
+from pathlib import Path
+
+print("Plan:")
+print("1. [ ] Inspect FASTQ files to determine paired-end and read length >=100")
+print("2. [ ] Build reference index and map reads")
+print("3. [ ] Compute uniquely mapped rate >=50% and filter")
+print("4. [ ] Write qualifying run directory names to JSON output")
+
+# Exit 141 came from SIGPIPE (e.g., zcat|head/awk). Disable pipefail to avoid treating SIGPIPE as fatal.
+bash_script = r'''
+set -eu
+
+BASE="benchmark/dataset/MetazExp"
+RUNS=("toy_srr1" "toy_srr2" "toy_srr3")
+REF="${BASE}/ncbi_dataset/data/GCF_001039355.2/GCF_001039355.2_LinAna2.0_genomic.fna"
+
+TMPROOT="/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/etazexp_refinemen"
+OUT="/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/metazexp_refinement.json"
+mkdir -p "$TMPROOT" "$(dirname "$OUT")"
+
+echo "Step 1: Inspect FASTQs (paired-end + read length)"
+declare -A R1 R2 MEDLEN PAIRED LENOK
+
+for r in "${RUNS[@]}"; do
+  echo "---- $r ----"
+  mapfile -t FQS < <(find "${BASE}/${r}" -maxdepth 3 -type f \( -iname "*.fastq" -o -iname "*.fq" -o -iname "*.fastq.gz" -o -iname "*.fq.gz" \) | sort)
+  echo "FASTQs found: ${#FQS[@]}"
+  printf "%s\n" "${FQS[@]:-}" | sed 's/^/  /'
+
+  r1=""
+  r2=""
+  for f in "${FQS[@]:-}"; do
+    bn="$(basename "$f")"
+    up="$(echo "$bn" | tr '[:lower:]' '[:upper:]')"
+    if [[ -z "$r1" && ( "$up" == *"R1"* || "$up" == *"_1."* || "$up" == *"_1_"* ) ]]; then r1="$f"; fi
+    if [[ -z "$r2" && ( "$up" == *"R2"* || "$up" == *"_2."* || "$up" == *"_2_"* ) ]]; then r2="$f"; fi
+  done
+  if [[ -z "$r1" || -z "$r2" ]]; then
+    if [[ "${#FQS[@]}" -eq 2 ]]; then
+      r1="${FQS[0]}"; r2="${FQS[1]}"
+    fi
+  fi
+
+  if [[ -n "$r1" && -n "$r2" ]]; then PAIRED["$r"]=1; else PAIRED["$r"]=0; fi
+  R1["$r"]="$r1"
+  R2["$r"]="$r2"
+
+  cand="$r1"
+  if [[ -z "$cand" && "${#FQS[@]}" -gt 0 ]]; then cand="${FQS[0]}"; fi
+  if [[ -z "$cand" ]]; then
+    MEDLEN["$r"]=0
+    LENOK["$r"]=0
+  else
+    # Avoid SIGPIPE by not exiting early; just compute first 200 read lengths via awk counter.
+    if [[ "$cand" == *.gz ]]; then
+      med=$(zcat "$cand" | awk 'NR%4==2{print length($0); c++; if(c==200) exit} END{}' | sort -n | awk 'NR==100{print $1}')
+    else
+      med=$(cat "$cand" | awk 'NR%4==2{print length($0); c++; if(c==200) exit} END{}' | sort -n | awk 'NR==100{print $1}')
+    fi
+    med="${med:-0}"
+    MEDLEN["$r"]="$med"
+    if [[ "$med" -ge 100 ]]; then LENOK["$r"]=1; else LENOK["$r"]=0; fi
+  fi
+
+  echo "Paired-end inferred: ${PAIRED[$r]} (R1='${R1[$r]}' R2='${R2[$r]}')"
+  echo "Estimated read length (median of first 200 reads): ${MEDLEN[$r]}"
+done
+
+echo "Step 2: Build minimap2 index and map"
+IDX="${TMPROOT}/ref.mmi"
+if [[ ! -s "$IDX" ]]; then
+  minimap2 -d "$IDX" "$REF" > "${TMPROOT}/minimap2_index.log" 2>&1
+fi
+
+declare -A MAPOK
+HQ=()
+for r in "${RUNS[@]}"; do
+  echo "---- mapping $r ----"
+  if [[ "${PAIRED[$r]}" -ne 1 || "${LENOK[$r]}" -ne 1 ]]; then
+    echo "Skip mapping (fails paired or length)"
+    MAPOK["$r"]=0
+    continue
+  fi
+
+  sam="${TMPROOT}/${r}.sam"
+  bam="${TMPROOT}/${r}.bam"
+  sorted="${TMPROOT}/${r}.sorted.bam"
+  log="${TMPROOT}/${r}.minimap2.log"
+
+  minimap2 -ax sr "$IDX" "${R1[$r]}" "${R2[$r]}" > "$sam" 2> "$log"
+  samtools view -bS "$sam" > "$bam"
+  samtools sort -o "$sorted" "$bam"
+  samtools index "$sorted"
+
+  total=$(samtools view -c "$sorted")
+  uniq=$(samtools view -c -q 1 "$sorted")
+  if [[ "$total" -gt 0 ]]; then
+    rate=$(awk -v u="$uniq" -v t="$total" 'BEGIN{printf "%.2f", (u/t)*100}')
+  else
+    rate="0.00"
+  fi
+  echo "Total mapped alignments: $total; Uniquely mapped (MAPQ>=1): $uniq; Unique rate (%): $rate"
+  awk -v rate="$rate" 'BEGIN{exit !(rate>=50.0)}' && MAPOK["$r"]=1 || MAPOK["$r"]=0
+
+  if [[ "${MAPOK[$r]}" -eq 1 ]]; then
+    HQ+=("$r")
+  fi
+done
+
+# Write JSON
+python3 - "$OUT" "${HQ[@]}" <<'PY'
+import json, os, sys
+out = sys.argv[1]
+hq = sys.argv[2:]
+os.makedirs(os.path.dirname(out), exist_ok=True)
+with open(out, "w") as f:
+    json.dump(hq, f, indent=2)
+print("Wrote:", out)
+print(json.dumps(hq, indent=2))
+PY
+'''
+
+res = subprocess.run(["bash", "-lc", bash_script], capture_output=True, text=True)
+print("STDOUT:\n", res.stdout)
+print("STDERR:\n", res.stderr)
+print("Return code:", res.returncode)
+res.check_returncode()
+
+print("\nUpdated plan:")
+print("1. [✓] Inspect FASTQ files to determine paired-end and read length >=100")
+print("2. [✓] Build reference index and map reads")
+print("3. [✓] Compute uniquely mapped rate >=50% and filter")
+print("4. [✓] Write qualifying run directory names to JSON output")</execute>
+<observation>Plan:
+1. [ ] Inspect FASTQ files to determine paired-end and read length >=100
+2. [ ] Build reference index and map reads
+3. [ ] Compute uniquely mapped rate >=50% and filter
+4. [ ] Write qualifying run directory names to JSON output
+STDOUT:
+ Step 1: Inspect FASTQs (paired-end + read length)
+---- toy_srr1 ----
+FASTQs found: 2
+  benchmark/dataset/MetazExp/toy_srr1/SRR2131217_1.fastq
+  benchmark/dataset/MetazExp/toy_srr1/SRR2131217_2.fastq
+Paired-end inferred: 1 (R1='benchmark/dataset/MetazExp/toy_srr1/SRR2131217_1.fastq' R2='benchmark/dataset/MetazExp/toy_srr1/SRR2131217_1.fastq')
+Estimated read length (median of first 200 reads): 101
+---- toy_srr2 ----
+FASTQs found: 2
+  benchmark/dataset/MetazExp/toy_srr2/SRR2131222_1.fastq
+  benchmark/dataset/MetazExp/toy_srr2/SRR2131222_2.fastq
+Paired-end inferred: 1 (R1='benchmark/dataset/MetazExp/toy_srr2/SRR2131222_1.fastq' R2='benchmark/dataset/MetazExp/toy_srr2/SRR2131222_1.fastq')
+Estimated read length (median of first 200 reads): 101
+---- toy_srr3 ----
+FASTQs found: 2
+  benchmark/dataset/MetazExp/toy_srr3/SRR2131244_1.fastq
+  benchmark/dataset/MetazExp/toy_srr3/SRR2131244_2.fastq
+Paired-end inferred: 1 (R1='benchmark/dataset/MetazExp/toy_srr3/SRR2131244_1.fastq' R2='benchmark/dataset/MetazExp/toy_srr3/SRR2131244_1.fastq')
+Estimated read length (median of first 200 reads): 111
+Step 2: Build minimap2 index and map
+---- mapping toy_srr1 ----
+Total mapped alignments: 216038; Uniquely mapped (MAPQ>=1): 156291; Unique rate (%): 72.34
+---- mapping toy_srr2 ----
+Total mapped alignments: 214665; Uniquely mapped (MAPQ>=1): 151682; Unique rate (%): 70.66
+---- mapping toy_srr3 ----
+Total mapped alignments: 201207; Uniquely mapped (MAPQ>=1): 156286; Unique rate (%): 77.67
+Wrote: /root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/metazexp_refinement.json
+[
+  "toy_srr1",
+  "toy_srr2",
+  "toy_srr3"
+]
+
+STDERR:
+ 
+Return code: 0
+
+Updated plan:
+1. [✓] Inspect FASTQ files to determine paired-end and read length >=100
+2. [✓] Build reference index and map reads
+3. [✓] Compute uniquely mapped rate >=50% and filter
+4. [✓] Write qualifying run directory names to JSON output
+</observation>
+<solution>[
+  "toy_srr1",
+  "toy_srr2",
+  "toy_srr3"
+]</solution>

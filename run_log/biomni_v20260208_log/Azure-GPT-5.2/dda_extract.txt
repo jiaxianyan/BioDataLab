@@ -1,0 +1,1014 @@
+# Core Task
+Query the NCBI GEO database for Series `GSE116315`, retrieve all associated samples, and extract specific metadata fields including sample name, project ID, cell line/tissue, organism, treatment, genotype, and technique for each sample.
+
+# Output Requirements & File Path
+- Output format: A CSV file with the following columns (exactly matching the ground truth CSV headers). Use "N/A" for missing values.
+  - `Sample Name`: The GSM accession and title. Connect them using a hyphen (-) in the middle, for example: GSM1234567-Sample1.
+  - `Source Project ID`: The GEO Series accession (e.g., GSE999999).
+  - `Cell Line/Tissue`: The specific cell type or tissue used (e.g., HeLa cells).
+  - `Organism`: The scientific name of the organism (e.g., Homo sapiens).
+  - `Treatment`: Specifies the experimental treatment or drug applied (e.g., Doxorubicin). For combination therapies involving multiple drugs, use a plus sign (+) as a strict separator without any spaces (e.g., Doxorubicin+Cyclophosphamide); ensure no whitespace exists around the plus sign, as formats like 'Doxorubicin + Cyclophosphamide' are incorrect.
+  - `Genotype`: The genetic background (e.g., CRISPR-KO).
+  - `Technique`: The experimental technique used (e.g., ChIP-seq).
+- Save Path: Save the result to: `/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/dda_extract.csv`
+- Intermediate Storage Path: All intermediate code generated during execution, downloaded files, and temporary results must be stored in `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/dda_extract/`
+
+# Output Example (For Reference Only)
+Sample Name,Source Project ID,Cell Line/Tissue,Organism,Treatment,Genotype,Technique
+GSM1234567-Sample1,GSE999999,HeLa cells,Homo sapiens,Doxorubicin,CRISPR-KO,ChIP-seq
+GSM7654321-Sample2,GSE999999,Mouse Liver,Mus musculus,Vehicle control,WT,RNA-seq
+
+<execute>#!/usr/bin/env python3
+import os, re, csv, textwrap, json, pathlib
+from urllib.request import urlopen
+
+tmp_dir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/dda_extract/"
+out_csv = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/dda_extract.csv"
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(out_csv), exist_ok=True)
+
+print("Plan:")
+plan = [
+"Query GEO for GSE116315 and obtain all GSM accessions (samples).",
+"Download/parse each GSM SOFT record to extract required metadata fields.",
+"Normalize fields (Treatment combo formatting, N/A), assemble table, and write CSV to required path."
+]
+for i,s in enumerate(plan,1):
+    print(f"{i}. [ ] {s}")
+
+# Step 1: get GSM list from GSE SOFT
+gse = "GSE116315"
+gse_soft_url = f"https://ftp.ncbi.nlm.nih.gov/geo/series/{gse[:-3]}nnn/{gse}/soft/{gse}_family.soft.gz"
+print("\nStep 1: Downloading GSE family SOFT:", gse_soft_url)
+
+import gzip, io
+data = urlopen(gse_soft_url).read()
+open(os.path.join(tmp_dir, f"{gse}_family.soft.gz"),"wb").write(data)
+text = gzip.decompress(data).decode("utf-8", errors="replace")
+# extract GSM accessions
+gsm_list = sorted(set(re.findall(r"\^SAMPLE = (GSM\d+)", text)))
+print("Found GSM count:", len(gsm_list))
+print("First 10:", gsm_list[:10])
+
+# update plan
+print("\nUpdated Plan:")
+print(f"1. [✓] {plan[0]} (completed; {len(gsm_list)} samples)")
+print(f"2. [ ] {plan[1]}")
+print(f"3. [ ] {plan[2]}")
+
+# Save gsm list
+open(os.path.join(tmp_dir,"gsm_list.txt"),"w").write("\n".join(gsm_list))
+
+# Step 2: parse each sample block from family SOFT (contains metadata) to avoid many requests
+print("\nStep 2: Parsing SAMPLE blocks from family SOFT...")
+# split into sample sections
+sections = re.split(r"(?m)^\^SAMPLE = ", text)
+sample_blocks = {}
+for sec in sections[1:]:
+    lines = sec.splitlines()
+    gsm = lines[0].strip()
+    sample_blocks[gsm] = sec
+
+def get_field(block, key):
+    # return list of values for !Sample_key =
+    vals = []
+    for m in re.finditer(rf"(?m)^!Sample_{re.escape(key)} = (.*)$", block):
+        vals.append(m.group(1).strip())
+    return vals
+
+def first_or_na(lst):
+    return lst[0] if lst else "N/A"
+
+rows=[]
+for gsm in gsm_list:
+    block = sample_blocks.get(gsm,"")
+    title = first_or_na(get_field(block,"title"))
+    organism = first_or_na(get_field(block,"organism_ch1"))
+    source = first_or_na(get_field(block,"source_name_ch1"))
+    characteristics = get_field(block,"characteristics_ch1")
+    # infer fields from characteristics
+    cell="N/A"; treatment="N/A"; genotype="N/A"
+    for c in characteristics:
+        lc=c.lower()
+        # split "key: value"
+        if ":" in c:
+            k,v = c.split(":",1)
+            k=k.strip().lower(); v=v.strip()
+            if any(x in k for x in ["cell line","cellline","tissue","cell type","celltype","source","organ","sample type"]):
+                if cell=="N/A": cell=v
+            if any(x in k for x in ["treatment","drug","stimulation","condition","exposure"]):
+                if treatment=="N/A": treatment=v
+            if any(x in k for x in ["genotype","strain","mutation","knockout","ko","transgene"]):
+                if genotype=="N/A": genotype=v
+        # fallback heuristics
+    if cell=="N/A" and source!="N/A":
+        cell = source
+    # Technique from library strategy or type
+    tech = first_or_na(get_field(block,"library_strategy"))
+    if tech=="N/A":
+        tech = first_or_na(get_field(block,"type"))
+    # normalize treatment separators: if contains " + " or "," etc
+    if treatment!="N/A":
+        treatment = re.sub(r"\s*\+\s*", "+", treatment)
+        # if multiple drugs separated by " and " or "," -> plus
+        treatment = re.sub(r"\s*(,|;| and )\s*", "+", treatment, flags=re.I)
+        treatment = re.sub(r"\++", "+", treatment).strip("+")
+    sample_name = f"{gsm}-{title if title!='N/A' else gsm}"
+    rows.append({
+        "Sample Name": sample_name,
+        "Source Project ID": gse,
+        "Cell Line/Tissue": cell if cell else "N/A",
+        "Organism": organism,
+        "Treatment": treatment,
+        "Genotype": genotype,
+        "Technique": tech
+    })
+
+print("Parsed rows:", len(rows))
+print("Example row:", rows[0])
+
+print("\nUpdated Plan:")
+print(f"1. [✓] {plan[0]} (completed; {len(gsm_list)} samples)")
+print(f"2. [✓] {plan[1]} (completed; parsed from family SOFT)")
+print(f"3. [ ] {plan[2]}")
+
+# Step 3: write CSV
+print("\nStep 3: Writing CSV to", out_csv)
+headers=["Sample Name","Source Project ID","Cell Line/Tissue","Organism","Treatment","Genotype","Technique"]
+with open(out_csv,"w",newline="") as f:
+    w=csv.DictWriter(f, fieldnames=headers)
+    w.writeheader()
+    for r in rows:
+        # ensure all headers present and N/A
+        out={}
+        for h in headers:
+            v=r.get(h,"N/A")
+            if v is None or str(v).strip()=="":
+                v="N/A"
+            out[h]=v
+        w.writerow(out)
+
+# verify
+import pandas as pd
+df=pd.read_csv(out_csv)
+print(df.head())
+print("Saved CSV rows:", df.shape)
+
+print("\nFinal Updated Plan:")
+print(f"1. [✓] {plan[0]} (completed)")
+print(f"2. [✓] {plan[1]} (completed)")
+print(f"3. [✓] {plan[2]} (completed)")</execute>
+<observation>NameError("name 're' is not defined")</observation>
+<execute>#!/usr/bin/env python3
+import os, csv, gzip, re
+from urllib.request import urlopen
+
+tmp_dir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/dda_extract/"
+out_csv = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/dda_extract.csv"
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(out_csv), exist_ok=True)
+
+print("Plan:")
+plan = [
+"Query GEO for GSE116315 and obtain all GSM accessions (samples).",
+"Download/parse each GSM record (via GSE family SOFT) to extract required metadata fields.",
+"Normalize fields (Treatment combo formatting, N/A), assemble table, and write CSV to required path."
+]
+for i, s in enumerate(plan, 1):
+    print(f"{i}. [ ] {s}")
+
+gse = "GSE116315"
+gse_soft_url = f"https://ftp.ncbi.nlm.nih.gov/geo/series/{gse[:-3]}nnn/{gse}/soft/{gse}_family.soft.gz"
+
+# Step 1
+print("\nStep 1: Downloading GSE family SOFT:", gse_soft_url)
+gz_path = os.path.join(tmp_dir, f"{gse}_family.soft.gz")
+data = urlopen(gse_soft_url).read()
+with open(gz_path, "wb") as f:
+    f.write(data)
+text = gzip.decompress(data).decode("utf-8", errors="replace")
+gsm_list = sorted(set(re.findall(r"\^SAMPLE = (GSM\d+)", text)))
+
+print("Found GSM count:", len(gsm_list))
+print("First 10 GSMs:", gsm_list[:10])
+
+print("\nUpdated Plan:")
+print(f"1. [✓] {plan[0]} (completed; {len(gsm_list)} samples)")
+print(f"2. [ ] {plan[1]}")
+print(f"3. [ ] {plan[2]}")
+
+with open(os.path.join(tmp_dir, "gsm_list.txt"), "w") as f:
+    f.write("\n".join(gsm_list))
+
+# Step 2
+print("\nStep 2: Parsing SAMPLE blocks from family SOFT...")
+sections = re.split(r"(?m)^\^SAMPLE = ", text)
+sample_blocks = {}
+for sec in sections[1:]:
+    lines = sec.splitlines()
+    gsm = lines[0].strip()
+    sample_blocks[gsm] = sec
+
+def get_field(block, key):
+    vals = []
+    for m in re.finditer(rf"(?m)^!Sample_{re.escape(key)} = (.*)$", block):
+        vals.append(m.group(1).strip())
+    return vals
+
+def first_or_na(lst):
+    return lst[0] if lst else "N/A"
+
+rows = []
+for gsm in gsm_list:
+    block = sample_blocks.get(gsm, "")
+    title = first_or_na(get_field(block, "title"))
+    organism = first_or_na(get_field(block, "organism_ch1"))
+    source = first_or_na(get_field(block, "source_name_ch1"))
+    characteristics = get_field(block, "characteristics_ch1")
+
+    cell = "N/A"
+    treatment = "N/A"
+    genotype = "N/A"
+
+    for c in characteristics:
+        if ":" in c:
+            k, v = c.split(":", 1)
+            k = k.strip().lower()
+            v = v.strip()
+            if any(x in k for x in ["cell line", "cellline", "tissue", "cell type", "celltype", "organ", "source"]):
+                if cell == "N/A":
+                    cell = v
+            if any(x in k for x in ["treatment", "drug", "stimulation", "condition", "exposure"]):
+                if treatment == "N/A":
+                    treatment = v
+            if any(x in k for x in ["genotype", "strain", "mutation", "knockout", "transgene", "ko"]):
+                if genotype == "N/A":
+                    genotype = v
+
+    if cell == "N/A" and source != "N/A":
+        cell = source
+
+    tech = first_or_na(get_field(block, "library_strategy"))
+    if tech == "N/A":
+        tech = first_or_na(get_field(block, "type"))
+
+    if treatment != "N/A":
+        treatment = re.sub(r"\s*\+\s*", "+", treatment)
+        treatment = re.sub(r"\s*(,|;|\band\b)\s*", "+", treatment, flags=re.I)
+        treatment = re.sub(r"\++", "+", treatment).strip("+")
+
+    sample_name = f"{gsm}-{title if title != 'N/A' else gsm}"
+
+    rows.append({
+        "Sample Name": sample_name,
+        "Source Project ID": gse,
+        "Cell Line/Tissue": cell if cell else "N/A",
+        "Organism": organism,
+        "Treatment": treatment,
+        "Genotype": genotype,
+        "Technique": tech
+    })
+
+print("Parsed rows:", len(rows))
+print("Example row:", rows[0] if rows else "N/A")
+
+print("\nUpdated Plan:")
+print(f"1. [✓] {plan[0]} (completed)")
+print(f"2. [✓] {plan[1]} (completed)")
+print(f"3. [ ] {plan[2]}")
+
+# Step 3
+print("\nStep 3: Writing CSV to", out_csv)
+headers = ["Sample Name", "Source Project ID", "Cell Line/Tissue", "Organism", "Treatment", "Genotype", "Technique"]
+with open(out_csv, "w", newline="") as f:
+    w = csv.DictWriter(f, fieldnames=headers)
+    w.writeheader()
+    for r in rows:
+        out = {}
+        for h in headers:
+            v = r.get(h, "N/A")
+            if v is None or str(v).strip() == "":
+                v = "N/A"
+            out[h] = v
+        w.writerow(out)
+
+# Minimal verification without pandas
+with open(out_csv, "r") as f:
+    for i in range(6):
+        line = f.readline().rstrip("\n")
+        if not line:
+            break
+        print(line)
+
+print("\nFinal Updated Plan:")
+print(f"1. [✓] {plan[0]} (completed)")
+print(f"2. [✓] {plan[1]} (completed)")
+print(f"3. [✓] {plan[2]} (completed)")
+print("\nDone. Output written to:", out_csv)</execute>
+<observation>NameError("name 're' is not defined")</observation>
+<execute>#!/usr/bin/env python3
+# Research log: robust rerun with explicit imports inside the same execution context.
+
+print("DEBUG: starting fresh run with explicit imports...")
+import os, csv, gzip
+import re as _re  # avoid any shadowing issues
+
+from urllib.request import urlopen
+
+tmp_dir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/dda_extract/"
+out_csv = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/dda_extract.csv"
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(out_csv), exist_ok=True)
+
+print("Plan:")
+plan = [
+"Query GEO for GSE116315 and obtain all GSM accessions (samples).",
+"Parse each GSM record (via GSE family SOFT) to extract required metadata fields.",
+"Normalize fields (Treatment combo formatting, N/A), assemble table, and write CSV to required path."
+]
+for i, s in enumerate(plan, 1):
+    print(f"{i}. [ ] {s}")
+
+gse = "GSE116315"
+gse_soft_url = f"https://ftp.ncbi.nlm.nih.gov/geo/series/{gse[:-3]}nnn/{gse}/soft/{gse}_family.soft.gz"
+
+# Step 1
+print("\nStep 1: Downloading GSE family SOFT:", gse_soft_url)
+gz_path = os.path.join(tmp_dir, f"{gse}_family.soft.gz")
+data = urlopen(gse_soft_url).read()
+with open(gz_path, "wb") as f:
+    f.write(data)
+text = gzip.decompress(data).decode("utf-8", errors="replace")
+gsm_list = sorted(set(_re.findall(r"\^SAMPLE = (GSM\d+)", text)))
+
+print("Found GSM count:", len(gsm_list))
+print("First 10 GSMs:", gsm_list[:10])
+
+print("\nUpdated Plan:")
+print(f"1. [✓] {plan[0]} (completed; {len(gsm_list)} samples)")
+print(f"2. [ ] {plan[1]}")
+print(f"3. [ ] {plan[2]}")
+
+with open(os.path.join(tmp_dir, "gsm_list.txt"), "w") as f:
+    f.write("\n".join(gsm_list))
+
+# Step 2
+print("\nStep 2: Parsing SAMPLE blocks from family SOFT...")
+sections = _re.split(r"(?m)^\^SAMPLE = ", text)
+sample_blocks = {}
+for sec in sections[1:]:
+    lines = sec.splitlines()
+    gsm = lines[0].strip()
+    sample_blocks[gsm] = sec
+
+def get_field(block, key):
+    vals = []
+    for m in _re.finditer(rf"(?m)^!Sample_{_re.escape(key)} = (.*)$", block):
+        vals.append(m.group(1).strip())
+    return vals
+
+def first_or_na(lst):
+    return lst[0] if lst else "N/A"
+
+rows = []
+for gsm in gsm_list:
+    block = sample_blocks.get(gsm, "")
+    title = first_or_na(get_field(block, "title"))
+    organism = first_or_na(get_field(block, "organism_ch1"))
+    source = first_or_na(get_field(block, "source_name_ch1"))
+    characteristics = get_field(block, "characteristics_ch1")
+
+    cell = "N/A"
+    treatment = "N/A"
+    genotype = "N/A"
+
+    for c in characteristics:
+        if ":" in c:
+            k, v = c.split(":", 1)
+            k = k.strip().lower()
+            v = v.strip()
+            if any(x in k for x in ["cell line", "cellline", "tissue", "cell type", "celltype", "organ", "source"]):
+                if cell == "N/A":
+                    cell = v
+            if any(x in k for x in ["treatment", "drug", "stimulation", "condition", "exposure"]):
+                if treatment == "N/A":
+                    treatment = v
+            if any(x in k for x in ["genotype", "strain", "mutation", "knockout", "transgene", "ko"]):
+                if genotype == "N/A":
+                    genotype = v
+
+    if cell == "N/A" and source != "N/A":
+        cell = source
+
+    tech = first_or_na(get_field(block, "library_strategy"))
+    if tech == "N/A":
+        tech = first_or_na(get_field(block, "type"))
+
+    if treatment != "N/A":
+        treatment = _re.sub(r"\s*\+\s*", "+", treatment)
+        treatment = _re.sub(r"\s*(,|;|\band\b)\s*", "+", treatment, flags=_re.I)
+        treatment = _re.sub(r"\++", "+", treatment).strip("+")
+
+    sample_name = f"{gsm}-{title if title != 'N/A' else gsm}"
+
+    rows.append({
+        "Sample Name": sample_name,
+        "Source Project ID": gse,
+        "Cell Line/Tissue": cell if cell else "N/A",
+        "Organism": organism,
+        "Treatment": treatment,
+        "Genotype": genotype,
+        "Technique": tech
+    })
+
+print("Parsed rows:", len(rows))
+print("Example row:", rows[0] if rows else "N/A")
+
+print("\nUpdated Plan:")
+print(f"1. [✓] {plan[0]} (completed)")
+print(f"2. [✓] {plan[1]} (completed)")
+print(f"3. [ ] {plan[2]}")
+
+# Step 3
+print("\nStep 3: Writing CSV to", out_csv)
+headers = ["Sample Name", "Source Project ID", "Cell Line/Tissue", "Organism", "Treatment", "Genotype", "Technique"]
+with open(out_csv, "w", newline="") as f:
+    w = csv.DictWriter(f, fieldnames=headers)
+    w.writeheader()
+    for r in rows:
+        out = {}
+        for h in headers:
+            v = r.get(h, "N/A")
+            if v is None or str(v).strip() == "":
+                v = "N/A"
+            out[h] = v
+        w.writerow(out)
+
+print("\nWrote CSV. Preview (first 5 lines):")
+with open(out_csv, "r") as f:
+    for i in range(5):
+        print(f.readline().rstrip("\n"))
+
+print("\nFinal Updated Plan:")
+print(f"1. [✓] {plan[0]} (completed)")
+print(f"2. [✓] {plan[1]} (completed)")
+print(f"3. [✓] {plan[2]} (completed)")
+print("\nDone. Output written to:", out_csv)</execute>
+<observation>NameError("name '_re' is not defined")</observation>
+<execute>#!/usr/bin/env python3
+# The repeated NameError suggests the sandbox may be executing lines selectively.
+# To be robust, avoid relying on any imported module names and use only Python built-ins
+# plus the 'regex' module accessed via __import__ locally each time.
+
+print("Plan:")
+plan = [
+"Query GEO for GSE116315 and obtain all GSM accessions (samples).",
+"Parse each GSM record (via GSE family SOFT) to extract required metadata fields.",
+"Normalize fields (Treatment combo formatting, N/A), assemble table, and write CSV to required path."
+]
+for i, s in enumerate(plan, 1):
+    print(f"{i}. [ ] {s}")
+
+import os, csv, gzip
+from urllib.request import urlopen
+
+tmp_dir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/dda_extract/"
+out_csv = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/dda_extract.csv"
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(out_csv), exist_ok=True)
+
+gse = "GSE116315"
+gse_soft_url = f"https://ftp.ncbi.nlm.nih.gov/geo/series/{gse[:-3]}nnn/{gse}/soft/{gse}_family.soft.gz"
+
+# Helper to access re without assuming a global name survives
+def R():
+    return __import__("re")
+
+# Step 1
+print("\nStep 1: Downloading GSE family SOFT:", gse_soft_url)
+gz_path = os.path.join(tmp_dir, f"{gse}_family.soft.gz")
+data = urlopen(gse_soft_url).read()
+with open(gz_path, "wb") as f:
+    f.write(data)
+text = gzip.decompress(data).decode("utf-8", errors="replace")
+gsm_list = sorted(set(R().findall(r"\^SAMPLE = (GSM\d+)", text)))
+
+print("Found GSM count:", len(gsm_list))
+print("First 10 GSMs:", gsm_list[:10])
+
+print("\nUpdated Plan:")
+print(f"1. [✓] {plan[0]} (completed; {len(gsm_list)} samples)")
+print(f"2. [ ] {plan[1]}")
+print(f"3. [ ] {plan[2]}")
+
+with open(os.path.join(tmp_dir, "gsm_list.txt"), "w") as f:
+    f.write("\n".join(gsm_list))
+
+# Step 2
+print("\nStep 2: Parsing SAMPLE blocks from family SOFT...")
+sections = R().split(r"(?m)^\^SAMPLE = ", text)
+sample_blocks = {}
+for sec in sections[1:]:
+    lines = sec.splitlines()
+    gsm = lines[0].strip()
+    sample_blocks[gsm] = sec
+
+def get_field(block, key):
+    vals = []
+    pattern = r"(?m)^!Sample_" + R().escape(key) + r" = (.*)$"
+    for m in R().finditer(pattern, block):
+        vals.append(m.group(1).strip())
+    return vals
+
+def first_or_na(lst):
+    return lst[0] if lst else "N/A"
+
+rows = []
+for gsm in gsm_list:
+    block = sample_blocks.get(gsm, "")
+    title = first_or_na(get_field(block, "title"))
+    organism = first_or_na(get_field(block, "organism_ch1"))
+    source = first_or_na(get_field(block, "source_name_ch1"))
+    characteristics = get_field(block, "characteristics_ch1")
+
+    cell = "N/A"
+    treatment = "N/A"
+    genotype = "N/A"
+
+    for c in characteristics:
+        if ":" in c:
+            k, v = c.split(":", 1)
+            k = k.strip().lower()
+            v = v.strip()
+            if any(x in k for x in ["cell line", "cellline", "tissue", "cell type", "celltype", "organ", "source"]):
+                if cell == "N/A":
+                    cell = v
+            if any(x in k for x in ["treatment", "drug", "stimulation", "condition", "exposure"]):
+                if treatment == "N/A":
+                    treatment = v
+            if any(x in k for x in ["genotype", "strain", "mutation", "knockout", "transgene", "ko"]):
+                if genotype == "N/A":
+                    genotype = v
+
+    if cell == "N/A" and source != "N/A":
+        cell = source
+
+    tech = first_or_na(get_field(block, "library_strategy"))
+    if tech == "N/A":
+        tech = first_or_na(get_field(block, "type"))
+
+    if treatment != "N/A":
+        treatment = R().sub(r"\s*\+\s*", "+", treatment)
+        treatment = R().sub(r"\s*(,|;|\band\b)\s*", "+", treatment, flags=R().I)
+        treatment = R().sub(r"\++", "+", treatment).strip("+")
+
+    sample_name = f"{gsm}-{title if title != 'N/A' else gsm}"
+
+    rows.append({
+        "Sample Name": sample_name,
+        "Source Project ID": gse,
+        "Cell Line/Tissue": cell if cell else "N/A",
+        "Organism": organism,
+        "Treatment": treatment,
+        "Genotype": genotype,
+        "Technique": tech
+    })
+
+print("Parsed rows:", len(rows))
+print("Example row:", rows[0] if rows else "N/A")
+
+print("\nUpdated Plan:")
+print(f"1. [✓] {plan[0]} (completed)")
+print(f"2. [✓] {plan[1]} (completed)")
+print(f"3. [ ] {plan[2]}")
+
+# Step 3
+print("\nStep 3: Writing CSV to", out_csv)
+headers = ["Sample Name", "Source Project ID", "Cell Line/Tissue", "Organism", "Treatment", "Genotype", "Technique"]
+with open(out_csv, "w", newline="") as f:
+    w = csv.DictWriter(f, fieldnames=headers)
+    w.writeheader()
+    for r in rows:
+        out = {}
+        for h in headers:
+            v = r.get(h, "N/A")
+            if v is None or str(v).strip() == "":
+                v = "N/A"
+            out[h] = v
+        w.writerow(out)
+
+print("\nWrote CSV. Preview (first 5 lines):")
+with open(out_csv, "r") as f:
+    for _ in range(5):
+        line = f.readline()
+        if not line:
+            break
+        print(line.rstrip("\n"))
+
+print("\nFinal Updated Plan:")
+print(f"1. [✓] {plan[0]} (completed)")
+print(f"2. [✓] {plan[1]} (completed)")
+print(f"3. [✓] {plan[2]} (completed)")
+print("\nDone. Output written to:", out_csv)</execute>
+<observation>NameError("name 'R' is not defined")</observation>
+<execute>#!/usr/bin/env python3
+# The environment appears to be evaluating in a way that loses earlier definitions.
+# Therefore, do everything WITHOUT helper functions and WITHOUT regex,
+# using only plain string operations.
+
+import os, csv, gzip
+from urllib.request import urlopen
+
+tmp_dir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/dda_extract/"
+out_csv = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/dda_extract.csv"
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(out_csv), exist_ok=True)
+
+print("Plan:")
+plan = [
+"Query GEO for GSE116315 and obtain all GSM accessions (samples).",
+"Parse each GSM record (via GSE family SOFT) to extract required metadata fields.",
+"Normalize fields (Treatment combo formatting, N/A), assemble table, and write CSV to required path."
+]
+for i, s in enumerate(plan, 1):
+    print(f"{i}. [ ] {s}")
+
+gse = "GSE116315"
+gse_soft_url = f"https://ftp.ncbi.nlm.nih.gov/geo/series/{gse[:-3]}nnn/{gse}/soft/{gse}_family.soft.gz"
+
+# ----------------
+# Step 1
+# ----------------
+print("\nStep 1: Downloading GSE family SOFT:", gse_soft_url)
+gz_path = os.path.join(tmp_dir, f"{gse}_family.soft.gz")
+data = urlopen(gse_soft_url).read()
+with open(gz_path, "wb") as f:
+    f.write(data)
+text = gzip.decompress(data).decode("utf-8", errors="replace")
+
+# Extract GSM list via line scanning (no regex)
+gsm_set = set()
+for line in text.splitlines():
+    if line.startswith("^SAMPLE = GSM"):
+        gsm = line.split("=", 1)[1].strip()
+        gsm_set.add(gsm)
+gsm_list = sorted(gsm_set)
+
+print("Found GSM count:", len(gsm_list))
+print("First 10 GSMs:", gsm_list[:10])
+
+print("\nUpdated Plan:")
+print(f"1. [✓] {plan[0]} (completed; {len(gsm_list)} samples)")
+print(f"2. [ ] {plan[1]}")
+print(f"3. [ ] {plan[2]}")
+
+with open(os.path.join(tmp_dir, "gsm_list.txt"), "w") as f:
+    f.write("\n".join(gsm_list))
+
+# ----------------
+# Step 2
+# ----------------
+print("\nStep 2: Parsing SAMPLE blocks from family SOFT (no regex)...")
+
+# Build blocks by scanning lines
+sample_blocks = {}
+current_gsm = None
+current_lines = []
+for line in text.splitlines():
+    if line.startswith("^SAMPLE = "):
+        # flush previous
+        if current_gsm is not None:
+            sample_blocks[current_gsm] = "\n".join(current_lines)
+        current_gsm = line.split("=", 1)[1].strip()
+        current_lines = [line]
+    else:
+        if current_gsm is not None:
+            current_lines.append(line)
+# flush last
+if current_gsm is not None and current_lines:
+    sample_blocks[current_gsm] = "\n".join(current_lines)
+
+def first_or_na(values):
+    return values[0] if values else "N/A"
+
+rows = []
+for gsm in gsm_list:
+    block = sample_blocks.get(gsm, "")
+    title_vals = []
+    org_vals = []
+    source_vals = []
+    char_vals = []
+    libstrat_vals = []
+    type_vals = []
+
+    for line in block.splitlines():
+        if line.startswith("!Sample_title = "):
+            title_vals.append(line.split("=", 1)[1].strip())
+        elif line.startswith("!Sample_organism_ch1 = "):
+            org_vals.append(line.split("=", 1)[1].strip())
+        elif line.startswith("!Sample_source_name_ch1 = "):
+            source_vals.append(line.split("=", 1)[1].strip())
+        elif line.startswith("!Sample_characteristics_ch1 = "):
+            char_vals.append(line.split("=", 1)[1].strip())
+        elif line.startswith("!Sample_library_strategy = "):
+            libstrat_vals.append(line.split("=", 1)[1].strip())
+        elif line.startswith("!Sample_type = "):
+            type_vals.append(line.split("=", 1)[1].strip())
+
+    title = first_or_na(title_vals)
+    organism = first_or_na(org_vals)
+    source = first_or_na(source_vals)
+
+    cell = "N/A"
+    treatment = "N/A"
+    genotype = "N/A"
+
+    for c in char_vals:
+        if ":" in c:
+            k, v = c.split(":", 1)
+            k = k.strip().lower()
+            v = v.strip()
+            if cell == "N/A" and ("cell line" in k or "cellline" in k or "tissue" in k or "cell type" in k or "celltype" in k or "organ" in k or "source" in k):
+                cell = v
+            if treatment == "N/A" and ("treatment" in k or "drug" in k or "stimulation" in k or "condition" in k or "exposure" in k):
+                treatment = v
+            if genotype == "N/A" and ("genotype" in k or "strain" in k or "mutation" in k or "knockout" in k or "transgene" in k or k == "ko"):
+                genotype = v
+
+    if cell == "N/A" and source != "N/A":
+        cell = source
+
+    tech = first_or_na(libstrat_vals)
+    if tech == "N/A":
+        tech = first_or_na(type_vals)
+
+    # Treatment normalization without regex:
+    # - remove spaces around '+'
+    # - replace ' and ' / ',' / ';' with '+'
+    if treatment != "N/A":
+        treatment = treatment.replace(" + ", "+").replace("+ ", "+").replace(" +", "+")
+        for sep in [",", ";"]:
+            treatment = treatment.replace(sep, "+")
+        # normalize ' and ' (case-insensitive-ish using multiple replaces)
+        treatment = treatment.replace(" and ", "+").replace(" AND ", "+").replace(" And ", "+")
+        # collapse multiple pluses
+        while "++" in treatment:
+            treatment = treatment.replace("++", "+")
+        treatment = treatment.strip("+").strip()
+
+    sample_name = f"{gsm}-{title if title != 'N/A' else gsm}"
+
+    rows.append({
+        "Sample Name": sample_name if sample_name else "N/A",
+        "Source Project ID": gse,
+        "Cell Line/Tissue": cell if cell else "N/A",
+        "Organism": organism if organism else "N/A",
+        "Treatment": treatment if treatment else "N/A",
+        "Genotype": genotype if genotype else "N/A",
+        "Technique": tech if tech else "N/A"
+    })
+
+print("Parsed rows:", len(rows))
+print("Example row:", rows[0] if rows else "N/A")
+
+print("\nUpdated Plan:")
+print(f"1. [✓] {plan[0]} (completed)")
+print(f"2. [✓] {plan[1]} (completed)")
+print(f"3. [ ] {plan[2]}")
+
+# ----------------
+# Step 3
+# ----------------
+print("\nStep 3: Writing CSV to", out_csv)
+headers = ["Sample Name", "Source Project ID", "Cell Line/Tissue", "Organism", "Treatment", "Genotype", "Technique"]
+with open(out_csv, "w", newline="") as f:
+    w = csv.DictWriter(f, fieldnames=headers)
+    w.writeheader()
+    for r in rows:
+        w.writerow({h: (r.get(h) if (r.get(h) not in [None, ""] ) else "N/A") for h in headers})
+
+print("\nWrote CSV. Preview (first 5 lines):")
+with open(out_csv, "r") as f:
+    for _ in range(5):
+        line = f.readline()
+        if not line:
+            break
+        print(line.rstrip("\n"))
+
+print("\nFinal Updated Plan:")
+print(f"1. [✓] {plan[0]} (completed)")
+print(f"2. [✓] {plan[1]} (completed)")
+print(f"3. [✓] {plan[2]} (completed)")
+print("\nDone. Output written to:", out_csv)</execute>
+<observation>NameError("name 'r' is not defined")</observation>
+<execute>#!/usr/bin/env python3
+# Fully linear script with NO function defs, to avoid any sandbox oddities.
+
+import os, csv, gzip
+from urllib.request import urlopen
+
+tmp_dir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/dda_extract/"
+out_csv = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/dda_extract.csv"
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(out_csv), exist_ok=True)
+
+print("Plan:")
+plan1 = "Query GEO for GSE116315 and obtain all GSM accessions (samples)."
+plan2 = "Parse each GSM record (via GSE family SOFT) to extract required metadata fields."
+plan3 = "Normalize fields (Treatment combo formatting, N/A), assemble table, and write CSV to required path."
+print("1. [ ] " + plan1)
+print("2. [ ] " + plan2)
+print("3. [ ] " + plan3)
+
+gse = "GSE116315"
+gse_soft_url = "https://ftp.ncbi.nlm.nih.gov/geo/series/" + gse[:-3] + "nnn/" + gse + "/soft/" + gse + "_family.soft.gz"
+
+# Step 1
+print("\nStep 1: Downloading GSE family SOFT:", gse_soft_url)
+gz_path = os.path.join(tmp_dir, gse + "_family.soft.gz")
+data = urlopen(gse_soft_url).read()
+with open(gz_path, "wb") as f:
+    f.write(data)
+text = gzip.decompress(data).decode("utf-8", errors="replace")
+
+gsm_set = set()
+for line in text.splitlines():
+    if line.startswith("^SAMPLE = GSM"):
+        gsm_set.add(line.split("=", 1)[1].strip())
+gsm_list = sorted(gsm_set)
+
+print("Found GSM count:", len(gsm_list))
+print("First 10 GSMs:", gsm_list[:10])
+
+print("\nUpdated Plan:")
+print("1. [✓] " + plan1 + " (completed; " + str(len(gsm_list)) + " samples)")
+print("2. [ ] " + plan2)
+print("3. [ ] " + plan3)
+
+with open(os.path.join(tmp_dir, "gsm_list.txt"), "w") as f:
+    f.write("\n".join(gsm_list))
+
+# Step 2
+print("\nStep 2: Parsing SAMPLE blocks from family SOFT...")
+
+sample_blocks = {}
+current_gsm = None
+current_lines = []
+for line in text.splitlines():
+    if line.startswith("^SAMPLE = "):
+        if current_gsm is not None:
+            sample_blocks[current_gsm] = "\n".join(current_lines)
+        current_gsm = line.split("=", 1)[1].strip()
+        current_lines = [line]
+    else:
+        if current_gsm is not None:
+            current_lines.append(line)
+if current_gsm is not None and current_lines:
+    sample_blocks[current_gsm] = "\n".join(current_lines)
+
+rows = []
+for gsm in gsm_list:
+    block = sample_blocks.get(gsm, "")
+    title = "N/A"
+    organism = "N/A"
+    source = "N/A"
+    characteristics = []
+    lib_strategy = "N/A"
+    sample_type = "N/A"
+
+    for line in block.splitlines():
+        if title == "N/A" and line.startswith("!Sample_title = "):
+            title = line.split("=", 1)[1].strip()
+        elif organism == "N/A" and line.startswith("!Sample_organism_ch1 = "):
+            organism = line.split("=", 1)[1].strip()
+        elif source == "N/A" and line.startswith("!Sample_source_name_ch1 = "):
+            source = line.split("=", 1)[1].strip()
+        elif line.startswith("!Sample_characteristics_ch1 = "):
+            characteristics.append(line.split("=", 1)[1].strip())
+        elif lib_strategy == "N/A" and line.startswith("!Sample_library_strategy = "):
+            lib_strategy = line.split("=", 1)[1].strip()
+        elif sample_type == "N/A" and line.startswith("!Sample_type = "):
+            sample_type = line.split("=", 1)[1].strip()
+
+    cell = "N/A"
+    treatment = "N/A"
+    genotype = "N/A"
+
+    for c in characteristics:
+        if ":" in c:
+            k, v = c.split(":", 1)
+            k = k.strip().lower()
+            v = v.strip()
+            if cell == "N/A" and ("cell line" in k or "cellline" in k or "tissue" in k or "cell type" in k or "celltype" in k or "organ" in k or "source" in k):
+                cell = v
+            if treatment == "N/A" and ("treatment" in k or "drug" in k or "stimulation" in k or "condition" in k or "exposure" in k):
+                treatment = v
+            if genotype == "N/A" and ("genotype" in k or "strain" in k or "mutation" in k or "knockout" in k or "transgene" in k or k == "ko"):
+                genotype = v
+
+    if cell == "N/A" and source != "N/A":
+        cell = source
+
+    technique = lib_strategy if lib_strategy != "N/A" else sample_type
+
+    if treatment != "N/A":
+        treatment = treatment.replace(" + ", "+").replace("+ ", "+").replace(" +", "+")
+        treatment = treatment.replace(",", "+").replace(";", "+")
+        treatment = treatment.replace(" and ", "+").replace(" AND ", "+").replace(" And ", "+")
+        while "++" in treatment:
+            treatment = treatment.replace("++", "+")
+        treatment = treatment.strip().strip("+").strip()
+
+    sample_name = gsm + "-" + (title if title != "N/A" else gsm)
+
+    rows.append([
+        sample_name if sample_name else "N/A",
+        gse,
+        cell if cell else "N/A",
+        organism if organism else "N/A",
+        treatment if treatment else "N/A",
+        genotype if genotype else "N/A",
+        technique if technique else "N/A"
+    ])
+
+print("Parsed rows:", len(rows))
+print("Example row:", rows[0] if rows else "N/A")
+
+print("\nUpdated Plan:")
+print("1. [✓] " + plan1 + " (completed)")
+print("2. [✓] " + plan2 + " (completed)")
+print("3. [ ] " + plan3)
+
+# Step 3
+print("\nStep 3: Writing CSV to", out_csv)
+headers = ["Sample Name", "Source Project ID", "Cell Line/Tissue", "Organism", "Treatment", "Genotype", "Technique"]
+with open(out_csv, "w", newline="") as f:
+    w = csv.writer(f)
+    w.writerow(headers)
+    for row in rows:
+        # ensure N/A for empties
+        fixed = []
+        for v in row:
+            if v is None or (isinstance(v, str) and v.strip() == ""):
+                fixed.append("N/A")
+            else:
+                fixed.append(v)
+        w.writerow(fixed)
+
+print("\nWrote CSV. Preview (first 5 lines):")
+with open(out_csv, "r") as f:
+    for _ in range(5):
+        line = f.readline()
+        if not line:
+            break
+        print(line.rstrip("\n"))
+
+print("\nFinal Updated Plan:")
+print("1. [✓] " + plan1 + " (completed)")
+print("2. [✓] " + plan2 + " (completed)")
+print("3. [✓] " + plan3 + " (completed)")
+print("\nDone. Output written to:", out_csv)</execute>
+<observation>Plan:
+1. [ ] Query GEO for GSE116315 and obtain all GSM accessions (samples).
+2. [ ] Parse each GSM record (via GSE family SOFT) to extract required metadata fields.
+3. [ ] Normalize fields (Treatment combo formatting, N/A), assemble table, and write CSV to required path.
+
+Step 1: Downloading GSE family SOFT: https://ftp.ncbi.nlm.nih.gov/geo/series/GSE116nnn/GSE116315/soft/GSE116315_family.soft.gz
+Found GSM count: 14
+First 10 GSMs: ['GSM3227944', 'GSM3227945', 'GSM3227946', 'GSM3227947', 'GSM3227948', 'GSM3227949', 'GSM3227950', 'GSM3227951', 'GSM3227952', 'GSM3227953']
+
+Updated Plan:
+1. [✓] Query GEO for GSE116315 and obtain all GSM accessions (samples). (completed; 14 samples)
+2. [ ] Parse each GSM record (via GSE family SOFT) to extract required metadata fields.
+3. [ ] Normalize fields (Treatment combo formatting, N/A), assemble table, and write CSV to required path.
+
+Step 2: Parsing SAMPLE blocks from family SOFT...
+Parsed rows: 14
+Example row: ['GSM3227944-ES1: END_seq_aB_28h_HU_28h_10mM_rep1', 'GSE116315', 'Activated primary B cells', 'Mus musculus', 'N/A', 'WT', 'OTHER']
+
+Updated Plan:
+1. [✓] Query GEO for GSE116315 and obtain all GSM accessions (samples). (completed)
+2. [✓] Parse each GSM record (via GSE family SOFT) to extract required metadata fields. (completed)
+3. [ ] Normalize fields (Treatment combo formatting, N/A), assemble table, and write CSV to required path.
+
+Step 3: Writing CSV to /root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/dda_extract.csv
+
+Wrote CSV. Preview (first 5 lines):
+Sample Name,Source Project ID,Cell Line/Tissue,Organism,Treatment,Genotype,Technique
+GSM3227944-ES1: END_seq_aB_28h_HU_28h_10mM_rep1,GSE116315,Activated primary B cells,Mus musculus,N/A,WT,OTHER
+GSM3227945-ES2: END_seq_aB_28h_HU_28h_10mM_rep2,GSE116315,Activated primary B cells,Mus musculus,N/A,WT,OTHER
+GSM3227946-ES3: END_seq_aB_28h_HU_6h_10mM_rep1,GSE116315,Activated primary B cells,Mus musculus,N/A,WT,OTHER
+GSM3227947-ES4: END_seq_aB_28h_NT_rep1,GSE116315,Activated primary B cells,Mus musculus,N/A,WT,OTHER
+
+Final Updated Plan:
+1. [✓] Query GEO for GSE116315 and obtain all GSM accessions (samples). (completed)
+2. [✓] Parse each GSM record (via GSE family SOFT) to extract required metadata fields. (completed)
+3. [✓] Normalize fields (Treatment combo formatting, N/A), assemble table, and write CSV to required path. (completed)
+
+Done. Output written to: /root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/dda_extract.csv
+</observation>
+<solution>
+Saved CSV to: /root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/dda_extract.csv
+
+Intermediate files stored in: /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/dda_extract/
+</solution>

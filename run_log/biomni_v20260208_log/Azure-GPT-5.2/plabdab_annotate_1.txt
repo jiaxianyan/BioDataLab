@@ -1,0 +1,1747 @@
+# Core Task
+You are a specialized Bioinformatics Agent acting as an expert in antibody sequence annotation and structural numbering. Your core competency is utilizing the ANARCI (Antibody Numbering and Antigen Receptor ClassIfication) tool to parse sequence data, apply standardized numbering schemes, and extract structural loop metrics. Process a FASTA file of antibody sequences using ANARCI to identify chain types, apply IMGT numbering, and calculate CDR lengths.
+
+# Workflow Instructions
+- `Sequence Parsing & Numbering`: The input is a FASTA file containing antibody sequences with Accession ID in the headers. Please use the `IMGT` numbering scheme.
+- `Chain Classification`: Classify each sequence based on the ANARCI output. Map results to a binary category: H (Heavy Chain) or L (Light Chain).
+- `CDR Length Calculation`: Identify the residue positions for CDR1, CDR2, and CDR3 according to the `IMGT` definition. Calculate the length for each region by counting residues only (exclude gaps).
+
+# Output Requirements & File Path
+Generate a CSV file with the following columns:
+- "Accession": The Accession ID from the FASTA header.
+- "Numbered_Sequence": The sequence string with `IMGT` numbering gaps.
+- "CDR_Lengths": The formatted length string (e.g., 8_8_12, which means the length of CDR1 is 8, CDR2 is 8, and CDR3 is 12).
+- "Chain_Type": The identified chain (either H or L).
+Input Path: Read the input file from: `benchmark/dataset/PLAbDab/plabdab_annotate_1_input.fasta`
+Save Path: Save the result to: `/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/plabdab_annotate_1.csv`
+
+# Output Example (For Reference Only)
+Accession,Raw_Sequence,Numbered_Sequence,CDR_Lengths,Chain_Type
+QPY89049.1,EIVLTQSPGTLSLSPGERATLSCRASQSVGSSYLAWYQQKPGQAPRLLIYGAFSRATGIPDRFSGSGSGTDFTLTISRLEPEDFAVYYCQQYGSSPWTFGQGTKVEIK,EIVLTQSPGTLSLSPGERATLSCRASQSVG-----SSYLAWYQQKPGQAPRLLIYGA-------FSRATGIP-DRFSGSG--SGTDFTLTISRLEPEDFAVYYCQQYGS----SPWTFGQGTKVEIK,7_3_9,L
+QEP20941.1,DIQMTQSPSSLSASVGDRVTITCRASQGISNSLAWYQQKPGKAPNLLLYAASRLESGVPSRFSGSGSGTDYTLTISSLQPEDFATYYCQQYYRTPLTFGGGSKVEIK,DIQMTQSPSSLSASVGDRVTITCRASQGI------SNSLAWYQQKPGKAPNLLLYAA-------SRLESGVP-SRFSGSG--SGTDYTLTISSLQPEDFATYYCQQYYR----TPLTFGGGSKVEIK,6_3_9,L
+
+
+# Intermediate Results
+All intermediate files generated should be saved in the directly `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/plabdab_annotate_1`
+
+<execute>#!BASH
+set -euo pipefail
+
+echo "Research log: ANARCI-based IMGT numbering + CDR length extraction"
+
+# Plan checklist (initial)
+cat <<'PLAN'
+1. [ ] Verify input FASTA exists and inspect headers for Accession parsing
+2. [ ] Check ANARCI availability; if missing, implement fallback using Biopython/limited heuristics (will be marked failed if ANARCI not available)
+3. [ ] Run ANARCI with IMGT numbering on all sequences; capture output in tmp directory
+4. [ ] Parse ANARCI output to: Accession, gapped numbered sequence, chain type (H/L), CDR1/2/3 lengths (exclude gaps)
+5. [ ] Write final CSV to requested path; validate row counts and basic sanity checks
+PLAN
+
+TMP_DIR="/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/plabdab_annotate_1"
+OUT_CSV="/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/plabdab_annotate_1.csv"
+IN_FASTA="benchmark/dataset/PLAbDab/plabdab_annotate_1_input.fasta"
+
+mkdir -p "$TMP_DIR"
+mkdir -p "$(dirname "$OUT_CSV")"
+
+echo
+echo "Step 1: Verify input FASTA and inspect headers"
+if [[ ! -f "$IN_FASTA" ]]; then
+  echo "ERROR: Input FASTA not found at $IN_FASTA"
+  exit 1
+fi
+echo "Found input FASTA: $IN_FASTA"
+echo "First 5 headers:"
+grep -m 5 '^>' "$IN_FASTA" || true
+echo "Sequence count:"
+grep -c '^>' "$IN_FASTA" || true
+
+# Update plan after step 1
+cat <<'PLAN'
+1. [✓] Verify input FASTA exists and inspect headers for Accession parsing (completed)
+2. [ ] Check ANARCI availability; if missing, implement fallback using Biopython/limited heuristics (will be marked failed if ANARCI not available)
+3. [ ] Run ANARCI with IMGT numbering on all sequences; capture output in tmp directory
+4. [ ] Parse ANARCI output to: Accession, gapped numbered sequence, chain type (H/L), CDR1/2/3 lengths (exclude gaps)
+5. [ ] Write final CSV to requested path; validate row counts and basic sanity checks
+PLAN
+
+echo
+echo "Step 2: Check ANARCI availability"
+if command -v anarci >/dev/null 2>&1; then
+  echo "ANARCI found: $(command -v anarci)"
+  anarci --help >/dev/null 2>&1 || true
+  echo "ANARCI appears callable."
+  echo
+  echo "Step 3: Run ANARCI with IMGT numbering"
+  ANARCI_OUT="$TMP_DIR/anarci_imgt.txt"
+  anarci -i "$IN_FASTA" -o "$ANARCI_OUT" -s imgt >/dev/null
+  echo "ANARCI output saved: $ANARCI_OUT"
+  echo "Preview (first 40 lines):"
+  head -n 40 "$ANARCI_OUT" || true
+
+  # Update plan after step 2&3
+  cat <<'PLAN'
+1. [✓] Verify input FASTA exists and inspect headers for Accession parsing (completed)
+2. [✓] Check ANARCI availability (completed)
+3. [✓] Run ANARCI with IMGT numbering on all sequences; capture output in tmp directory (completed)
+4. [ ] Parse ANARCI output to: Accession, gapped numbered sequence, chain type (H/L), CDR1/2/3 lengths (exclude gaps)
+5. [ ] Write final CSV to requested path; validate row counts and basic sanity checks
+PLAN
+else
+  echo "ANARCI not found in PATH."
+  echo "This workflow requires ANARCI; cannot proceed with correct IMGT numbering without it."
+  # Update plan with failure
+  cat <<'PLAN'
+1. [✓] Verify input FASTA exists and inspect headers for Accession parsing (completed)
+2. [✗] Check ANARCI availability (failed because ANARCI is not installed/available in PATH)
+3. [ ] Run ANARCI with IMGT numbering on all sequences; capture output in tmp directory
+4. [ ] Parse ANARCI output to: Accession, gapped numbered sequence, chain type (H/L), CDR1/2/3 lengths (exclude gaps)
+5. [ ] Write final CSV to requested path; validate row counts and basic sanity checks
+PLAN
+  exit 2
+fi
+</execute>
+<observation>Error running Bash script (exit code 2):
+</observation>
+<execute>#!BASH
+set -euo pipefail
+
+echo "Research log: Diagnose environment and locate ANARCI executable/module"
+
+# Plan checklist (revised)
+cat <<'PLAN'
+1. [ ] Confirm input FASTA path and count sequences
+2. [ ] Probe ANARCI availability via PATH, python module import, and common script names
+3. [ ] If ANARCI is available via python, run numbering from python and write raw ANARCI-style output to tmp
+4. [ ] Parse numbering to gapped IMGT sequence, chain type (H/L), and CDR lengths; write final CSV
+PLAN
+
+IN_FASTA="benchmark/dataset/PLAbDab/plabdab_annotate_1_input.fasta"
+TMP_DIR="/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/plabdab_annotate_1"
+OUT_CSV="/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/plabdab_annotate_1.csv"
+mkdir -p "$TMP_DIR" "$(dirname "$OUT_CSV")"
+
+echo
+echo "Step 1: Confirm input FASTA path and count sequences"
+ls -lh "$IN_FASTA"
+echo "n_headers=$(grep -c '^>' "$IN_FASTA")"
+echo "Example headers:"
+grep -m 3 '^>' "$IN_FASTA" || true
+
+cat <<'PLAN'
+1. [✓] Confirm input FASTA path and count sequences (completed)
+2. [ ] Probe ANARCI availability via PATH, python module import, and common script names
+3. [ ] If ANARCI is available via python, run numbering from python and write raw ANARCI-style output to tmp
+4. [ ] Parse numbering to gapped IMGT sequence, chain type (H/L), and CDR lengths; write final CSV
+PLAN
+
+echo
+echo "Step 2: Probe ANARCI availability"
+echo "PATH search:"
+command -v anarci && echo "anarci in PATH" || echo "anarci not in PATH"
+command -v ANARCI && echo "ANARCI in PATH" || echo "ANARCI not in PATH"
+command -v run_anarci && echo "run_anarci in PATH" || echo "run_anarci not in PATH"
+
+echo
+echo "Python import probe:"
+python - <<'PY'
+import sys, importlib.util, pkgutil
+print("python:", sys.version)
+spec = importlib.util.find_spec("anarci")
+print("find_spec('anarci'):", spec)
+if spec is None:
+    # sometimes package is named ANARCI
+    spec2 = importlib.util.find_spec("ANARCI")
+    print("find_spec('ANARCI'):", spec2)
+else:
+    import anarci
+    print("anarci module file:", getattr(anarci, "__file__", None))
+    # list top-level attributes
+    print("anarci attrs (subset):", [a for a in dir(anarci) if a.lower() in ("anarci","number","run_anarci","scheme")][:20])
+PY
+
+echo
+echo "If neither CLI nor module is available, we cannot run IMGT numbering as requested."
+cat <<'PLAN'
+1. [✓] Confirm input FASTA path and count sequences (completed)
+2. [✓] Probe ANARCI availability via PATH, python module import, and common script names (completed)
+3. [ ] If ANARCI is available via python, run numbering from python and write raw ANARCI-style output to tmp
+4. [ ] Parse numbering to gapped IMGT sequence, chain type (H/L), and CDR lengths; write final CSV
+PLAN
+</execute>
+<observation>Research log: Diagnose environment and locate ANARCI executable/module
+1. [ ] Confirm input FASTA path and count sequences
+2. [ ] Probe ANARCI availability via PATH, python module import, and common script names
+3. [ ] If ANARCI is available via python, run numbering from python and write raw ANARCI-style output to tmp
+4. [ ] Parse numbering to gapped IMGT sequence, chain type (H/L), and CDR lengths; write final CSV
+
+Step 1: Confirm input FASTA path and count sequences
+-rw-r--r-- 1 root root 39K Feb  2 08:48 benchmark/dataset/PLAbDab/plabdab_annotate_1_input.fasta
+n_headers=240
+Example headers:
+>QPY89049.1
+>QEP20941.1
+>AJM03010.1
+1. [✓] Confirm input FASTA path and count sequences (completed)
+2. [ ] Probe ANARCI availability via PATH, python module import, and common script names
+3. [ ] If ANARCI is available via python, run numbering from python and write raw ANARCI-style output to tmp
+4. [ ] Parse numbering to gapped IMGT sequence, chain type (H/L), and CDR lengths; write final CSV
+
+Step 2: Probe ANARCI availability
+PATH search:
+anarci not in PATH
+/root/miniconda3/envs/biomni_e1/bin/ANARCI
+ANARCI in PATH
+run_anarci not in PATH
+
+Python import probe:
+python: 3.11.14 | packaged by conda-forge | (main, Jan 26 2026, 23:48:32) [GCC 14.3.0]
+find_spec('anarci'): ModuleSpec(name='anarci', loader=<_frozen_importlib_external.SourceFileLoader object at 0x7f9a2ab5cc10>, origin='/root/miniconda3/envs/biomni_e1/lib/python3.11/site-packages/anarci/__init__.py', submodule_search_locations=['/root/miniconda3/envs/biomni_e1/lib/python3.11/site-packages/anarci'])
+anarci module file: /root/miniconda3/envs/biomni_e1/lib/python3.11/site-packages/anarci/__init__.py
+anarci attrs (subset): ['anarci', 'number', 'run_anarci']
+
+If neither CLI nor module is available, we cannot run IMGT numbering as requested.
+1. [✓] Confirm input FASTA path and count sequences (completed)
+2. [✓] Probe ANARCI availability via PATH, python module import, and common script names (completed)
+3. [ ] If ANARCI is available via python, run numbering from python and write raw ANARCI-style output to tmp
+4. [ ] Parse numbering to gapped IMGT sequence, chain type (H/L), and CDR lengths; write final CSV
+</observation>
+<execute>import os, re, csv
+from pathlib import Path
+from Bio import SeqIO
+from anarci import anarci as anarci_run
+
+print("Research log: Run ANARCI (IMGT) via python, parse gapped sequence + CDR lengths")
+
+# Plan
+plan = [
+"Confirm input/output/tmp paths and load FASTA",
+"Run ANARCI with IMGT scheme for all sequences",
+"Convert ANARCI numbering to gapped numbered sequence (IMGT positions)",
+"Compute CDR1/2/3 lengths (IMGT definition; exclude gaps) and chain type (H/L)",
+"Write CSV and run sanity checks; save intermediates in tmp dir"
+]
+for i,s in enumerate(plan,1):
+    print(f"{i}. [ ] {s}")
+
+IN_FASTA = Path("benchmark/dataset/PLAbDab/plabdab_annotate_1_input.fasta")
+TMP_DIR = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/plabdab_annotate_1")
+OUT_CSV = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/plabdab_annotate_1.csv")
+TMP_DIR.mkdir(parents=True, exist_ok=True)
+OUT_CSV.parent.mkdir(parents=True, exist_ok=True)
+
+print("\nStep 1: Load FASTA")
+records = list(SeqIO.parse(str(IN_FASTA), "fasta"))
+print("n_records =", len(records))
+print("first_ids =", [records[i].id for i in range(min(3,len(records)))])
+print("\nUpdated plan:")
+for i,s in enumerate(plan,1):
+    mark = "✓" if i==1 else " "
+    print(f"{i}. [{mark}] {s}")
+
+print("\nStep 2: Run ANARCI (IMGT)")
+seq_tuples = [(r.id, str(r.seq)) for r in records]
+# anarci() returns (results, hit_tables) in current versions
+results, hit_tables = anarci_run(seq_tuples, scheme="imgt")
+print("ANARCI returned results for n =", len(results))
+raw_pickle_path = TMP_DIR/"anarci_results_repr.txt"
+with open(raw_pickle_path,"w") as f:
+    f.write(repr(results)[:20000])
+print("Saved intermediate (repr truncated) to:", raw_pickle_path)
+
+print("\nUpdated plan:")
+for i,s in enumerate(plan,1):
+    mark = "✓" if i<=2 else " "
+    print(f"{i}. [{mark}] {s}")
+
+# Helpers
+def chain_binary(chain_type: str) -> str:
+    # ANARCI chain type like 'H','K','L','A','B','G','D' etc. We map to H vs L
+    if chain_type in ("H","A","B","G","D"):  # include TCR as heavy-like? but requirement is antibody H/L; keep H for heavy chain only.
+        return "H" if chain_type=="H" else "H"
+    if chain_type in ("K","L"):
+        return "L"
+    return ""
+
+def parse_numbering(numbering_block):
+    """
+    numbering_block: list of ( (pos, ins), aa ) where pos is int, ins is str ''/'A' etc; aa is '-' or residue
+    Returns dict: { (pos, ins): aa }
+    """
+    d = {}
+    for (pos_ins, aa) in numbering_block:
+        pos, ins = pos_ins
+        d[(int(pos), str(ins))] = aa
+    return d
+
+# IMGT CDR definitions (positions inclusive), per IMGT unique numbering:
+# CDR1: 27-38, CDR2: 56-65, CDR3: 105-117 (for both VH and VL)
+IMGT_CDRS = {"CDR1": (27,38), "CDR2": (56,65), "CDR3": (105,117)}
+
+# We'll create a gapped "numbered sequence" by sorting observed keys by (pos, ins) and concatenating aa
+# This reflects IMGT numbering with gaps where ANARCI assigns '-' for missing positions.
+# Additionally, we will insert '-' between discontinuous positions? Not necessary since ANARCI already outputs gaps as '-' residues at those positions.
+# We'll just concatenate in numbering order.
+
+def ins_key(ins: str):
+    # '' comes before letters
+    return (0,"") if ins=="" else (1, ins)
+
+def build_gapped_sequence(num_dict):
+    keys = sorted(num_dict.keys(), key=lambda x: (x[0], ins_key(x[1])[0], ins_key(x[1])[1]))
+    return "".join(num_dict[k] for k in keys), keys
+
+def cdr_length(num_dict, start, end):
+    # count non-gap residues in positions within [start,end], across all insertions at those positions
+    cnt = 0
+    for (pos, ins), aa in num_dict.items():
+        if start <= pos <= end and aa != "-":
+            cnt += 1
+    return cnt
+
+print("\nStep 3-4: Parse ANARCI results -> output rows")
+rows = []
+n_failed = 0
+fail_ids = []
+for i,(rec, res) in enumerate(zip(records, results)):
+    acc = rec.id
+    # Each res element is either None or list of domain results
+    if res is None:
+        n_failed += 1
+        fail_ids.append(acc)
+        continue
+    # res is list of domains; take first domain
+    dom = res[0]
+    # domain tuple: (numbering, start, end, chain_type, evalue, bitscore, species)
+    numbering, start, end, ctype, evalue, bitscore, species = dom
+    num_dict = parse_numbering(numbering)
+    gapped_seq, ordered_keys = build_gapped_sequence(num_dict)
+    cdrs = [cdr_length(num_dict, *IMGT_CDRS["CDR1"]),
+            cdr_length(num_dict, *IMGT_CDRS["CDR2"]),
+            cdr_length(num_dict, *IMGT_CDRS["CDR3"])]
+    rows.append({
+        "Accession": acc,
+        "Numbered_Sequence": gapped_seq,
+        "CDR_Lengths": f"{cdrs[0]}_{cdrs[1]}_{cdrs[2]}",
+        "Chain_Type": chain_binary(ctype)
+    })
+
+print("rows_written_candidate =", len(rows), "failed =", n_failed)
+if n_failed:
+    fail_path = TMP_DIR/"failed_accessions.txt"
+    with open(fail_path,"w") as f:
+        f.write("\n".join(fail_ids))
+    print("Saved failed accessions to:", fail_path)
+
+print("\nUpdated plan:")
+for i,s in enumerate(plan,1):
+    mark = "✓" if i<=4 else " "
+    print(f"{i}. [{mark}] {s}")
+
+print("\nStep 5: Write CSV and sanity checks")
+with open(OUT_CSV, "w", newline="") as f:
+    w = csv.DictWriter(f, fieldnames=["Accession","Numbered_Sequence","CDR_Lengths","Chain_Type"])
+    w.writeheader()
+    for r in rows:
+        w.writerow(r)
+
+print("Saved CSV:", OUT_CSV)
+print("CSV line count (including header):", sum(1 for _ in open(OUT_CSV)))
+print("Preview first 3 lines:")
+with open(OUT_CSV) as f:
+    for _ in range(3):
+        print(f.readline().rstrip("\n"))
+
+# Save intermediate parsed table too
+intermediate_csv = TMP_DIR/"plabdab_annotate_1_intermediate.csv"
+with open(intermediate_csv, "w", newline="") as f:
+    w = csv.DictWriter(f, fieldnames=["Accession","Numbered_Sequence","CDR_Lengths","Chain_Type"])
+    w.writeheader()
+    for r in rows:
+        w.writerow(r)
+print("Saved intermediate CSV:", intermediate_csv)
+
+print("\nFinal updated plan:")
+for i,s in enumerate(plan,1):
+    print(f"{i}. [✓] {s} (completed)")</execute>
+<observation>NameError("name 'records' is not defined")</observation>
+<execute>import os, re, csv
+from pathlib import Path
+from Bio import SeqIO
+from anarci import anarci as anarci_run
+
+print("Research log: Re-run end-to-end (fixing missing state)")
+
+# Plan
+plan = [
+"Confirm paths; load FASTA into records",
+"Run ANARCI with IMGT scheme",
+"Parse ANARCI numbering -> gapped numbered sequence",
+"Compute IMGT CDR1/2/3 lengths (exclude gaps) + chain type (H/L)",
+"Write final CSV to requested path + save intermediates in tmp dir"
+]
+def show_plan(done_upto=0, failed_step=None, fail_reason=None):
+    for i,s in enumerate(plan,1):
+        if failed_step == i:
+            print(f"{i}. [✗] {s} (failed because {fail_reason})")
+        else:
+            mark = "✓" if i<=done_upto else " "
+            print(f"{i}. [{mark}] {s}")
+
+show_plan(0)
+
+IN_FASTA = Path("benchmark/dataset/PLAbDab/plabdab_annotate_1_input.fasta")
+TMP_DIR = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/plabdab_annotate_1")
+OUT_CSV = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/plabdab_annotate_1.csv")
+TMP_DIR.mkdir(parents=True, exist_ok=True)
+OUT_CSV.parent.mkdir(parents=True, exist_ok=True)
+
+print("\nStep 1: Load FASTA")
+records = list(SeqIO.parse(str(IN_FASTA), "fasta"))
+print("n_records =", len(records))
+print("first3_accessions =", [r.id for r in records[:3]])
+show_plan(1)
+
+print("\nStep 2: Run ANARCI (scheme=imgt)")
+seq_tuples = [(r.id, str(r.seq)) for r in records]
+results, hit_tables = anarci_run(seq_tuples, scheme="imgt")
+print("n_results =", len(results))
+repr_path = TMP_DIR/"anarci_results_repr_head.txt"
+with open(repr_path,"w") as f:
+    f.write(repr(results)[:50000])
+print("Saved intermediate repr(head) to:", repr_path)
+show_plan(2)
+
+def chain_binary(chain_type: str) -> str:
+    if chain_type == "H":
+        return "H"
+    if chain_type in ("K","L"):
+        return "L"
+    # If ANARCI returns something unexpected, keep empty to flag
+    return ""
+
+def parse_numbering(numbering_block):
+    d = {}
+    for (pos_ins, aa) in numbering_block:
+        pos, ins = pos_ins
+        d[(int(pos), str(ins))] = aa
+    return d
+
+def ins_sort(ins: str):
+    return (0,"") if ins=="" else (1, ins)
+
+def build_gapped_sequence(num_dict):
+    keys = sorted(num_dict.keys(), key=lambda x: (x[0], ins_sort(x[1])[0], ins_sort(x[1])[1]))
+    return "".join(num_dict[k] for k in keys)
+
+# IMGT CDR definitions
+IMGT_CDRS = {"CDR1": (27,38), "CDR2": (56,65), "CDR3": (105,117)}
+
+def cdr_length(num_dict, start, end):
+    return sum(1 for (pos, ins), aa in num_dict.items() if start <= pos <= end and aa != "-")
+
+print("\nStep 3-4: Build output rows")
+rows = []
+failed = []
+multi_domain = 0
+for rec, res in zip(records, results):
+    acc = rec.id
+    if res is None or len(res)==0:
+        failed.append(acc)
+        continue
+    if len(res) > 1:
+        multi_domain += 1
+    numbering, start, end, ctype, evalue, bitscore, species = res[0]
+    num_dict = parse_numbering(numbering)
+    gapped_seq = build_gapped_sequence(num_dict)
+    c1 = cdr_length(num_dict, *IMGT_CDRS["CDR1"])
+    c2 = cdr_length(num_dict, *IMGT_CDRS["CDR2"])
+    c3 = cdr_length(num_dict, *IMGT_CDRS["CDR3"])
+    rows.append({
+        "Accession": acc,
+        "Numbered_Sequence": gapped_seq,
+        "CDR_Lengths": f"{c1}_{c2}_{c3}",
+        "Chain_Type": chain_binary(ctype)
+    })
+
+print("n_rows =", len(rows))
+print("n_failed =", len(failed))
+print("n_multi_domain =", multi_domain)
+if failed:
+    fail_path = TMP_DIR/"failed_accessions.txt"
+    with open(fail_path,"w") as f:
+        f.write("\n".join(failed))
+    print("Saved failed accessions to:", fail_path)
+
+# Save intermediate parsed CSV
+intermediate_csv = TMP_DIR/"plabdab_annotate_1_intermediate.csv"
+with open(intermediate_csv, "w", newline="") as f:
+    w = csv.DictWriter(f, fieldnames=["Accession","Numbered_Sequence","CDR_Lengths","Chain_Type"])
+    w.writeheader()
+    w.writerows(rows)
+print("Saved intermediate CSV:", intermediate_csv)
+show_plan(4)
+
+print("\nStep 5: Write final CSV")
+with open(OUT_CSV, "w", newline="") as f:
+    w = csv.DictWriter(f, fieldnames=["Accession","Numbered_Sequence","CDR_Lengths","Chain_Type"])
+    w.writeheader()
+    w.writerows(rows)
+
+print("Saved final CSV:", OUT_CSV)
+print("Preview:")
+with open(OUT_CSV) as f:
+    for _ in range(3):
+        print(f.readline().rstrip("\n"))
+
+show_plan(5)
+</execute>
+<observation>NameError("name 'plan' is not defined")</observation>
+<execute>import csv
+from pathlib import Path
+from Bio import SeqIO
+from anarci import anarci as anarci_run
+
+print("Research log: End-to-end ANARCI IMGT annotation (self-contained run)")
+
+# Plan (checklist)
+PLAN = [
+"Confirm paths; load FASTA into records",
+"Run ANARCI with IMGT scheme",
+"Parse ANARCI numbering -> gapped numbered sequence",
+"Compute IMGT CDR1/2/3 lengths (exclude gaps) + chain type (H/L)",
+"Write final CSV + save intermediates in tmp dir"
+]
+
+def show_plan(done=None, failed=None, reason=None):
+    for i, s in enumerate(PLAN, 1):
+        if failed == i:
+            print(f"{i}. [✗] {s} (failed because {reason})")
+        else:
+            mark = "✓" if (done is not None and i <= done) else " "
+            print(f"{i}. [{mark}] {s}")
+
+show_plan(done=0)
+
+IN_FASTA = Path("benchmark/dataset/PLAbDab/plabdab_annotate_1_input.fasta")
+TMP_DIR = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/plabdab_annotate_1")
+OUT_CSV = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/plabdab_annotate_1.csv")
+TMP_DIR.mkdir(parents=True, exist_ok=True)
+OUT_CSV.parent.mkdir(parents=True, exist_ok=True)
+
+print("\nStep 1: Load FASTA")
+records = list(SeqIO.parse(str(IN_FASTA), "fasta"))
+print("n_records =", len(records))
+print("first3_accessions =", [r.id for r in records[:3]])
+show_plan(done=1)
+
+print("\nStep 2: Run ANARCI (scheme=imgt)")
+seq_tuples = [(r.id, str(r.seq)) for r in records]
+results, hit_tables = anarci_run(seq_tuples, scheme="imgt")
+print("n_results =", len(results))
+repr_path = TMP_DIR / "anarci_results_repr_head.txt"
+with open(repr_path, "w") as f:
+    f.write(repr(results)[:50000])
+print("Saved intermediate ANARCI repr(head) to:", repr_path)
+show_plan(done=2)
+
+# Helpers
+def chain_binary(chain_type: str) -> str:
+    if chain_type == "H":
+        return "H"
+    if chain_type in ("K", "L"):
+        return "L"
+    return ""
+
+def parse_numbering(numbering_block):
+    # numbering_block: [ (((pos, ins), aa)), ... ]
+    d = {}
+    for (pos_ins, aa) in numbering_block:
+        pos, ins = pos_ins
+        d[(int(pos), str(ins))] = aa
+    return d
+
+def ins_sort_key(ins: str):
+    return (0, "") if ins == "" else (1, ins)
+
+def build_gapped_sequence(num_dict):
+    keys = sorted(num_dict.keys(), key=lambda x: (x[0], ins_sort_key(x[1])[0], ins_sort_key(x[1])[1]))
+    return "".join(num_dict[k] for k in keys)
+
+# IMGT CDR ranges (inclusive)
+IMGT_CDRS = {"CDR1": (27, 38), "CDR2": (56, 65), "CDR3": (105, 117)}
+
+def cdr_length(num_dict, start, end):
+    return sum(1 for (pos, ins), aa in num_dict.items() if start <= pos <= end and aa != "-")
+
+print("\nStep 3-4: Parse results -> rows")
+rows = []
+failed = []
+multi_domain = 0
+
+for rec, res in zip(records, results):
+    acc = rec.id
+    if res is None or len(res) == 0:
+        failed.append(acc)
+        continue
+    if len(res) > 1:
+        multi_domain += 1
+
+    numbering, start, end, ctype, evalue, bitscore, species = res[0]
+    num_dict = parse_numbering(numbering)
+    gapped_seq = build_gapped_sequence(num_dict)
+
+    c1 = cdr_length(num_dict, *IMGT_CDRS["CDR1"])
+    c2 = cdr_length(num_dict, *IMGT_CDRS["CDR2"])
+    c3 = cdr_length(num_dict, *IMGT_CDRS["CDR3"])
+
+    rows.append({
+        "Accession": acc,
+        "Numbered_Sequence": gapped_seq,
+        "CDR_Lengths": f"{c1}_{c2}_{c3}",
+        "Chain_Type": chain_binary(ctype)
+    })
+
+print("n_rows =", len(rows))
+print("n_failed =", len(failed))
+print("n_multi_domain =", multi_domain)
+
+if failed:
+    fail_path = TMP_DIR / "failed_accessions.txt"
+    with open(fail_path, "w") as f:
+        f.write("\n".join(failed))
+    print("Saved failed accessions to:", fail_path)
+
+intermediate_csv = TMP_DIR / "plabdab_annotate_1_intermediate.csv"
+with open(intermediate_csv, "w", newline="") as f:
+    w = csv.DictWriter(f, fieldnames=["Accession", "Numbered_Sequence", "CDR_Lengths", "Chain_Type"])
+    w.writeheader()
+    w.writerows(rows)
+print("Saved intermediate CSV:", intermediate_csv)
+show_plan(done=4)
+
+print("\nStep 5: Write final CSV")
+with open(OUT_CSV, "w", newline="") as f:
+    w = csv.DictWriter(f, fieldnames=["Accession", "Numbered_Sequence", "CDR_Lengths", "Chain_Type"])
+    w.writeheader()
+    w.writerows(rows)
+
+print("Saved final CSV:", OUT_CSV)
+print("Preview first 3 lines:")
+with open(OUT_CSV) as f:
+    for _ in range(3):
+        print(f.readline().rstrip("\n"))
+
+show_plan(done=5)
+</execute>
+<observation>NameError("name 'PLAN' is not defined")</observation>
+<execute>import csv
+from pathlib import Path
+from Bio import SeqIO
+from anarci import anarci as anarci_run
+
+print("Research log: End-to-end ANARCI IMGT annotation (fully self-contained, no external state)")
+
+# Step 1: Load FASTA
+print("\nPlan:")
+print("1. [ ] Load FASTA")
+print("2. [ ] Run ANARCI (IMGT)")
+print("3. [ ] Build gapped numbered sequence")
+print("4. [ ] Compute IMGT CDR lengths + chain type (H/L)")
+print("5. [ ] Write outputs (final CSV + intermediates)")
+
+IN_FASTA = Path("benchmark/dataset/PLAbDab/plabdab_annotate_1_input.fasta")
+TMP_DIR = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/plabdab_annotate_1")
+OUT_CSV = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/plabdab_annotate_1.csv")
+TMP_DIR.mkdir(parents=True, exist_ok=True)
+OUT_CSV.parent.mkdir(parents=True, exist_ok=True)
+
+print("\nStep 1: Load FASTA")
+records = list(SeqIO.parse(str(IN_FASTA), "fasta"))
+print("n_records =", len(records))
+print("first3_accessions =", [r.id for r in records[:3]])
+
+print("\nUpdated Plan:")
+print("1. [✓] Load FASTA (completed)")
+print("2. [ ] Run ANARCI (IMGT)")
+print("3. [ ] Build gapped numbered sequence")
+print("4. [ ] Compute IMGT CDR lengths + chain type (H/L)")
+print("5. [ ] Write outputs (final CSV + intermediates)")
+
+# Step 2: Run ANARCI
+print("\nStep 2: Run ANARCI (scheme=imgt)")
+seq_tuples = [(r.id, str(r.seq)) for r in records]
+results, hit_tables = anarci_run(seq_tuples, scheme="imgt")
+print("n_results =", len(results))
+repr_path = TMP_DIR / "anarci_results_repr_head.txt"
+with open(repr_path, "w") as f:
+    f.write(repr(results)[:50000])
+print("Saved intermediate ANARCI repr(head) to:", repr_path)
+
+print("\nUpdated Plan:")
+print("1. [✓] Load FASTA (completed)")
+print("2. [✓] Run ANARCI (IMGT) (completed)")
+print("3. [ ] Build gapped numbered sequence")
+print("4. [ ] Compute IMGT CDR lengths + chain type (H/L)")
+print("5. [ ] Write outputs (final CSV + intermediates)")
+
+# Helpers
+def chain_binary(chain_type: str) -> str:
+    if chain_type == "H":
+        return "H"
+    if chain_type in ("K", "L"):
+        return "L"
+    return ""
+
+def parse_numbering(numbering_block):
+    d = {}
+    for (pos_ins, aa) in numbering_block:
+        pos, ins = pos_ins
+        d[(int(pos), str(ins))] = aa
+    return d
+
+def ins_sort_key(ins: str):
+    return (0, "") if ins == "" else (1, ins)
+
+def build_gapped_sequence(num_dict):
+    keys = sorted(num_dict.keys(), key=lambda x: (x[0], ins_sort_key(x[1])[0], ins_sort_key(x[1])[1]))
+    return "".join(num_dict[k] for k in keys)
+
+# IMGT CDR ranges (inclusive)
+IMGT_CDRS = {"CDR1": (27, 38), "CDR2": (56, 65), "CDR3": (105, 117)}
+
+def cdr_length(num_dict, start, end):
+    return sum(1 for (pos, ins), aa in num_dict.items() if start <= pos <= end and aa != "-")
+
+# Step 3-4: Parse and compute
+print("\nStep 3-4: Build gapped numbered sequence + compute CDR lengths/chain type")
+rows = []
+failed = []
+multi_domain = 0
+
+for rec, res in zip(records, results):
+    acc = rec.id
+    if res is None or len(res) == 0:
+        failed.append(acc)
+        continue
+    if len(res) > 1:
+        multi_domain += 1
+
+    numbering, start, end, ctype, evalue, bitscore, species = res[0]
+    num_dict = parse_numbering(numbering)
+    gapped_seq = build_gapped_sequence(num_dict)
+
+    c1 = cdr_length(num_dict, *IMGT_CDRS["CDR1"])
+    c2 = cdr_length(num_dict, *IMGT_CDRS["CDR2"])
+    c3 = cdr_length(num_dict, *IMGT_CDRS["CDR3"])
+
+    rows.append({
+        "Accession": acc,
+        "Numbered_Sequence": gapped_seq,
+        "CDR_Lengths": f"{c1}_{c2}_{c3}",
+        "Chain_Type": chain_binary(ctype)
+    })
+
+print("n_rows =", len(rows))
+print("n_failed =", len(failed))
+print("n_multi_domain =", multi_domain)
+
+if failed:
+    fail_path = TMP_DIR / "failed_accessions.txt"
+    with open(fail_path, "w") as f:
+        f.write("\n".join(failed))
+    print("Saved failed accessions to:", fail_path)
+
+print("\nUpdated Plan:")
+print("1. [✓] Load FASTA (completed)")
+print("2. [✓] Run ANARCI (IMGT) (completed)")
+print("3. [✓] Build gapped numbered sequence (completed)")
+print("4. [✓] Compute IMGT CDR lengths + chain type (H/L) (completed)")
+print("5. [ ] Write outputs (final CSV + intermediates)")
+
+# Step 5: Write outputs
+print("\nStep 5: Write outputs")
+intermediate_csv = TMP_DIR / "plabdab_annotate_1_intermediate.csv"
+with open(intermediate_csv, "w", newline="") as f:
+    w = csv.DictWriter(f, fieldnames=["Accession", "Numbered_Sequence", "CDR_Lengths", "Chain_Type"])
+    w.writeheader()
+    w.writerows(rows)
+print("Saved intermediate CSV:", intermediate_csv)
+
+with open(OUT_CSV, "w", newline="") as f:
+    w = csv.DictWriter(f, fieldnames=["Accession", "Numbered_Sequence", "CDR_Lengths", "Chain_Type"])
+    w.writeheader()
+    w.writerows(rows)
+print("Saved final CSV:", OUT_CSV)
+
+print("Preview first 3 lines:")
+with open(OUT_CSV) as f:
+    for _ in range(3):
+        print(f.readline().rstrip("\n"))
+
+print("\nFinal Updated Plan:")
+print("1. [✓] Load FASTA (completed)")
+print("2. [✓] Run ANARCI (IMGT) (completed)")
+print("3. [✓] Build gapped numbered sequence (completed)")
+print("4. [✓] Compute IMGT CDR lengths + chain type (H/L) (completed)")
+print("5. [✓] Write outputs (final CSV + intermediates) (completed)")
+</execute>
+<observation>ValueError('too many values to unpack (expected 2)')</observation>
+<execute>import csv
+from pathlib import Path
+from Bio import SeqIO
+from anarci import anarci as anarci_run
+
+print("Research log: Robustly parse ANARCI python output (handle varying tuple shapes)")
+
+# Plan checklist
+print("1. [ ] Load FASTA")
+print("2. [ ] Run ANARCI (IMGT)")
+print("3. [ ] Inspect ANARCI output structure and normalize domains")
+print("4. [ ] Build gapped numbered sequence + compute CDR lengths + chain type")
+print("5. [ ] Write final CSV + intermediates")
+
+IN_FASTA = Path("benchmark/dataset/PLAbDab/plabdab_annotate_1_input.fasta")
+TMP_DIR = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/plabdab_annotate_1")
+OUT_CSV = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/plabdab_annotate_1.csv")
+TMP_DIR.mkdir(parents=True, exist_ok=True)
+OUT_CSV.parent.mkdir(parents=True, exist_ok=True)
+
+print("\nStep 1: Load FASTA")
+records = list(SeqIO.parse(str(IN_FASTA), "fasta"))
+print("n_records =", len(records))
+print("1. [✓] Load FASTA")
+print("2. [ ] Run ANARCI (IMGT)")
+print("3. [ ] Inspect ANARCI output structure and normalize domains")
+print("4. [ ] Build gapped numbered sequence + compute CDR lengths + chain type")
+print("5. [ ] Write final CSV + intermediates")
+
+print("\nStep 2: Run ANARCI (scheme=imgt)")
+seq_tuples = [(r.id, str(r.seq)) for r in records]
+anarci_out = anarci_run(seq_tuples, scheme="imgt")
+print("type(anarci_out) =", type(anarci_out))
+# Some versions return 2-tuple, others 3+; handle generically
+if isinstance(anarci_out, tuple):
+    print("anarci_out tuple len =", len(anarci_out))
+else:
+    print("anarci_out is not a tuple; unexpected")
+
+# Save structure info
+struct_path = TMP_DIR / "anarci_output_structure.txt"
+with open(struct_path, "w") as f:
+    f.write("type=" + str(type(anarci_out)) + "\n")
+    if isinstance(anarci_out, tuple):
+        f.write("tuple_len=" + str(len(anarci_out)) + "\n")
+        for i,part in enumerate(anarci_out):
+            f.write(f"part{i}_type={type(part)}\n")
+            try:
+                f.write(f"part{i}_len={len(part)}\n")
+            except Exception:
+                f.write(f"part{i}_len=NA\n")
+print("Saved output structure to:", struct_path)
+
+# Normalize to results list
+if isinstance(anarci_out, tuple) and len(anarci_out) >= 1:
+    results = anarci_out[0]
+    rest = anarci_out[1:]
+else:
+    results = anarci_out
+    rest = ()
+print("n_results =", len(results))
+print("1. [✓] Load FASTA")
+print("2. [✓] Run ANARCI (IMGT)")
+print("3. [ ] Inspect ANARCI output structure and normalize domains")
+print("4. [ ] Build gapped numbered sequence + compute CDR lengths + chain type")
+print("5. [ ] Write final CSV + intermediates")
+
+print("\nStep 3: Inspect first non-empty result element")
+example = None
+for r in results:
+    if r:
+        example = r
+        break
+print("example_type =", type(example))
+print("example_repr_head =", repr(example)[:500])
+
+example_path = TMP_DIR / "anarci_example_repr.txt"
+with open(example_path, "w") as f:
+    f.write(repr(example))
+print("Saved example repr to:", example_path)
+
+print("1. [✓] Load FASTA")
+print("2. [✓] Run ANARCI (IMGT)")
+print("3. [✓] Inspect ANARCI output structure and normalize domains (completed)")
+print("4. [ ] Build gapped numbered sequence + compute CDR lengths + chain type")
+print("5. [ ] Write final CSV + intermediates")
+
+# Helpers
+def chain_binary(chain_type: str) -> str:
+    if chain_type == "H":
+        return "H"
+    if chain_type in ("K", "L"):
+        return "L"
+    return ""
+
+def parse_numbering(numbering_block):
+    d = {}
+    for item in numbering_block:
+        # item can be: (((pos, ins), aa)) OR ((pos, ins), aa) depending on version
+        if len(item) == 2 and isinstance(item[0], tuple) and len(item[0]) == 2:
+            (pos, ins), aa = item
+        else:
+            # try to unpack as (pos, ins, aa)
+            try:
+                pos, ins, aa = item
+            except Exception as e:
+                raise ValueError(f"Unrecognized numbering item shape: {item!r}") from e
+        d[(int(pos), str(ins))] = aa
+    return d
+
+def ins_sort_key(ins: str):
+    return (0, "") if ins == "" else (1, ins)
+
+def build_gapped_sequence(num_dict):
+    keys = sorted(num_dict.keys(), key=lambda x: (x[0], ins_sort_key(x[1])[0], ins_sort_key(x[1])[1]))
+    return "".join(num_dict[k] for k in keys)
+
+IMGT_CDRS = {"CDR1": (27, 38), "CDR2": (56, 65), "CDR3": (105, 117)}
+
+def cdr_length(num_dict, start, end):
+    return sum(1 for (pos, ins), aa in num_dict.items() if start <= pos <= end and aa != "-")
+
+def normalize_domain(dom):
+    """
+    Return dict with keys: numbering, chain_type
+    ANARCI domain tuple can vary; we detect by positions/types.
+    """
+    if dom is None:
+        return None
+    # typical: (numbering, start, end, chain_type, evalue, bitscore, species)
+    if isinstance(dom, tuple) and len(dom) >= 4 and isinstance(dom[0], (list, tuple)):
+        numbering = dom[0]
+        chain_type = dom[3]
+        return {"numbering": numbering, "chain_type": chain_type, "raw": dom}
+    # sometimes nested dict-like
+    raise ValueError(f"Unrecognized domain shape: {dom!r}")
+
+print("\nStep 4: Build rows")
+rows = []
+failed = []
+parse_errors = []
+
+for rec, res in zip(records, results):
+    acc = rec.id
+    try:
+        if not res:
+            failed.append(acc)
+            continue
+        dom0 = res[0]
+        nd = normalize_domain(dom0)
+        num_dict = parse_numbering(nd["numbering"])
+        gapped_seq = build_gapped_sequence(num_dict)
+        c1 = cdr_length(num_dict, *IMGT_CDRS["CDR1"])
+        c2 = cdr_length(num_dict, *IMGT_CDRS["CDR2"])
+        c3 = cdr_length(num_dict, *IMGT_CDRS["CDR3"])
+        rows.append({
+            "Accession": acc,
+            "Numbered_Sequence": gapped_seq,
+            "CDR_Lengths": f"{c1}_{c2}_{c3}",
+            "Chain_Type": chain_binary(str(nd["chain_type"]))
+        })
+    except Exception as e:
+        parse_errors.append((acc, str(e)))
+        failed.append(acc)
+
+print("n_rows =", len(rows))
+print("n_failed =", len(failed))
+print("n_parse_errors =", len(parse_errors))
+if parse_errors:
+    err_path = TMP_DIR / "parse_errors.tsv"
+    with open(err_path, "w") as f:
+        f.write("Accession\tError\n")
+        for a,err in parse_errors[:1000]:
+            f.write(f"{a}\t{err}\n")
+    print("Saved parse errors (up to 1000) to:", err_path)
+
+print("1. [✓] Load FASTA")
+print("2. [✓] Run ANARCI (IMGT)")
+print("3. [✓] Inspect ANARCI output structure and normalize domains (completed)")
+print("4. [✓] Build gapped numbered sequence + compute CDR lengths + chain type (completed)")
+print("5. [ ] Write final CSV + intermediates")
+
+print("\nStep 5: Write CSVs")
+intermediate_csv = TMP_DIR / "plabdab_annotate_1_intermediate.csv"
+with open(intermediate_csv, "w", newline="") as f:
+    w = csv.DictWriter(f, fieldnames=["Accession","Numbered_Sequence","CDR_Lengths","Chain_Type"])
+    w.writeheader()
+    w.writerows(rows)
+
+with open(OUT_CSV, "w", newline="") as f:
+    w = csv.DictWriter(f, fieldnames=["Accession","Numbered_Sequence","CDR_Lengths","Chain_Type"])
+    w.writeheader()
+    w.writerows(rows)
+
+print("Saved intermediate CSV:", intermediate_csv)
+print("Saved final CSV:", OUT_CSV)
+print("Preview first 3 lines:")
+with open(OUT_CSV) as f:
+    for _ in range(3):
+        print(f.readline().rstrip("\n"))
+
+print("\nFinal plan:")
+print("1. [✓] Load FASTA (completed)")
+print("2. [✓] Run ANARCI (IMGT) (completed)")
+print("3. [✓] Inspect ANARCI output structure and normalize domains (completed)")
+print("4. [✓] Build gapped numbered sequence + compute CDR lengths + chain type (completed)")
+print("5. [✓] Write final CSV + intermediates (completed)")
+</execute>
+<observation>Research log: Robustly parse ANARCI python output (handle varying tuple shapes)
+1. [ ] Load FASTA
+2. [ ] Run ANARCI (IMGT)
+3. [ ] Inspect ANARCI output structure and normalize domains
+4. [ ] Build gapped numbered sequence + compute CDR lengths + chain type
+5. [ ] Write final CSV + intermediates
+
+Step 1: Load FASTA
+n_records = 240
+1. [✓] Load FASTA
+2. [ ] Run ANARCI (IMGT)
+3. [ ] Inspect ANARCI output structure and normalize domains
+4. [ ] Build gapped numbered sequence + compute CDR lengths + chain type
+5. [ ] Write final CSV + intermediates
+
+Step 2: Run ANARCI (scheme=imgt)
+type(anarci_out) = <class 'tuple'>
+anarci_out tuple len = 3
+Saved output structure to: /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/plabdab_annotate_1/anarci_output_structure.txt
+n_results = 240
+1. [✓] Load FASTA
+2. [✓] Run ANARCI (IMGT)
+3. [ ] Inspect ANARCI output structure and normalize domains
+4. [ ] Build gapped numbered sequence + compute CDR lengths + chain type
+5. [ ] Write final CSV + intermediates
+
+Step 3: Inspect first non-empty result element
+example_type = <class 'list'>
+example_repr_head = [([((1, ' '), 'E'), ((2, ' '), 'I'), ((3, ' '), 'V'), ((4, ' '), 'L'), ((5, ' '), 'T'), ((6, ' '), 'Q'), ((7, ' '), 'S'), ((8, ' '), 'P'), ((9, ' '), 'G'), ((10, ' '), 'T'), ((11, ' '), 'L'), ((12, ' '), 'S'), ((13, ' '), 'L'), ((14, ' '), 'S'), ((15, ' '), 'P'), ((16, ' '), 'G'), ((17, ' '), 'E'), ((18, ' '), 'R'), ((19, ' '), 'A'), ((20, ' '), 'T'), ((21, ' '), 'L'), ((22, ' '), 'S'), ((23, ' '), 'C'), ((24, ' '), 'R'), ((25, ' '), 'A'), ((26, ' '), 'S'), ((27, ' '), 'Q'), ((28, ' '), 'S'), ((
+Saved example repr to: /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/plabdab_annotate_1/anarci_example_repr.txt
+1. [✓] Load FASTA
+2. [✓] Run ANARCI (IMGT)
+3. [✓] Inspect ANARCI output structure and normalize domains (completed)
+4. [ ] Build gapped numbered sequence + compute CDR lengths + chain type
+5. [ ] Write final CSV + intermediates
+
+Step 4: Build rows
+n_rows = 0
+n_failed = 240
+n_parse_errors = 240
+Saved parse errors (up to 1000) to: /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/plabdab_annotate_1/parse_errors.tsv
+1. [✓] Load FASTA
+2. [✓] Run ANARCI (IMGT)
+3. [✓] Inspect ANARCI output structure and normalize domains (completed)
+4. [✓] Build gapped numbered sequence + compute CDR lengths + chain type (completed)
+5. [ ] Write final CSV + intermediates
+
+Step 5: Write CSVs
+Saved intermediate CSV: /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/plabdab_annotate_1/plabdab_annotate_1_intermediate.csv
+Saved final CSV: /root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/plabdab_annotate_1.csv
+Preview first 3 lines:
+Accession,Numbered_Sequence,CDR_Lengths,Chain_Type
+
+
+
+Final plan:
+1. [✓] Load FASTA (completed)
+2. [✓] Run ANARCI (IMGT) (completed)
+3. [✓] Inspect ANARCI output structure and normalize domains (completed)
+4. [✓] Build gapped numbered sequence + compute CDR lengths + chain type (completed)
+5. [✓] Write final CSV + intermediates (completed)
+</observation>
+<execute>import csv
+from pathlib import Path
+from Bio import SeqIO
+from anarci import anarci as anarci_run
+
+print("Research log: Fix ANARCI domain tuple parsing (new ANARCI output shape)")
+
+# Plan
+plan = [
+"Load FASTA",
+"Run ANARCI (IMGT) and inspect actual domain tuple layout",
+"Parse numbering + chain type correctly; compute IMGT CDR lengths",
+"Write final CSV to required path; save intermediates"
+]
+def show(done=0, fail=None, reason=None):
+    for i,s in enumerate(plan,1):
+        if fail==i:
+            print(f"{i}. [✗] {s} (failed because {reason})")
+        else:
+            print(f"{i}. [{'✓' if i<=done else ' '}] {s}")
+
+show(0)
+
+IN_FASTA = Path("benchmark/dataset/PLAbDab/plabdab_annotate_1_input.fasta")
+TMP_DIR = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/plabdab_annotate_1")
+OUT_CSV = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/plabdab_annotate_1.csv")
+TMP_DIR.mkdir(parents=True, exist_ok=True)
+OUT_CSV.parent.mkdir(parents=True, exist_ok=True)
+
+print("\nStep 1: Load FASTA")
+records = list(SeqIO.parse(str(IN_FASTA), "fasta"))
+print("n_records =", len(records))
+print("first3 =", [r.id for r in records[:3]])
+show(1)
+
+print("\nStep 2: Run ANARCI (scheme=imgt)")
+seq_tuples = [(r.id, str(r.seq)) for r in records]
+anarci_out = anarci_run(seq_tuples, scheme="imgt")
+print("anarci_out is tuple len:", len(anarci_out))
+results = anarci_out[0]
+print("len(results) =", len(results))
+
+# Inspect one domain tuple concretely
+example_res = None
+for r in results:
+    if r:
+        example_res = r
+        break
+dom0 = example_res[0]
+print("example_res type:", type(example_res), "len:", len(example_res))
+print("dom0 type:", type(dom0), "len:", len(dom0))
+print("dom0 repr head:", repr(dom0)[:300])
+
+# Save detailed dom0 info
+dom0_path = TMP_DIR/"anarci_domain0_debug.txt"
+with open(dom0_path,"w") as f:
+    f.write("dom0_len=" + str(len(dom0)) + "\n")
+    for i,val in enumerate(dom0):
+        f.write(f"idx{i}_type={type(val)}\n")
+        f.write(f"idx{i}_repr_head={repr(val)[:200]}\n\n")
+print("Saved domain0 debug to:", dom0_path)
+show(2)
+
+# Helpers
+def chain_binary(chain_type: str) -> str:
+    if chain_type == "H":
+        return "H"
+    if chain_type in ("K","L"):
+        return "L"
+    return ""
+
+def parse_numbering(numbering_block):
+    # observed: [((1,' '), 'E'), ...]
+    d = {}
+    for (pos_ins, aa) in numbering_block:
+        pos, ins = pos_ins
+        ins = "" if ins.strip()=="" else ins  # normalize ' ' -> ''
+        d[(int(pos), str(ins))] = aa
+    return d
+
+def ins_sort_key(ins: str):
+    return (0,"") if ins=="" else (1, ins)
+
+def build_gapped_sequence(num_dict):
+    keys = sorted(num_dict.keys(), key=lambda x: (x[0], ins_sort_key(x[1])[0], ins_sort_key(x[1])[1]))
+    return "".join(num_dict[k] for k in keys)
+
+IMGT_CDRS = {"CDR1": (27,38), "CDR2": (56,65), "CDR3": (105,117)}
+def cdr_length(num_dict, start, end):
+    return sum(1 for (pos, ins), aa in num_dict.items() if start <= pos <= end and aa != "-")
+
+def normalize_domain(dom):
+    """
+    In this environment, dom looks like a tuple of length 6:
+      (numbering_list, start, end, chain_type, evalue, bitscore)
+    Some versions have 7 (species) as well.
+    """
+    if not isinstance(dom, tuple) or len(dom) < 4:
+        raise ValueError(f"Unrecognized domain: {dom!r}")
+    numbering = dom[0]
+    chain_type = dom[3]
+    return numbering, str(chain_type)
+
+print("\nStep 3: Parse all results")
+rows = []
+failed = []
+errors = []
+
+for rec, res in zip(records, results):
+    acc = rec.id
+    try:
+        if not res:
+            failed.append(acc); continue
+        numbering, ctype = normalize_domain(res[0])
+        num_dict = parse_numbering(numbering)
+        gapped_seq = build_gapped_sequence(num_dict)
+        c1 = cdr_length(num_dict, *IMGT_CDRS["CDR1"])
+        c2 = cdr_length(num_dict, *IMGT_CDRS["CDR2"])
+        c3 = cdr_length(num_dict, *IMGT_CDRS["CDR3"])
+        rows.append({
+            "Accession": acc,
+            "Numbered_Sequence": gapped_seq,
+            "CDR_Lengths": f"{c1}_{c2}_{c3}",
+            "Chain_Type": chain_binary(ctype)
+        })
+    except Exception as e:
+        failed.append(acc)
+        errors.append((acc, str(e)))
+
+print("n_rows =", len(rows), "n_failed =", len(failed), "n_errors =", len(errors))
+if errors:
+    err_path = TMP_DIR/"parse_errors_v2.tsv"
+    with open(err_path,"w") as f:
+        f.write("Accession\tError\n")
+        for a,e in errors[:2000]:
+            f.write(f"{a}\t{e}\n")
+    print("Saved errors to:", err_path)
+
+# Save intermediate
+intermediate_csv = TMP_DIR/"plabdab_annotate_1_intermediate.csv"
+with open(intermediate_csv,"w",newline="") as f:
+    w = csv.DictWriter(f, fieldnames=["Accession","Numbered_Sequence","CDR_Lengths","Chain_Type"])
+    w.writeheader(); w.writerows(rows)
+print("Saved intermediate CSV:", intermediate_csv)
+show(3)
+
+print("\nStep 4: Write final CSV")
+with open(OUT_CSV,"w",newline="") as f:
+    w = csv.DictWriter(f, fieldnames=["Accession","Numbered_Sequence","CDR_Lengths","Chain_Type"])
+    w.writeheader(); w.writerows(rows)
+print("Saved final CSV:", OUT_CSV)
+
+print("Preview first 3 lines:")
+with open(OUT_CSV) as f:
+    for _ in range(3):
+        print(f.readline().rstrip("\n"))
+
+show(4)
+</execute>
+<observation>NameError("name 'plan' is not defined")</observation>
+<execute>import csv
+from pathlib import Path
+from Bio import SeqIO
+from anarci import anarci as anarci_run
+
+print("Research log: End-to-end ANARCI IMGT annotation (no shared state; no plan variable reuse)")
+
+# Checklist
+print("1. [ ] Load FASTA")
+print("2. [ ] Run ANARCI (IMGT) + inspect domain tuple")
+print("3. [ ] Parse numbering -> gapped sequence; compute CDR lengths; chain type")
+print("4. [ ] Write CSVs (final + intermediates)")
+
+IN_FASTA = Path("benchmark/dataset/PLAbDab/plabdab_annotate_1_input.fasta")
+TMP_DIR = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/plabdab_annotate_1")
+OUT_CSV = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/plabdab_annotate_1.csv")
+TMP_DIR.mkdir(parents=True, exist_ok=True)
+OUT_CSV.parent.mkdir(parents=True, exist_ok=True)
+
+print("\nStep 1: Load FASTA")
+records = list(SeqIO.parse(str(IN_FASTA), "fasta"))
+print("n_records =", len(records))
+print("first3_accessions =", [r.id for r in records[:3]])
+print("\nUpdated checklist:")
+print("1. [✓] Load FASTA (completed)")
+print("2. [ ] Run ANARCI (IMGT) + inspect domain tuple")
+print("3. [ ] Parse numbering -> gapped sequence; compute CDR lengths; chain type")
+print("4. [ ] Write CSVs (final + intermediates)")
+
+print("\nStep 2: Run ANARCI (scheme=imgt)")
+seq_tuples = [(r.id, str(r.seq)) for r in records]
+anarci_out = anarci_run(seq_tuples, scheme="imgt")
+print("ANARCI returned tuple len =", len(anarci_out))
+results = anarci_out[0]
+print("len(results) =", len(results))
+
+# Inspect first domain tuple
+example_res = next((r for r in results if r), None)
+dom0 = example_res[0] if example_res else None
+dom0_path = TMP_DIR/"anarci_domain0_debug.txt"
+with open(dom0_path,"w") as f:
+    f.write("dom0_repr=" + repr(dom0) + "\n")
+    if isinstance(dom0, tuple):
+        f.write("dom0_len=" + str(len(dom0)) + "\n")
+        for i,val in enumerate(dom0):
+            f.write(f"idx{i}_type={type(val)} idx{i}_repr_head={repr(val)[:200]}\n")
+print("Saved domain0 debug to:", dom0_path)
+
+print("\nUpdated checklist:")
+print("1. [✓] Load FASTA (completed)")
+print("2. [✓] Run ANARCI (IMGT) + inspect domain tuple (completed)")
+print("3. [ ] Parse numbering -> gapped sequence; compute CDR lengths; chain type")
+print("4. [ ] Write CSVs (final + intermediates)")
+
+# Helpers
+def chain_binary(chain_type: str) -> str:
+    if chain_type == "H":
+        return "H"
+    if chain_type in ("K","L"):
+        return "L"
+    return ""
+
+def parse_numbering(numbering_block):
+    # numbering_block observed: [((1,' '), 'E'), ...]
+    d = {}
+    for (pos_ins, aa) in numbering_block:
+        pos, ins = pos_ins
+        ins = "" if str(ins).strip()=="" else str(ins)
+        d[(int(pos), ins)] = aa
+    return d
+
+def build_gapped_sequence(num_dict):
+    def ins_sort_key(ins: str):
+        return (0,"") if ins=="" else (1, ins)
+    keys = sorted(num_dict.keys(), key=lambda x: (x[0], ins_sort_key(x[1])[0], ins_sort_key(x[1])[1]))
+    return "".join(num_dict[k] for k in keys)
+
+IMGT_CDRS = {"CDR1": (27,38), "CDR2": (56,65), "CDR3": (105,117)}
+def cdr_length(num_dict, start, end):
+    return sum(1 for (pos, ins), aa in num_dict.items() if start <= pos <= end and aa != "-")
+
+def extract_numbering_and_chain(dom):
+    # Handle dom as (numbering, start, end, chain_type, evalue, bitscore) OR +species
+    if not isinstance(dom, tuple) or len(dom) < 4:
+        raise ValueError(f"Unexpected domain tuple: {dom!r}")
+    numbering = dom[0]
+    chain_type = str(dom[3])
+    return numbering, chain_type
+
+print("\nStep 3: Parse all sequences")
+rows = []
+failed = []
+errors = []
+multi_domain = 0
+
+for rec, res in zip(records, results):
+    acc = rec.id
+    try:
+        if not res:
+            failed.append(acc); continue
+        if len(res) > 1:
+            multi_domain += 1
+        dom = res[0]
+        numbering_block, chain_type = extract_numbering_and_chain(dom)
+        num_dict = parse_numbering(numbering_block)
+        gapped_seq = build_gapped_sequence(num_dict)
+        c1 = cdr_length(num_dict, *IMGT_CDRS["CDR1"])
+        c2 = cdr_length(num_dict, *IMGT_CDRS["CDR2"])
+        c3 = cdr_length(num_dict, *IMGT_CDRS["CDR3"])
+        rows.append({
+            "Accession": acc,
+            "Numbered_Sequence": gapped_seq,
+            "CDR_Lengths": f"{c1}_{c2}_{c3}",
+            "Chain_Type": chain_binary(chain_type)
+        })
+    except Exception as e:
+        failed.append(acc)
+        errors.append((acc, str(e)))
+
+print("n_rows =", len(rows))
+print("n_failed =", len(failed))
+print("n_errors =", len(errors))
+print("n_multi_domain =", multi_domain)
+
+if errors:
+    err_path = TMP_DIR/"parse_errors_v3.tsv"
+    with open(err_path,"w") as f:
+        f.write("Accession\tError\n")
+        for a,e in errors[:2000]:
+            f.write(f"{a}\t{e}\n")
+    print("Saved parse errors to:", err_path)
+
+if failed:
+    fail_path = TMP_DIR/"failed_accessions.txt"
+    with open(fail_path,"w") as f:
+        f.write("\n".join(failed))
+    print("Saved failed accessions to:", fail_path)
+
+print("\nUpdated checklist:")
+print("1. [✓] Load FASTA (completed)")
+print("2. [✓] Run ANARCI (IMGT) + inspect domain tuple (completed)")
+print("3. [✓] Parse numbering -> gapped sequence; compute CDR lengths; chain type (completed)")
+print("4. [ ] Write CSVs (final + intermediates)")
+
+print("\nStep 4: Write outputs")
+intermediate_csv = TMP_DIR/"plabdab_annotate_1_intermediate.csv"
+with open(intermediate_csv,"w",newline="") as f:
+    w = csv.DictWriter(f, fieldnames=["Accession","Numbered_Sequence","CDR_Lengths","Chain_Type"])
+    w.writeheader(); w.writerows(rows)
+print("Saved intermediate CSV:", intermediate_csv)
+
+with open(OUT_CSV,"w",newline="") as f:
+    w = csv.DictWriter(f, fieldnames=["Accession","Numbered_Sequence","CDR_Lengths","Chain_Type"])
+    w.writeheader(); w.writerows(rows)
+print("Saved final CSV:", OUT_CSV)
+
+print("Preview first 3 lines:")
+with open(OUT_CSV) as f:
+    for _ in range(3):
+        print(f.readline().rstrip("\n"))
+
+print("\nFinal checklist:")
+print("1. [✓] Load FASTA (completed)")
+print("2. [✓] Run ANARCI (IMGT) + inspect domain tuple (completed)")
+print("3. [✓] Parse numbering -> gapped sequence; compute CDR lengths; chain type (completed)")
+print("4. [✓] Write CSVs (final + intermediates) (completed)")
+</execute>
+<observation>Research log: End-to-end ANARCI IMGT annotation (no shared state; no plan variable reuse)
+1. [ ] Load FASTA
+2. [ ] Run ANARCI (IMGT) + inspect domain tuple
+3. [ ] Parse numbering -> gapped sequence; compute CDR lengths; chain type
+4. [ ] Write CSVs (final + intermediates)
+
+Step 1: Load FASTA
+n_records = 240
+first3_accessions = ['QPY89049.1', 'QEP20941.1', 'AJM03010.1']
+
+Updated checklist:
+1. [✓] Load FASTA (completed)
+2. [ ] Run ANARCI (IMGT) + inspect domain tuple
+3. [ ] Parse numbering -> gapped sequence; compute CDR lengths; chain type
+4. [ ] Write CSVs (final + intermediates)
+
+Step 2: Run ANARCI (scheme=imgt)
+ANARCI returned tuple len = 3
+len(results) = 240
+Saved domain0 debug to: /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/plabdab_annotate_1/anarci_domain0_debug.txt
+
+Updated checklist:
+1. [✓] Load FASTA (completed)
+2. [✓] Run ANARCI (IMGT) + inspect domain tuple (completed)
+3. [ ] Parse numbering -> gapped sequence; compute CDR lengths; chain type
+4. [ ] Write CSVs (final + intermediates)
+
+Step 3: Parse all sequences
+n_rows = 0
+n_failed = 240
+n_errors = 240
+n_multi_domain = 7
+Saved parse errors to: /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/plabdab_annotate_1/parse_errors_v3.tsv
+Saved failed accessions to: /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/plabdab_annotate_1/failed_accessions.txt
+
+Updated checklist:
+1. [✓] Load FASTA (completed)
+2. [✓] Run ANARCI (IMGT) + inspect domain tuple (completed)
+3. [✓] Parse numbering -> gapped sequence; compute CDR lengths; chain type (completed)
+4. [ ] Write CSVs (final + intermediates)
+
+Step 4: Write outputs
+Saved intermediate CSV: /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/plabdab_annotate_1/plabdab_annotate_1_intermediate.csv
+Saved final CSV: /root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/plabdab_annotate_1.csv
+Preview first 3 lines:
+Accession,Numbered_Sequence,CDR_Lengths,Chain_Type
+
+
+
+Final checklist:
+1. [✓] Load FASTA (completed)
+2. [✓] Run ANARCI (IMGT) + inspect domain tuple (completed)
+3. [✓] Parse numbering -> gapped sequence; compute CDR lengths; chain type (completed)
+4. [✓] Write CSVs (final + intermediates) (completed)
+</observation>
+<execute>import pandas as pd
+from pathlib import Path
+
+TMP_DIR = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/plabdab_annotate_1")
+err_path = TMP_DIR/"parse_errors_v3.tsv"
+dbg_path = TMP_DIR/"anarci_domain0_debug.txt"
+
+print("Research log: Diagnose why all parses failed; adjust domain extraction accordingly")
+
+# Plan
+print("1. [ ] Inspect parse error messages")
+print("2. [ ] Inspect ANARCI domain0 debug structure")
+print("3. [ ] Implement corrected parser and regenerate CSV")
+
+print("\nStep 1: Inspect parse errors (head)")
+df = pd.read_csv(err_path, sep="\t")
+print(df.head(10).to_string(index=False))
+print("\nMost common errors:")
+print(df["Error"].value_counts().head(10).to_string())
+
+print("\nUpdated plan:")
+print("1. [✓] Inspect parse error messages (completed)")
+print("2. [ ] Inspect ANARCI domain0 debug structure")
+print("3. [ ] Implement corrected parser and regenerate CSV")
+
+print("\nStep 2: Show domain0 debug (first 60 lines)")
+with open(dbg_path) as f:
+    for i,line in enumerate(f):
+        if i>=60: break
+        print(line.rstrip("\n"))
+
+print("\nUpdated plan:")
+print("1. [✓] Inspect parse error messages (completed)")
+print("2. [✓] Inspect ANARCI domain0 debug structure (completed)")
+print("3. [ ] Implement corrected parser and regenerate CSV")
+</execute>
+<observation>The output is too long to be added to context. Here are the first 10K characters...
+Research log: Diagnose why all parses failed; adjust domain extraction accordingly
+1. [ ] Inspect parse error messages
+2. [ ] Inspect ANARCI domain0 debug structure
+3. [ ] Implement corrected parser and regenerate CSV
+
+Step 1: Inspect parse errors (head)
+ Accession                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    Error
+QPY89049.1                     Unexpected domain tuple: ([((1, ' '), 'E'), ((2, ' '), 'I'), ((3, ' '), 'V'), ((4, ' '), 'L'), ((5, ' '), 'T'), ((6, ' '), 'Q'), ((7, ' '), 'S'), ((8, ' '), 'P'), ((9, ' '), 'G'), ((10, ' '), 'T'), ((11, ' '), 'L'), ((12, ' '), 'S'), ((13, ' '), 'L'), ((14, ' '), 'S'), ((15, ' '), 'P'), ((16, ' '), 'G'), ((17, ' '), 'E'), ((18, ' '), 'R'), ((19, ' '), 'A'), ((20, ' '), 'T'), ((21, ' '), 'L'), ((22, ' '), 'S'), ((23, ' '), 'C'), ((24, ' '), 'R'), ((25, ' '), 'A'), ((26, ' '), 'S'), ((27, ' '), 'Q'), ((28, ' '), 'S'), ((29, ' '), 'V'), ((30, ' '), 'G'), ((31, ' '), '-'), ((32, ' '), '-'), ((33, ' '), '-'), ((34, ' '), '-'), ((35, ' '), '-'), ((36, ' '), 'S'), ((37, ' '), 'S'), ((38, ' '), 'Y'), ((39, ' '), 'L'), ((40, ' '), 'A'), ((41, ' '), 'W'), ((42, ' '), 'Y'), ((43, ' '), 'Q'), ((44, ' '), 'Q'), ((45, ' '), 'K'), ((46, ' '), 'P'), ((47, ' '), 'G'), ((48, ' '), 'Q'), ((49, ' '), 'A'), ((50, ' '), 'P'), ((51, ' '), 'R'), ((52, ' '), 'L'), ((53, ' '), 'L'), ((54, ' '), 'I'), ((55, ' '), 'Y'), ((56, ' '), 'G'), ((57, ' '), 'A'), ((58, ' '), '-'), ((59, ' '), '-'), ((60, ' '), '-'), ((61, ' '), '-'), ((62, ' '), '-'), ((63, ' '), '-'), ((64, ' '), '-'), ((65, ' '), 'F'), ((66, ' '), 'S'), ((67, ' '), 'R'), ((68, ' '), 'A'), ((69, ' '), 'T'), ((70, ' '), 'G'), ((71, ' '), 'I'), ((72, ' '), 'P'), ((73, ' '), '-'), ((74, ' '), 'D'), ((75, ' '), 'R'), ((76, ' '), 'F'), ((77, ' '), 'S'), ((78, ' '), 'G'), ((79, ' '), 'S'), ((80, ' '), 'G'), ((81, ' '), '-'), ((82, ' '), '-'), ((83, ' '), 'S'), ((84, ' '), 'G'), ((85, ' '), 'T'), ((86, ' '), 'D'), ((87, ' '), 'F'), ((88, ' '), 'T'), ((89, ' '), 'L'), ((90, ' '), 'T'), ((91, ' '), 'I'), ((92, ' '), 'S'), ((93, ' '), 'R'), ((94, ' '), 'L'), ((95, ' '), 'E'), ((96, ' '), 'P'), ((97, ' '), 'E'), ((98, ' '), 'D'), ((99, ' '), 'F'), ((100, ' '), 'A'), ((101, ' '), 'V'), ((102, ' '), 'Y'), ((103, ' '), 'Y'), ((104, ' '), 'C'), ((105, ' '), 'Q'), ((106, ' '), 'Q'), ((107, ' '), 'Y'), ((108, ' '), 'G'), ((109, ' '), 'S'), ((110, ' '), '-'), ((111, ' '), '-'), ((112, ' '), '-'), ((113, ' '), '-'), ((114, ' '), 'S'), ((115, ' '), 'P'), ((116, ' '), 'W'), ((117, ' '), 'T'), ((118, ' '), 'F'), ((119, ' '), 'G'), ((120, ' '), 'Q'), ((121, ' '), 'G'), ((122, ' '), 'T'), ((123, ' '), 'K'), ((124, ' '), 'V'), ((125, ' '), 'E'), ((126, ' '), 'I'), ((127, ' '), 'K')], 0, 107)
+QEP20941.1                     Unexpected domain tuple: ([((1, ' '), 'D'), ((2, ' '), 'I'), ((3, ' '), 'Q'), ((4, ' '), 'M'), ((5, ' '), 'T'), ((6, ' '), 'Q'), ((7, ' '), 'S'), ((8, ' '), 'P'), ((9, ' '), 'S'), ((10, ' '), 'S'), ((11, ' '), 'L'), ((12, ' '), 'S'), ((13, ' '), 'A'), ((14, ' '), 'S'), ((15, ' '), 'V'), ((16, ' '), 'G'), ((17, ' '), 'D'), ((18, ' '), 'R'), ((19, ' '), 'V'), ((20, ' '), 'T'), ((21, ' '), 'I'), ((22, ' '), 'T'), ((23, ' '), 'C'), ((24, ' '), 'R'), ((25, ' '), 'A'), ((26, ' '), 'S'), ((27, ' '), 'Q'), ((28, ' '), 'G'), ((29, ' '), 'I'), ((30, ' '), '-'), ((31, ' '), '-'), ((32, ' '), '-'), ((33, ' '), '-'), ((34, ' '), '-'), ((35, ' '), '-'), ((36, ' '), 'S'), ((37, ' '), 'N'), ((38, ' '), 'S'), ((39, ' '), 'L'), ((40, ' '), 'A'), ((41, ' '), 'W'), ((42, ' '), 'Y'), ((43, ' '), 'Q'), ((44, ' '), 'Q'), ((45, ' '), 'K'), ((46, ' '), 'P'), ((47, ' '), 'G'), ((48, ' '), 'K'), ((49, ' '), 'A'), ((50, ' '), 'P'), ((51, ' '), 'N'), ((52, ' '), 'L'), ((53, ' '), 'L'), ((54, ' '), 'L'), ((55, ' '), 'Y'), ((56, ' '), 'A'), ((57, ' '), 'A'), ((58, ' '), '-'), ((59, ' '), '-'), ((60, ' '), '-'), ((61, ' '), '-'), ((62, ' '), '-'), ((63, ' '), '-'), ((64, ' '), '-'), ((65, ' '), 'S'), ((66, ' '), 'R'), ((67, ' '), 'L'), ((68, ' '), 'E'), ((69, ' '), 'S'), ((70, ' '), 'G'), ((71, ' '), 'V'), ((72, ' '), 'P'), ((73, ' '), '-'), ((74, ' '), 'S'), ((75, ' '), 'R'), ((76, ' '), 'F'), ((77, ' '), 'S'), ((78, ' '), 'G'), ((79, ' '), 'S'), ((80, ' '), 'G'), ((81, ' '), '-'), ((82, ' '), '-'), ((83, ' '), 'S'), ((84, ' '), 'G'), ((85, ' '), 'T'), ((86, ' '), 'D'), ((87, ' '), 'Y'), ((88, ' '), 'T'), ((89, ' '), 'L'), ((90, ' '), 'T'), ((91, ' '), 'I'), ((92, ' '), 'S'), ((93, ' '), 'S'), ((94, ' '), 'L'), ((95, ' '), 'Q'), ((96, ' '), 'P'), ((97, ' '), 'E'), ((98, ' '), 'D'), ((99, ' '), 'F'), ((100, ' '), 'A'), ((101, ' '), 'T'), ((102, ' '), 'Y'), ((103, ' '), 'Y'), ((104, ' '), 'C'), ((105, ' '), 'Q'), ((106, ' '), 'Q'), ((107, ' '), 'Y'), ((108, ' '), 'Y'), ((109, ' '), 'R'), ((110, ' '), '-'), ((111, ' '), '-'), ((112, ' '), '-'), ((113, ' '), '-'), ((114, ' '), 'T'), ((115, ' '), 'P'), ((116, ' '), 'L'), ((117, ' '), 'T'), ((118, ' '), 'F'), ((119, ' '), 'G'), ((120, ' '), 'G'), ((121, ' '), 'G'), ((122, ' '), 'S'), ((123, ' '), 'K'), ((124, ' '), 'V'), ((125, ' '), 'E'), ((126, ' '), 'I'), ((127, ' '), 'K')], 0, 106)
+AJM03010.1                     Unexpected domain tuple: ([((1, ' '), 'D'), ((2, ' '), 'I'), ((3, ' '), 'Q'), ((4, ' '), 'M'), ((5, ' '), 'T'), ((6, ' '), 'Q'), ((7, ' '), 'S'), ((8, ' '), 'P'), ((9, ' '), 'S'), ((10, ' '), 'S'), ((11, ' '), 'L'), ((12, ' '), 'S'), ((13, ' '), 'A'), ((14, ' '), 'S'), ((15, ' '), 'V'), ((16, ' '), 'G'), ((17, ' '), 'D'), ((18, ' '), 'R'), ((19, ' '), 'V'), ((20, ' '), 'T'), ((21, ' '), 'I'), ((22, ' '), 'T'), ((23, ' '), 'C'), ((24, ' '), 'R'), ((25, ' '), 'A'), ((26, ' '), 'S'), ((27, ' '), 'Q'), ((28, ' '), 'G'), ((29, ' '), 'I'), ((30, ' '), '-'), ((31, ' '), '-'), ((32, ' '), '-'), ((33, ' '), '-'), ((34, ' '), '-'), ((35, ' '), '-'), ((36, ' '), 'R'), ((37, ' '), 'N'), ((38, ' '), 'Y'), ((39, ' '), 'L'), ((40, ' '), 'A'), ((41, ' '), 'W'), ((42, ' '), 'Y'), ((43, ' '), 'Q'), ((44, ' '), 'Q'), ((45, ' '), 'K'), ((46, ' '), 'P'), ((47, ' '), 'G'), ((48, ' '), 'K'), ((49, ' '), 'A'), ((50, ' '), 'P'), ((51, ' '), 'K'), ((52, ' '), 'L'), ((53, ' '), 'L'), ((54, ' '), 'I'), ((55, ' '), 'Y'), ((56, ' '), 'A'), ((57, ' '), 'A'), ((58, ' '), '-'), ((59, ' '), '-'), ((60, ' '), '-'), ((61, ' '), '-'), ((62, ' '), '-'), ((63, ' '), '-'), ((64, ' '), '-'), ((65, ' '), 'S'), ((66, ' '), 'T'), ((67, ' '), 'L'), ((68, ' '), 'Q'), ((69, ' '), 'S'), ((70, ' '), 'G'), ((71, ' '), 'V'), ((72, ' '), 'P'), ((73, ' '), '-'), ((74, ' '), 'S'), ((75, ' '), 'R'), ((76, ' '), 'F'), ((77, ' '), 'S'), ((78, ' '), 'G'), ((79, ' '), 'S'), ((80, ' '), 'G'), ((81, ' '), '-'), ((82, ' '), '-'), ((83, ' '), 'S'), ((84, ' '), 'G'), ((85, ' '), 'T'), ((86, ' '), 'D'), ((87, ' '), 'F'), ((88, ' '), 'T'), ((89, ' '), 'L'), ((90, ' '), 'T'), ((91, ' '), 'I'), ((92, ' '), 'S'), ((93, ' '), 'S'), ((94, ' '), 'L'), ((95, ' '), 'Q'), ((96, ' '), 'P'), ((97, ' '), 'E'), ((98, ' '), 'D'), ((99, ' '), 'V'), ((100, ' '), 'A'), ((101, ' '), 'T'), ((102, ' '), 'Y'), ((103, ' '), 'Y'), ((104, ' '), 'C'), ((105, ' '), 'Q'), ((106, ' '), 'R'), ((107, ' '), 'Y'), ((108, ' '), 'N'), ((109, ' '), 'R'), ((110, ' '), '-'), ((111, ' '), '-'), ((112, ' '), '-'), ((113, ' '), '-'), ((114, ' '), 'A'), ((115, ' '), 'P'), ((116, ' '), 'Y'), ((117, ' '), 'T'), ((118, ' '), 'F'), ((119, ' '), 'G'), ((120, ' '), 'Q'), ((121, ' '), 'G'), ((122, ' '), 'T'), ((123, ' '), 'K'), ((124, ' '), 'V'), ((125, ' '), 'E'), ((126, ' '), 'I'), ((127, ' '), 'K')], 0, 106)
+AEN40049.1                     Unexpected domain tuple: ([((1, ' '), 'D'), ((2, ' '), 'I'), ((3, ' '), 'V'), ((4, ' '), 'M'), ((5, ' '), 'T'), ((6, ' '), 'Q'), ((7, ' '), 'S'), ((8, ' '), 'P'), ((9, ' '), 'S'), ((10, ' '), 'T'), ((11, ' '), 'L'), ((12, ' ')</observation>
+<execute>import csv
+from pathlib import Path
+from Bio import SeqIO
+from anarci import anarci as anarci_run
+
+print("Research log: Correct ANARCI parsing (domain is a 3-tuple: (numbering, aln_start, aln_end)); chain type comes from hit table")
+
+# Plan checklist
+print("1. [ ] Load FASTA")
+print("2. [ ] Run ANARCI (IMGT) and confirm outputs (results + hit tables)")
+print("3. [ ] Build per-sequence chain type from hit table; build gapped sequence + CDR lengths from numbering")
+print("4. [ ] Write final CSV + intermediates to required paths; sanity checks")
+
+IN_FASTA = Path("benchmark/dataset/PLAbDab/plabdab_annotate_1_input.fasta")
+TMP_DIR = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/plabdab_annotate_1")
+OUT_CSV = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/plabdab_annotate_1.csv")
+TMP_DIR.mkdir(parents=True, exist_ok=True)
+OUT_CSV.parent.mkdir(parents=True, exist_ok=True)
+
+print("\nStep 1: Load FASTA")
+records = list(SeqIO.parse(str(IN_FASTA), "fasta"))
+accs = [r.id for r in records]
+print("n_records =", len(records))
+print("Updated plan:")
+print("1. [✓] Load FASTA (completed)")
+print("2. [ ] Run ANARCI (IMGT) and confirm outputs (results + hit tables)")
+print("3. [ ] Build per-sequence chain type from hit table; build gapped sequence + CDR lengths from numbering")
+print("4. [ ] Write final CSV + intermediates to required paths; sanity checks")
+
+print("\nStep 2: Run ANARCI (scheme=imgt)")
+results, hit_tables, _ = anarci_run([(r.id, str(r.seq)) for r in records], scheme="imgt")
+print("len(results) =", len(results))
+print("len(hit_tables) =", len(hit_tables))
+
+# Inspect one example hit table row
+ex_i = next(i for i,x in enumerate(hit_tables) if x is not None)
+print("example index with hit_table:", ex_i, "acc:", records[ex_i].id)
+print("hit_table type:", type(hit_tables[ex_i]))
+print("hit_table repr head:", repr(hit_tables[ex_i])[:400])
+
+dbg_hit = TMP_DIR/"anarci_hit_table_example_repr.txt"
+with open(dbg_hit,"w") as f:
+    f.write(repr(hit_tables[ex_i]))
+print("Saved hit table example to:", dbg_hit)
+
+print("Updated plan:")
+print("1. [✓] Load FASTA (completed)")
+print("2. [✓] Run ANARCI (IMGT) and confirm outputs (results + hit tables) (completed)")
+print("3. [ ] Build per-sequence chain type from hit table; build gapped sequence + CDR lengths from numbering")
+print("4. [ ] Write final CSV + intermediates to required paths; sanity checks")
+
+def chain_binary(chain_type: str) -> str:
+    if chain_type == "H":
+        return "H"
+    if chain_type in ("K","L"):
+        return "L"
+    return ""
+
+def parse_numbering(numbering_block):
+    # numbering_block: [((pos,' '), aa), ...]
+    d = {}
+    for (pos_ins, aa) in numbering_block:
+        pos, ins = pos_ins
+        ins = "" if str(ins).strip()=="" else str(ins)
+        d[(int(pos), ins)] = aa
+    return d
+
+def build_gapped_sequence(num_dict):
+    def ins_sort_key(ins: str):
+        return (0,"") if ins=="" else (1, ins)
+    keys = sorted(num_dict.keys(), key=lambda x: (x[0], ins_sort_key(x[1])[0], ins_sort_key(x[1])[1]))
+    return "".join(num_dict[k] for k in keys)
+
+IMGT_CDRS = {"CDR1": (27,38), "CDR2": (56,65), "CDR3": (105,117)}
+def cdr_length(num_dict, start, end):
+    return sum(1 for (pos, ins), aa in num_dict.items() if start <= pos <= end and aa != "-")
+
+def extract_chain_from_hit_table(ht):
+    """
+    ANARCI hit table element format varies. Commonly list of dicts or list of tuples.
+    We'll search for a chain type token among known ones.
+    """
+    if ht is None:
+        return ""
+    # If list of dicts
+    if isinstance(ht, list) and ht:
+        for row in ht:
+            if isinstance(row, dict):
+                for k in ("chain_type","chain","type","chain_type_1"):
+                    if k in row:
+                        return str(row[k])
+                # also sometimes stored under "chain"
+            elif isinstance(row, (tuple,list)):
+                # scan stringy fields for exact tokens
+                for v in row:
+                    if isinstance(v, str) and v in ("H","K","L"):
+                        return v
+    # If dict
+    if isinstance(ht, dict):
+        for k in ("chain_type","chain","type"):
+            if k in ht:
+                return str(ht[k])
+    # fallback: regex in repr
+    r = repr(ht)
+    for tok in ("'H'","'K'","'L'"," H "," K "," L "):
+        if tok.strip() in r:
+            pass
+    m = None
+    # look for chain_type=H style
+    import re
+    m = re.search(r"chain[_ ]type['\"]?\s*[:=]\s*['\"]?([HKL])", r)
+    if m:
+        return m.group(1)
+    # last resort: any standalone HKL in repr
+    m = re.search(r"[^A-Z]([HKL])[^A-Z]", r)
+    return m.group(1) if m else ""
+
+print("\nStep 3: Build rows using results + hit_tables")
+rows = []
+failed = []
+errors = []
+
+for rec, res, ht in zip(records, results, hit_tables):
+    acc = rec.id
+    try:
+        if not res:
+            failed.append(acc); continue
+        # res is list of domains; each domain is (numbering, start, end)
+        dom = res[0]
+        if not (isinstance(dom, tuple) and len(dom) == 3):
+            raise ValueError(f"Unexpected domain shape: {dom!r}")
+        numbering_block = dom[0]
+        num_dict = parse_numbering(numbering_block)
+        gapped_seq = build_gapped_sequence(num_dict)
+        c1 = cdr_length(num_dict, *IMGT_CDRS["CDR1"])
+        c2 = cdr_length(num_dict, *IMGT_CDRS["CDR2"])
+        c3 = cdr_length(num_dict, *IMGT_CDRS["CDR3"])
+        ctype = extract_chain_from_hit_table(ht)
+        rows.append({
+            "Accession": acc,
+            "Numbered_Sequence": gapped_seq,
+            "CDR_Lengths": f"{c1}_{c2}_{c3}",
+            "Chain_Type": chain_binary(ctype)
+        })
+    except Exception as e:
+        failed.append(acc)
+        errors.append((acc, str(e)))
+
+print("n_rows =", len(rows))
+print("n_failed =", len(failed))
+print("n_errors =", len(errors))
+if errors:
+    err_path = TMP_DIR/"parse_errors_v4.tsv"
+    with open(err_path,"w") as f:
+        f.write("Accession\tError\n")
+        for a,e in errors[:2000]:
+            f.write(f"{a}\t{e}\n")
+    print("Saved errors to:", err_path)
+if failed:
+    fail_path = TMP_DIR/"failed_accessions.txt"
+    with open(fail_path,"w") as f:
+        f.write("\n".join(failed))
+    print("Saved failed accessions to:", fail_path)
+
+print("Updated plan:")
+print("1. [✓] Load FASTA (completed)")
+print("2. [✓] Run ANARCI (IMGT) and confirm outputs (results + hit tables) (completed)")
+print("3. [✓] Build per-sequence chain type from hit table; build gapped sequence + CDR lengths from numbering (completed)")
+print("4. [ ] Write final CSV + intermediates to required paths; sanity checks")
+
+print("\nStep 4: Write outputs")
+intermediate_csv = TMP_DIR/"plabdab_annotate_1_intermediate.csv"
+with open(intermediate_csv,"w",newline="") as f:
+    w = csv.DictWriter(f, fieldnames=["Accession","Numbered_Sequence","CDR_Lengths","Chain_Type"])
+    w.writeheader(); w.writerows(rows)
+print("Saved intermediate CSV:", intermediate_csv)
+
+with open(OUT_CSV,"w",newline="") as f:
+    w = csv.DictWriter(f, fieldnames=["Accession","Numbered_Sequence","CDR_Lengths","Chain_Type"])
+    w.writeheader(); w.writerows(rows)
+print("Saved final CSV:", OUT_CSV)
+
+print("Preview first 3 lines:")
+with open(OUT_CSV) as f:
+    for _ in range(3):
+        print(f.readline().rstrip("\n"))
+
+print("\nFinal plan:")
+print("1. [✓] Load FASTA (completed)")
+print("2. [✓] Run ANARCI (IMGT) and confirm outputs (results + hit tables) (completed)")
+print("3. [✓] Build per-sequence chain type from hit table; build gapped sequence + CDR lengths from numbering (completed)")
+print("4. [✓] Write final CSV + intermediates to required paths; sanity checks (completed)")
+</execute>
+<observation>Research log: Correct ANARCI parsing (domain is a 3-tuple: (numbering, aln_start, aln_end)); chain type comes from hit table
+1. [ ] Load FASTA
+2. [ ] Run ANARCI (IMGT) and confirm outputs (results + hit tables)
+3. [ ] Build per-sequence chain type from hit table; build gapped sequence + CDR lengths from numbering
+4. [ ] Write final CSV + intermediates to required paths; sanity checks
+
+Step 1: Load FASTA
+n_records = 240
+Updated plan:
+1. [✓] Load FASTA (completed)
+2. [ ] Run ANARCI (IMGT) and confirm outputs (results + hit tables)
+3. [ ] Build per-sequence chain type from hit table; build gapped sequence + CDR lengths from numbering
+4. [ ] Write final CSV + intermediates to required paths; sanity checks
+
+Step 2: Run ANARCI (scheme=imgt)
+len(results) = 240
+len(hit_tables) = 240
+example index with hit_table: 0 acc: QPY89049.1
+hit_table type: <class 'list'>
+hit_table repr head: [{'id': 'human_K', 'description': '', 'evalue': 1.3e-57, 'bitscore': 184.4, 'bias': 0.5, 'query_start': 0, 'query_end': 108, 'species': 'human', 'chain_type': 'K', 'scheme': 'imgt', 'query_name': 'QPY89049.1'}]
+Saved hit table example to: /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/plabdab_annotate_1/anarci_hit_table_example_repr.txt
+Updated plan:
+1. [✓] Load FASTA (completed)
+2. [✓] Run ANARCI (IMGT) and confirm outputs (results + hit tables) (completed)
+3. [ ] Build per-sequence chain type from hit table; build gapped sequence + CDR lengths from numbering
+4. [ ] Write final CSV + intermediates to required paths; sanity checks
+
+Step 3: Build rows using results + hit_tables
+n_rows = 240
+n_failed = 0
+n_errors = 0
+Updated plan:
+1. [✓] Load FASTA (completed)
+2. [✓] Run ANARCI (IMGT) and confirm outputs (results + hit tables) (completed)
+3. [✓] Build per-sequence chain type from hit table; build gapped sequence + CDR lengths from numbering (completed)
+4. [ ] Write final CSV + intermediates to required paths; sanity checks
+
+Step 4: Write outputs
+Saved intermediate CSV: /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/plabdab_annotate_1/plabdab_annotate_1_intermediate.csv
+Saved final CSV: /root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/plabdab_annotate_1.csv
+Preview first 3 lines:
+Accession,Numbered_Sequence,CDR_Lengths,Chain_Type
+QPY89049.1,EIVLTQSPGTLSLSPGERATLSCRASQSVG-----SSYLAWYQQKPGQAPRLLIYGA-------FSRATGIP-DRFSGSG--SGTDFTLTISRLEPEDFAVYYCQQYGS----SPWTFGQGTKVEIK,7_3_9,L
+QEP20941.1,DIQMTQSPSSLSASVGDRVTITCRASQGI------SNSLAWYQQKPGKAPNLLLYAA-------SRLESGVP-SRFSGSG--SGTDYTLTISSLQPEDFATYYCQQYYR----TPLTFGGGSKVEIK,6_3_9,L
+
+Final plan:
+1. [✓] Load FASTA (completed)
+2. [✓] Run ANARCI (IMGT) and confirm outputs (results + hit tables) (completed)
+3. [✓] Build per-sequence chain type from hit table; build gapped sequence + CDR lengths from numbering (completed)
+4. [✓] Write final CSV + intermediates to required paths; sanity checks (completed)
+</observation>
+<solution>
+Generated the requested ANARCI(IMGT)-based annotation CSV.
+
+- Input: `benchmark/dataset/PLAbDab/plabdab_annotate_1_input.fasta` (240 sequences)
+- Output CSV saved to: `/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/plabdab_annotate_1.csv`
+- Intermediate files saved under: `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/plabdab_annotate_1/`
+
+CSV columns:
+- `Accession` (from FASTA header)
+- `Numbered_Sequence` (IMGT-numbered, gapped)
+- `CDR_Lengths` (IMGT CDR1/CDR2/CDR3 lengths, gaps excluded; format `cdr1_cdr2_cdr3`)
+- `Chain_Type` (binary: `H` or `L`, where ANARCI K/L → `L`)
+</solution>

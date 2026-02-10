@@ -1,0 +1,1329 @@
+Analyze the provided gene expression data in `benchmark/dataset/ClinicalOmicsDB/expression_data.csv` to compare expression levels between "responder" and "non-responder" groups. 
+
+For each gene, perform a Wilcoxon rank-sum test to get a p-value and calculate the Area Under the Receiver Operating Characteristic (AUROC) score. 
+
+Save the results as a CSV file to `/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/clinicalomicsdb_annotate.csv`, with columns for "gene", "p_value", and "auroc".
+
+Output example format:
+```
+gene,p_value,auroc
+GeneA,0.01,0.85
+GeneB,0.05,0.75
+```
+
+All intermediate results should be saved in `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/clinicalomicsdb_annotate` directory.
+
+<execute>
+import os, pandas as pd, numpy as np
+from pathlib import Path
+from scipy.stats import mannwhitneyu
+from sklearn.metrics import roc_auc_score
+
+print("Research log: clinicalomicsdb_annotate")
+
+# Plan checklist
+plan = [
+    "Locate and load expression_data.csv; identify responder/non-responder labels and gene columns.",
+    "Compute per-gene Wilcoxon rank-sum p-values and AUROC (responder vs non-responder), handling missing/constant values.",
+    "Save intermediate artifacts to tmp directory and final CSV to requested output path."
+]
+checklist = [f"{i+1}. [ ] {step}" for i, step in enumerate(plan)]
+print("\nInitial plan:\n" + "\n".join(checklist))
+
+# Step 1: paths and load
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/clinicalomicsdb_annotate")
+out_path = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/clinicalomicsdb_annotate.csv")
+tmp_dir.mkdir(parents=True, exist_ok=True)
+out_path.parent.mkdir(parents=True, exist_ok=True)
+
+in_path = Path("benchmark/dataset/ClinicalOmicsDB/expression_data.csv")
+print(f"\nStep 1: Loading input from: {in_path.resolve()}")
+df = pd.read_csv(in_path)
+print("Loaded shape:", df.shape)
+print("Columns (first 30):", df.columns.tolist()[:30])
+
+# attempt to find label column
+col_lower = {c: c.lower() for c in df.columns}
+label_candidates = [c for c in df.columns if col_lower[c] in ("response","responder","group","status","label","clinical_response")]
+print("Label candidates:", label_candidates)
+
+# heuristics: look for column containing responder/non-responder strings
+resp_col = None
+for c in df.columns:
+    if df[c].dtype == object:
+        vals = df[c].astype(str).str.lower().unique()
+        if any("responder" in v for v in vals) and any("non" in v and "responder" in v for v in vals):
+            resp_col = c
+            break
+
+if resp_col is None and label_candidates:
+    resp_col = label_candidates[0]
+
+if resp_col is None:
+    # scan any column for exactly two unique categories that map
+    for c in df.columns:
+        if df[c].dtype == object or str(df[c].dtype).startswith("category"):
+            u = pd.Series(df[c].astype(str).str.lower().unique())
+            if len(u) == 2 and (("responder" in u.iloc[0]) or ("responder" in u.iloc[1])):
+                resp_col = c
+                break
+
+print("Chosen response column:", resp_col)
+if resp_col is None:
+    raise ValueError("Could not identify responder/non-responder column.")
+
+# define y: responder=1, non-responder=0
+resp_series = df[resp_col].astype(str).str.lower()
+def map_resp(x):
+    if "non" in x and "responder" in x:
+        return 0
+    if "responder" in x:
+        return 1
+    if x in ("1","true","yes","y","responder"):
+        return 1
+    if x in ("0","false","no","n","non-responder","nonresponder"):
+        return 0
+    return np.nan
+
+y = resp_series.map(map_resp)
+valid_y = y.dropna()
+print("Response value counts (mapped):", y.value_counts(dropna=False).to_dict())
+
+# Identify gene columns: numeric columns excluding response and obvious ids
+exclude = {resp_col}
+id_like = [c for c in df.columns if col_lower[c] in ("sample","sample_id","id","patient","patient_id","subject","subject_id")]
+exclude.update(id_like)
+numeric_cols = [c for c in df.columns if c not in exclude and pd.api.types.is_numeric_dtype(df[c])]
+print("Excluded columns:", sorted(list(exclude)))
+print("Numeric (gene) columns count:", len(numeric_cols))
+
+# Save intermediate: basic metadata
+meta_path = tmp_dir / "metadata.json"
+meta = {
+    "input_path": str(in_path),
+    "shape": df.shape,
+    "response_column": resp_col,
+    "excluded_columns": sorted(list(exclude)),
+    "n_gene_columns": len(numeric_cols),
+    "n_samples_total": int(df.shape[0]),
+    "n_samples_with_label": int(valid_y.shape[0]),
+    "label_counts": {str(k): int(v) for k,v in y.value_counts(dropna=False).items()}
+}
+import json
+meta_path.write_text(json.dumps(meta, indent=2))
+print("Saved metadata to:", meta_path)
+
+# update checklist step1
+checklist[0] = checklist[0].replace("[ ]","[✓]")
+print("\nUpdated plan:\n" + "\n".join(checklist))
+
+# Step 2: per-gene tests
+print("\nStep 2: Computing Wilcoxon rank-sum (Mann-Whitney U) and AUROC per gene")
+work_df = df.loc[y.notna(), numeric_cols].copy()
+y_work = y.loc[y.notna()].astype(int).values
+
+results = []
+skipped = []
+for gene in numeric_cols:
+    x = work_df[gene].values
+    mask = ~np.isnan(x)
+    x = x[mask]
+    yy = y_work[mask]
+    # Need both classes present
+    if len(np.unique(yy)) < 2:
+        skipped.append((gene, "single_class_after_nan_filter"))
+        continue
+    x0 = x[yy==0]
+    x1 = x[yy==1]
+    # If all values identical, AUROC undefined; p-value will be 1 (u-test can handle ties but constant both groups)
+    try:
+        # two-sided Mann-Whitney U
+        p = mannwhitneyu(x1, x0, alternative="two-sided").pvalue
+    except Exception as e:
+        skipped.append((gene, f"mw_error:{e}"))
+        continue
+    # AUROC: handle constant scores -> roc_auc_score raises
+    try:
+        au = roc_auc_score(yy, x)
+    except Exception:
+        au = np.nan
+    results.append((gene, float(p), float(au) if au==au else np.nan))
+
+res_df = pd.DataFrame(results, columns=["gene","p_value","auroc"])
+print("Computed results for genes:", res_df.shape[0])
+print("Skipped genes:", len(skipped))
+pd.DataFrame(skipped, columns=["gene","reason"]).to_csv(tmp_dir/"skipped_genes.csv", index=False)
+res_df.to_csv(tmp_dir/"per_gene_stats.csv", index=False)
+print("Saved intermediate results to:", tmp_dir/"per_gene_stats.csv")
+print("Saved skipped genes to:", tmp_dir/"skipped_genes.csv")
+
+# update checklist step2
+checklist[1] = checklist[1].replace("[ ]","[✓]")
+print("\nUpdated plan:\n" + "\n".join(checklist))
+
+# Step 3: save final CSV
+res_df.to_csv(out_path, index=False)
+print("\nStep 3: Saved final CSV to:", out_path)
+print("Preview:\n", res_df.head().to_csv(index=False))
+
+# update checklist step3
+checklist[2] = checklist[2].replace("[ ]","[✓]")
+print("\nUpdated plan:\n" + "\n".join(checklist))
+</execute>
+<observation>NameError("name 'col_lower' is not defined")</observation>
+<execute>
+import os, pandas as pd, numpy as np
+from pathlib import Path
+from scipy.stats import mannwhitneyu
+from sklearn.metrics import roc_auc_score
+import json
+
+print("Research log: clinicalomicsdb_annotate (rerun with fix)")
+
+# Plan checklist
+plan = [
+    "Locate and load expression_data.csv; identify responder/non-responder labels and gene columns.",
+    "Compute per-gene Wilcoxon rank-sum p-values and AUROC (responder vs non-responder), handling missing/constant values.",
+    "Save intermediate artifacts to tmp directory and final CSV to requested output path."
+]
+checklist = [f"{i+1}. [ ] {step}" for i, step in enumerate(plan)]
+print("\nInitial plan:\n" + "\n".join(checklist))
+
+# Step 1
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/clinicalomicsdb_annotate")
+out_path = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/clinicalomicsdb_annotate.csv")
+tmp_dir.mkdir(parents=True, exist_ok=True)
+out_path.parent.mkdir(parents=True, exist_ok=True)
+
+in_path = Path("benchmark/dataset/ClinicalOmicsDB/expression_data.csv")
+print(f"\nStep 1: Loading input from: {in_path.resolve()}")
+df = pd.read_csv(in_path)
+print("Loaded shape:", df.shape)
+
+# FIX: define col_lower mapping
+col_lower = {c: str(c).lower() for c in df.columns}
+print("Columns (first 30):", df.columns.tolist()[:30])
+
+# Identify response column
+label_candidates = [c for c in df.columns if col_lower[c] in ("response","responder","group","status","label","clinical_response")]
+print("Label candidates:", label_candidates)
+
+resp_col = None
+for c in df.columns:
+    if df[c].dtype == object:
+        vals = df[c].astype(str).str.lower().unique()
+        if any("responder" in v for v in vals) and any(("non" in v and "responder" in v) for v in vals):
+            resp_col = c
+            break
+
+if resp_col is None and label_candidates:
+    resp_col = label_candidates[0]
+
+if resp_col is None:
+    # fallback: any column with exactly two unique values containing responder
+    for c in df.columns:
+        if df[c].dtype == object:
+            u = df[c].astype(str).str.lower().dropna().unique()
+            if len(u) == 2 and any("responder" in v for v in u):
+                resp_col = c
+                break
+
+print("Chosen response column:", resp_col)
+if resp_col is None:
+    raise ValueError("Could not identify responder/non-responder column.")
+
+resp_series = df[resp_col].astype(str).str.lower()
+def map_resp(x):
+    if "non" in x and "responder" in x:
+        return 0
+    if "responder" in x:
+        return 1
+    if x in ("1","true","yes","y"):
+        return 1
+    if x in ("0","false","no","n"):
+        return 0
+    return np.nan
+
+y = resp_series.map(map_resp)
+print("Response value counts (mapped):", y.value_counts(dropna=False).to_dict())
+
+exclude = {resp_col}
+id_like = [c for c in df.columns if col_lower[c] in ("sample","sample_id","id","patient","patient_id","subject","subject_id")]
+exclude.update(id_like)
+numeric_cols = [c for c in df.columns if c not in exclude and pd.api.types.is_numeric_dtype(df[c])]
+print("Excluded columns:", sorted(list(exclude)))
+print("Numeric (gene) columns count:", len(numeric_cols))
+
+meta = {
+    "input_path": str(in_path),
+    "shape": list(df.shape),
+    "response_column": resp_col,
+    "excluded_columns": sorted(list(exclude)),
+    "n_gene_columns": len(numeric_cols),
+    "n_samples_total": int(df.shape[0]),
+    "n_samples_with_label": int(y.notna().sum()),
+    "label_counts": {str(k): int(v) for k, v in y.value_counts(dropna=False).items()},
+}
+(meta_path := tmp_dir / "metadata.json").write_text(json.dumps(meta, indent=2))
+print("Saved metadata to:", meta_path)
+
+checklist[0] = checklist[0].replace("[ ]","[✓]")
+print("\nUpdated plan:\n" + "\n".join(checklist))
+
+# Step 2
+print("\nStep 2: Computing Wilcoxon rank-sum (Mann-Whitney U) and AUROC per gene")
+work_df = df.loc[y.notna(), numeric_cols].copy()
+y_work = y.loc[y.notna()].astype(int).to_numpy()
+
+results, skipped = [], []
+for gene in numeric_cols:
+    x_all = work_df[gene].to_numpy()
+    mask = ~np.isnan(x_all)
+    x = x_all[mask]
+    yy = y_work[mask]
+    if len(np.unique(yy)) < 2:
+        skipped.append((gene, "single_class_after_nan_filter"))
+        continue
+    x0 = x[yy == 0]
+    x1 = x[yy == 1]
+    try:
+        p = mannwhitneyu(x1, x0, alternative="two-sided").pvalue
+    except Exception as e:
+        skipped.append((gene, f"mw_error:{type(e).__name__}"))
+        continue
+    try:
+        au = roc_auc_score(yy, x)
+    except Exception:
+        au = np.nan
+    results.append((gene, float(p), float(au) if np.isfinite(au) else np.nan))
+
+res_df = pd.DataFrame(results, columns=["gene", "p_value", "auroc"])
+print("Computed results for genes:", res_df.shape[0])
+print("Skipped genes:", len(skipped))
+
+pd.DataFrame(skipped, columns=["gene", "reason"]).to_csv(tmp_dir / "skipped_genes.csv", index=False)
+res_df.to_csv(tmp_dir / "per_gene_stats.csv", index=False)
+print("Saved intermediate results to:", tmp_dir / "per_gene_stats.csv")
+print("Saved skipped genes to:", tmp_dir / "skipped_genes.csv")
+
+checklist[1] = checklist[1].replace("[ ]","[✓]")
+print("\nUpdated plan:\n" + "\n".join(checklist))
+
+# Step 3
+res_df.to_csv(out_path, index=False)
+print("\nStep 3: Saved final CSV to:", out_path)
+print("Preview:\n", res_df.head().to_csv(index=False))
+
+checklist[2] = checklist[2].replace("[ ]","[✓]")
+print("\nUpdated plan:\n" + "\n".join(checklist))
+</execute>
+<observation>NameError("name 'col_lower' is not defined")</observation>
+<execute>
+import traceback, sys, os, pandas as pd, numpy as np
+from pathlib import Path
+
+print("Debug log: reproduce and inspect environment state")
+
+# Minimal reproduction: read file and define col_lower immediately before any use.
+in_path = Path("benchmark/dataset/ClinicalOmicsDB/expression_data.csv")
+print("Exists?", in_path.exists(), "Path:", in_path.resolve())
+
+df = pd.read_csv(in_path)
+print("Loaded:", df.shape)
+
+col_lower = {c: str(c).lower() for c in df.columns}
+print("col_lower defined, sample:", list(col_lower.items())[:5])
+
+# Ensure no accidental reference before definition:
+label_candidates = [c for c in df.columns if col_lower[c] in ("response","responder","group","status","label","clinical_response")]
+print("label_candidates:", label_candidates)
+
+print("OK: no NameError in this minimal block.")
+</execute>
+<observation>NameError("name 'col_lower' is not defined")</observation>
+<execute>
+import os, json, pandas as pd, numpy as np
+from pathlib import Path
+from scipy.stats import mannwhitneyu
+from sklearn.metrics import roc_auc_score
+
+print("Research log: clinicalomicsdb_annotate (workaround: avoid col_lower var entirely)")
+
+# Plan checklist
+plan = [
+    "Load expression_data.csv and identify responder/non-responder label column and gene columns without using col_lower.",
+    "Compute per-gene Wilcoxon rank-sum p-values and AUROC (responder vs non-responder), handling missing/constant values.",
+    "Save intermediate artifacts to tmp directory and final CSV to requested output path."
+]
+checklist = [f"{i+1}. [ ] {step}" for i, step in enumerate(plan)]
+print("\nInitial plan:\n" + "\n".join(checklist))
+
+# Step 1
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/clinicalomicsdb_annotate")
+out_path = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/clinicalomicsdb_annotate.csv")
+tmp_dir.mkdir(parents=True, exist_ok=True)
+out_path.parent.mkdir(parents=True, exist_ok=True)
+
+in_path = Path("benchmark/dataset/ClinicalOmicsDB/expression_data.csv")
+df = pd.read_csv(in_path)
+print("\nStep 1: Loaded", in_path, "shape:", df.shape)
+print("Columns (first 40):", df.columns.tolist()[:40])
+
+# Find response column by scanning object columns for responder/non-responder strings
+resp_col = None
+for c in df.columns:
+    if df[c].dtype == object:
+        vals = df[c].astype(str).str.lower().dropna().unique()
+        if any("responder" in v for v in vals) and any(("non" in v and "responder" in v) for v in vals):
+            resp_col = c
+            break
+
+# fallback by common names
+if resp_col is None:
+    common = ["response","responder","group","status","label","clinical_response"]
+    lower_names = {str(c).lower(): c for c in df.columns}
+    for nm in common:
+        if nm in lower_names:
+            resp_col = lower_names[nm]
+            break
+
+print("Chosen response column:", resp_col)
+if resp_col is None:
+    raise ValueError("Could not identify responder/non-responder column.")
+
+resp_series = df[resp_col].astype(str).str.lower()
+def map_resp(x):
+    if "non" in x and "responder" in x:
+        return 0
+    if "responder" in x:
+        return 1
+    if x in ("1","true","yes","y"):
+        return 1
+    if x in ("0","false","no","n"):
+        return 0
+    return np.nan
+
+y = resp_series.map(map_resp)
+print("Mapped label counts:", y.value_counts(dropna=False).to_dict())
+
+# Identify gene columns: numeric columns excluding response and common ID columns (case-insensitive)
+exclude = {resp_col}
+id_names = {"sample","sample_id","id","patient","patient_id","subject","subject_id"}
+for c in df.columns:
+    if str(c).lower() in id_names:
+        exclude.add(c)
+
+gene_cols = [c for c in df.columns if c not in exclude and pd.api.types.is_numeric_dtype(df[c])]
+print("Excluded:", sorted(exclude))
+print("Gene(numeric) columns:", len(gene_cols))
+
+(meta_path := tmp_dir / "metadata.json").write_text(json.dumps({
+    "input_path": str(in_path),
+    "shape": list(df.shape),
+    "response_column": resp_col,
+    "excluded_columns": sorted(exclude),
+    "n_gene_columns": len(gene_cols),
+    "label_counts": {str(k): int(v) for k,v in y.value_counts(dropna=False).items()}
+}, indent=2))
+print("Saved metadata:", meta_path)
+
+checklist[0] = checklist[0].replace("[ ]","[✓]")
+print("\nUpdated plan:\n" + "\n".join(checklist))
+
+# Step 2
+print("\nStep 2: Per-gene Wilcoxon rank-sum + AUROC")
+mask_lbl = y.notna()
+X = df.loc[mask_lbl, gene_cols].copy()
+yy_all = y.loc[mask_lbl].astype(int).to_numpy()
+
+results, skipped = [], []
+for gene in gene_cols:
+    x_all = X[gene].to_numpy()
+    m = ~np.isnan(x_all)
+    x = x_all[m]
+    yy = yy_all[m]
+    if len(np.unique(yy)) < 2:
+        skipped.append((gene, "single_class_after_nan_filter"))
+        continue
+    x0, x1 = x[yy==0], x[yy==1]
+    try:
+        p = mannwhitneyu(x1, x0, alternative="two-sided").pvalue
+    except Exception as e:
+        skipped.append((gene, f"mw_error:{type(e).__name__}"))
+        continue
+    try:
+        au = roc_auc_score(yy, x)
+    except Exception:
+        au = np.nan
+    results.append((gene, float(p), float(au) if np.isfinite(au) else np.nan))
+
+res_df = pd.DataFrame(results, columns=["gene","p_value","auroc"])
+print("Done. Genes tested:", len(res_df), "Skipped:", len(skipped))
+
+res_df.to_csv(tmp_dir/"per_gene_stats.csv", index=False)
+pd.DataFrame(skipped, columns=["gene","reason"]).to_csv(tmp_dir/"skipped_genes.csv", index=False)
+print("Saved intermediate:", tmp_dir/"per_gene_stats.csv")
+print("Saved skipped:", tmp_dir/"skipped_genes.csv")
+
+checklist[1] = checklist[1].replace("[ ]","[✓]")
+print("\nUpdated plan:\n" + "\n".join(checklist))
+
+# Step 3
+res_df.to_csv(out_path, index=False)
+print("\nStep 3: Saved final CSV:", out_path)
+print("Preview:\n", res_df.head().to_csv(index=False))
+
+checklist[2] = checklist[2].replace("[ ]","[✓]")
+print("\nUpdated plan:\n" + "\n".join(checklist))
+</execute>
+<observation>NameError("name 'np' is not defined")</observation>
+<execute>
+import os, json
+import pandas as pd
+
+print("Research log: clinicalomicsdb_annotate (fix: ensure numpy imported as np)")
+
+# Plan checklist
+plan = [
+    "Load expression_data.csv and identify responder/non-responder label column and gene columns.",
+    "Compute per-gene Wilcoxon rank-sum p-values and AUROC (responder vs non-responder), handling missing/constant values.",
+    "Save intermediate artifacts to tmp directory and final CSV to requested output path."
+]
+checklist = [f"{i+1}. [ ] {step}" for i, step in enumerate(plan)]
+print("\nInitial plan:\n" + "\n".join(checklist))
+
+# Step 1: imports and paths
+import numpy as np
+from pathlib import Path
+from scipy.stats import mannwhitneyu
+from sklearn.metrics import roc_auc_score
+
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/clinicalomicsdb_annotate")
+out_path = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/clinicalomicsdb_annotate.csv")
+tmp_dir.mkdir(parents=True, exist_ok=True)
+out_path.parent.mkdir(parents=True, exist_ok=True)
+
+in_path = Path("benchmark/dataset/ClinicalOmicsDB/expression_data.csv")
+df = pd.read_csv(in_path)
+print("\nStep 1: Loaded", in_path, "shape:", df.shape)
+print("Columns (first 40):", df.columns.tolist()[:40])
+
+# Find response column
+resp_col = None
+for c in df.columns:
+    if df[c].dtype == object:
+        vals = df[c].astype(str).str.lower().dropna().unique()
+        if any("responder" in v for v in vals) and any(("non" in v and "responder" in v) for v in vals):
+            resp_col = c
+            break
+if resp_col is None:
+    common = ["response","responder","group","status","label","clinical_response"]
+    lower_names = {str(c).lower(): c for c in df.columns}
+    for nm in common:
+        if nm in lower_names:
+            resp_col = lower_names[nm]
+            break
+
+print("Chosen response column:", resp_col)
+if resp_col is None:
+    raise ValueError("Could not identify responder/non-responder column.")
+
+resp_series = df[resp_col].astype(str).str.lower()
+def map_resp(x):
+    if "non" in x and "responder" in x:
+        return 0
+    if "responder" in x:
+        return 1
+    if x in ("1","true","yes","y"):
+        return 1
+    if x in ("0","false","no","n"):
+        return 0
+    return np.nan
+
+y = resp_series.map(map_resp)
+print("Mapped label counts:", y.value_counts(dropna=False).to_dict())
+
+exclude = {resp_col}
+id_names = {"sample","sample_id","id","patient","patient_id","subject","subject_id"}
+for c in df.columns:
+    if str(c).lower() in id_names:
+        exclude.add(c)
+
+gene_cols = [c for c in df.columns if c not in exclude and pd.api.types.is_numeric_dtype(df[c])]
+print("Excluded:", sorted(exclude))
+print("Gene(numeric) columns:", len(gene_cols))
+
+(tmp_dir / "metadata.json").write_text(json.dumps({
+    "input_path": str(in_path),
+    "shape": list(df.shape),
+    "response_column": resp_col,
+    "excluded_columns": sorted(exclude),
+    "n_gene_columns": len(gene_cols),
+    "label_counts": {str(k): int(v) for k,v in y.value_counts(dropna=False).items()}
+}, indent=2))
+print("Saved metadata:", tmp_dir / "metadata.json")
+
+checklist[0] = checklist[0].replace("[ ]","[✓]")
+print("\nUpdated plan:\n" + "\n".join(checklist))
+
+# Step 2
+print("\nStep 2: Per-gene Wilcoxon rank-sum + AUROC")
+mask_lbl = y.notna()
+X = df.loc[mask_lbl, gene_cols].copy()
+yy_all = y.loc[mask_lbl].astype(int).to_numpy()
+
+results, skipped = [], []
+for gene in gene_cols:
+    x_all = X[gene].to_numpy()
+    m = ~np.isnan(x_all)
+    x = x_all[m]
+    yy = yy_all[m]
+    if len(np.unique(yy)) < 2:
+        skipped.append((gene, "single_class_after_nan_filter"))
+        continue
+    x0, x1 = x[yy==0], x[yy==1]
+    try:
+        p = mannwhitneyu(x1, x0, alternative="two-sided").pvalue
+    except Exception as e:
+        skipped.append((gene, f"mw_error:{type(e).__name__}"))
+        continue
+    try:
+        au = roc_auc_score(yy, x)
+    except Exception:
+        au = np.nan
+    results.append((gene, float(p), float(au) if np.isfinite(au) else np.nan))
+
+res_df = pd.DataFrame(results, columns=["gene","p_value","auroc"])
+print("Done. Genes tested:", len(res_df), "Skipped:", len(skipped))
+
+res_df.to_csv(tmp_dir/"per_gene_stats.csv", index=False)
+pd.DataFrame(skipped, columns=["gene","reason"]).to_csv(tmp_dir/"skipped_genes.csv", index=False)
+print("Saved intermediate:", tmp_dir/"per_gene_stats.csv")
+print("Saved skipped:", tmp_dir/"skipped_genes.csv")
+
+checklist[1] = checklist[1].replace("[ ]","[✓]")
+print("\nUpdated plan:\n" + "\n".join(checklist))
+
+# Step 3
+res_df.to_csv(out_path, index=False)
+print("\nStep 3: Saved final CSV:", out_path)
+print("Preview:\n", res_df.head().to_csv(index=False))
+
+checklist[2] = checklist[2].replace("[ ]","[✓]")
+print("\nUpdated plan:\n" + "\n".join(checklist))
+</execute>
+<observation>NameError("name 'np' is not defined")</observation>
+<execute>
+# NOTE: This environment seems to execute code in a way that can drop later imports.
+# Workaround: import numpy under its full name and never reference `np`.
+
+import os, json
+from pathlib import Path
+
+import pandas as pd
+import numpy  # use `numpy.` prefix everywhere
+
+from scipy.stats import mannwhitneyu
+from sklearn.metrics import roc_auc_score
+
+print("Research log: clinicalomicsdb_annotate (final workaround: use `numpy` not `np`)")
+
+# Plan checklist
+plan = [
+    "Load expression_data.csv and identify responder/non-responder label column and gene columns.",
+    "Compute per-gene Wilcoxon rank-sum p-values and AUROC (responder vs non-responder), handling missing/constant values.",
+    "Save intermediate artifacts to tmp directory and final CSV to requested output path."
+]
+checklist = [f"{i+1}. [ ] {step}" for i, step in enumerate(plan)]
+print("\nInitial plan:\n" + "\n".join(checklist))
+
+# Step 1
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/clinicalomicsdb_annotate")
+out_path = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/clinicalomicsdb_annotate.csv")
+tmp_dir.mkdir(parents=True, exist_ok=True)
+out_path.parent.mkdir(parents=True, exist_ok=True)
+
+in_path = Path("benchmark/dataset/ClinicalOmicsDB/expression_data.csv")
+df = pd.read_csv(in_path)
+print("\nStep 1: Loaded", in_path, "shape:", df.shape)
+print("Columns (first 40):", df.columns.tolist()[:40])
+
+resp_col = None
+for c in df.columns:
+    if df[c].dtype == object:
+        vals = df[c].astype(str).str.lower().dropna().unique()
+        if any("responder" in v for v in vals) and any(("non" in v and "responder" in v) for v in vals):
+            resp_col = c
+            break
+if resp_col is None:
+    common = ["response","responder","group","status","label","clinical_response"]
+    lower_names = {str(c).lower(): c for c in df.columns}
+    for nm in common:
+        if nm in lower_names:
+            resp_col = lower_names[nm]
+            break
+
+print("Chosen response column:", resp_col)
+if resp_col is None:
+    raise ValueError("Could not identify responder/non-responder column.")
+
+resp_series = df[resp_col].astype(str).str.lower()
+def map_resp(x):
+    if "non" in x and "responder" in x:
+        return 0
+    if "responder" in x:
+        return 1
+    if x in ("1","true","yes","y"):
+        return 1
+    if x in ("0","false","no","n"):
+        return 0
+    return numpy.nan
+
+y = resp_series.map(map_resp)
+print("Mapped label counts:", y.value_counts(dropna=False).to_dict())
+
+exclude = {resp_col}
+id_names = {"sample","sample_id","id","patient","patient_id","subject","subject_id"}
+for c in df.columns:
+    if str(c).lower() in id_names:
+        exclude.add(c)
+
+gene_cols = [c for c in df.columns if c not in exclude and pd.api.types.is_numeric_dtype(df[c])]
+print("Excluded:", sorted(exclude))
+print("Gene(numeric) columns:", len(gene_cols))
+
+(tmp_dir / "metadata.json").write_text(json.dumps({
+    "input_path": str(in_path),
+    "shape": list(df.shape),
+    "response_column": resp_col,
+    "excluded_columns": sorted(exclude),
+    "n_gene_columns": len(gene_cols),
+    "label_counts": {str(k): int(v) for k,v in y.value_counts(dropna=False).items()}
+}, indent=2))
+print("Saved metadata:", tmp_dir / "metadata.json")
+
+checklist[0] = checklist[0].replace("[ ]","[✓]")
+print("\nUpdated plan:\n" + "\n".join(checklist))
+
+# Step 2
+print("\nStep 2: Per-gene Wilcoxon rank-sum + AUROC")
+mask_lbl = y.notna()
+X = df.loc[mask_lbl, gene_cols].copy()
+yy_all = y.loc[mask_lbl].astype(int).to_numpy()
+
+results, skipped = [], []
+for gene in gene_cols:
+    x_all = X[gene].to_numpy()
+    m = ~numpy.isnan(x_all)
+    x = x_all[m]
+    yy = yy_all[m]
+    if len(numpy.unique(yy)) < 2:
+        skipped.append((gene, "single_class_after_nan_filter"))
+        continue
+    x0, x1 = x[yy==0], x[yy==1]
+    try:
+        p = mannwhitneyu(x1, x0, alternative="two-sided").pvalue
+    except Exception as e:
+        skipped.append((gene, f"mw_error:{type(e).__name__}"))
+        continue
+    try:
+        au = roc_auc_score(yy, x)
+    except Exception:
+        au = numpy.nan
+    results.append((gene, float(p), float(au) if numpy.isfinite(au) else numpy.nan))
+
+res_df = pd.DataFrame(results, columns=["gene","p_value","auroc"])
+print("Done. Genes tested:", len(res_df), "Skipped:", len(skipped))
+
+res_df.to_csv(tmp_dir/"per_gene_stats.csv", index=False)
+pd.DataFrame(skipped, columns=["gene","reason"]).to_csv(tmp_dir/"skipped_genes.csv", index=False)
+print("Saved intermediate:", tmp_dir/"per_gene_stats.csv")
+print("Saved skipped:", tmp_dir/"skipped_genes.csv")
+
+checklist[1] = checklist[1].replace("[ ]","[✓]")
+print("\nUpdated plan:\n" + "\n".join(checklist))
+
+# Step 3
+res_df.to_csv(out_path, index=False)
+print("\nStep 3: Saved final CSV:", out_path)
+print("Preview:\n", res_df.head().to_csv(index=False))
+
+checklist[2] = checklist[2].replace("[ ]","[✓]")
+print("\nUpdated plan:\n" + "\n".join(checklist))
+</execute>
+<observation>NameError("name 'numpy' is not defined")</observation>
+<execute>
+# Workaround for this environment: avoid numpy entirely.
+
+import os, json, math
+from pathlib import Path
+
+import pandas as pd
+from scipy.stats import mannwhitneyu
+from sklearn.metrics import roc_auc_score
+
+print("Research log: clinicalomicsdb_annotate (no-numpy implementation)")
+
+# Plan checklist
+plan = [
+    "Load expression_data.csv and identify responder/non-responder label column and gene columns.",
+    "Compute per-gene Wilcoxon rank-sum p-values and AUROC (responder vs non-responder), handling missing/constant values.",
+    "Save intermediate artifacts to tmp directory and final CSV to requested output path."
+]
+checklist = [f"{i+1}. [ ] {step}" for i, step in enumerate(plan)]
+print("\nInitial plan:\n" + "\n".join(checklist))
+
+def is_nan(x):
+    try:
+        return x != x  # NaN is not equal to itself
+    except Exception:
+        return False
+
+# Step 1
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/clinicalomicsdb_annotate")
+out_path = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/clinicalomicsdb_annotate.csv")
+tmp_dir.mkdir(parents=True, exist_ok=True)
+out_path.parent.mkdir(parents=True, exist_ok=True)
+
+in_path = Path("benchmark/dataset/ClinicalOmicsDB/expression_data.csv")
+df = pd.read_csv(in_path)
+print("\nStep 1: Loaded", in_path, "shape:", df.shape)
+print("Columns (first 40):", df.columns.tolist()[:40])
+
+# find response column
+resp_col = None
+for c in df.columns:
+    if df[c].dtype == object:
+        vals = df[c].astype(str).str.lower().dropna().unique()
+        if any("responder" in v for v in vals) and any(("non" in v and "responder" in v) for v in vals):
+            resp_col = c
+            break
+if resp_col is None:
+    common = ["response","responder","group","status","label","clinical_response"]
+    lower_names = {str(c).lower(): c for c in df.columns}
+    for nm in common:
+        if nm in lower_names:
+            resp_col = lower_names[nm]
+            break
+
+print("Chosen response column:", resp_col)
+if resp_col is None:
+    raise ValueError("Could not identify responder/non-responder column.")
+
+def map_resp(x):
+    x = str(x).lower()
+    if "non" in x and "responder" in x:
+        return 0
+    if "responder" in x:
+        return 1
+    if x in ("1","true","yes","y"):
+        return 1
+    if x in ("0","false","no","n"):
+        return 0
+    return None
+
+y = df[resp_col].map(map_resp)
+print("Mapped label counts:", y.value_counts(dropna=False).to_dict())
+
+exclude = {resp_col}
+id_names = {"sample","sample_id","id","patient","patient_id","subject","subject_id"}
+for c in df.columns:
+    if str(c).lower() in id_names:
+        exclude.add(c)
+
+gene_cols = [c for c in df.columns if c not in exclude and pd.api.types.is_numeric_dtype(df[c])]
+print("Excluded:", sorted(exclude))
+print("Gene(numeric) columns:", len(gene_cols))
+
+(tmp_dir / "metadata.json").write_text(json.dumps({
+    "input_path": str(in_path),
+    "shape": list(df.shape),
+    "response_column": resp_col,
+    "excluded_columns": sorted(exclude),
+    "n_gene_columns": len(gene_cols),
+    "label_counts": {str(k): int(v) for k,v in y.value_counts(dropna=False).items()}
+}, indent=2))
+print("Saved metadata:", tmp_dir / "metadata.json")
+
+checklist[0] = checklist[0].replace("[ ]","[✓]")
+print("\nUpdated plan:\n" + "\n".join(checklist))
+
+# Step 2
+print("\nStep 2: Per-gene Wilcoxon rank-sum + AUROC (no numpy)")
+mask_lbl = y.notna()
+df_lbl = df.loc[mask_lbl, :]
+y_lbl = y.loc[mask_lbl].astype(int).tolist()
+
+results, skipped = [], []
+for gene in gene_cols:
+    x_series = df_lbl[gene]
+    x_vals = x_series.tolist()
+
+    # filter NaNs in x while keeping y aligned
+    x_f, y_f = [], []
+    for xv, yv in zip(x_vals, y_lbl):
+        if xv is None or is_nan(xv):
+            continue
+        x_f.append(float(xv))
+        y_f.append(int(yv))
+
+    if len(set(y_f)) < 2:
+        skipped.append((gene, "single_class_after_nan_filter"))
+        continue
+
+    x0 = [x for x, yy in zip(x_f, y_f) if yy == 0]
+    x1 = [x for x, yy in zip(x_f, y_f) if yy == 1]
+    try:
+        p = mannwhitneyu(x1, x0, alternative="two-sided").pvalue
+    except Exception as e:
+        skipped.append((gene, f"mw_error:{type(e).__name__}"))
+        continue
+
+    try:
+        au = roc_auc_score(y_f, x_f)
+    except Exception:
+        au = float("nan")
+
+    results.append((gene, float(p), float(au)))
+
+res_df = pd.DataFrame(results, columns=["gene","p_value","auroc"])
+print("Done. Genes tested:", len(res_df), "Skipped:", len(skipped))
+
+res_df.to_csv(tmp_dir/"per_gene_stats.csv", index=False)
+pd.DataFrame(skipped, columns=["gene","reason"]).to_csv(tmp_dir/"skipped_genes.csv", index=False)
+print("Saved intermediate:", tmp_dir/"per_gene_stats.csv")
+print("Saved skipped:", tmp_dir/"skipped_genes.csv")
+
+checklist[1] = checklist[1].replace("[ ]","[✓]")
+print("\nUpdated plan:\n" + "\n".join(checklist))
+
+# Step 3
+res_df.to_csv(out_path, index=False)
+print("\nStep 3: Saved final CSV:", out_path)
+print("Preview:\n", res_df.head().to_csv(index=False))
+
+checklist[2] = checklist[2].replace("[ ]","[✓]")
+print("\nUpdated plan:\n" + "\n".join(checklist))
+</execute>
+<observation>NameError("name 'exclude' is not defined")</observation>
+<execute>
+# This run minimizes reliance on cross-statement state by using a single main() function.
+
+def main():
+    import os, json
+    from pathlib import Path
+    import pandas as pd
+    from scipy.stats import mannwhitneyu
+    from sklearn.metrics import roc_auc_score
+
+    print("Research log: clinicalomicsdb_annotate (single-function run)")
+
+    # Plan checklist
+    plan = [
+        "Load expression_data.csv and identify responder/non-responder label column and gene columns.",
+        "Compute per-gene Wilcoxon rank-sum p-values and AUROC (responder vs non-responder), handling missing/constant values.",
+        "Save intermediate artifacts to tmp directory and final CSV to requested output path."
+    ]
+    checklist = [f"{i+1}. [ ] {step}" for i, step in enumerate(plan)]
+    print("\nInitial plan:\n" + "\n".join(checklist))
+
+    def is_nan(x):
+        try:
+            return x != x
+        except Exception:
+            return False
+
+    tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/clinicalomicsdb_annotate")
+    out_path = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/clinicalomicsdb_annotate.csv")
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    in_path = Path("benchmark/dataset/ClinicalOmicsDB/expression_data.csv")
+
+    # ---- Step 1
+    df = pd.read_csv(in_path)
+    print("\nStep 1: Loaded", in_path, "shape:", df.shape)
+    print("Columns (first 40):", df.columns.tolist()[:40])
+
+    resp_col = None
+    for c in df.columns:
+        if df[c].dtype == object:
+            vals = df[c].astype(str).str.lower().dropna().unique()
+            if any("responder" in v for v in vals) and any(("non" in v and "responder" in v) for v in vals):
+                resp_col = c
+                break
+    if resp_col is None:
+        common = ["response","responder","group","status","label","clinical_response"]
+        lower_names = {str(c).lower(): c for c in df.columns}
+        for nm in common:
+            if nm in lower_names:
+                resp_col = lower_names[nm]
+                break
+
+    print("Chosen response column:", resp_col)
+    if resp_col is None:
+        raise ValueError("Could not identify responder/non-responder column.")
+
+    def map_resp(x):
+        x = str(x).lower()
+        if "non" in x and "responder" in x:
+            return 0
+        if "responder" in x:
+            return 1
+        if x in ("1","true","yes","y"):
+            return 1
+        if x in ("0","false","no","n"):
+            return 0
+        return None
+
+    y = df[resp_col].map(map_resp)
+    print("Mapped label counts:", y.value_counts(dropna=False).to_dict())
+
+    exclude = {resp_col}
+    id_names = {"sample","sample_id","id","patient","patient_id","subject","subject_id"}
+    for c in df.columns:
+        if str(c).lower() in id_names:
+            exclude.add(c)
+
+    gene_cols = [c for c in df.columns if c not in exclude and pd.api.types.is_numeric_dtype(df[c])]
+    print("Excluded:", sorted(exclude))
+    print("Gene(numeric) columns:", len(gene_cols))
+
+    (tmp_dir / "metadata.json").write_text(json.dumps({
+        "input_path": str(in_path),
+        "shape": list(df.shape),
+        "response_column": resp_col,
+        "excluded_columns": sorted(exclude),
+        "n_gene_columns": len(gene_cols),
+        "label_counts": {str(k): int(v) for k,v in y.value_counts(dropna=False).items()}
+    }, indent=2))
+    print("Saved metadata:", tmp_dir / "metadata.json")
+
+    checklist[0] = checklist[0].replace("[ ]","[✓]")
+    print("\nUpdated plan:\n" + "\n".join(checklist))
+
+    # ---- Step 2
+    print("\nStep 2: Per-gene Wilcoxon rank-sum + AUROC")
+    mask_lbl = y.notna()
+    df_lbl = df.loc[mask_lbl, :]
+    y_lbl = y.loc[mask_lbl].astype(int).tolist()
+
+    results, skipped = [], []
+    for gene in gene_cols:
+        x_vals = df_lbl[gene].tolist()
+        x_f, y_f = [], []
+        for xv, yv in zip(x_vals, y_lbl):
+            if xv is None or is_nan(xv):
+                continue
+            x_f.append(float(xv))
+            y_f.append(int(yv))
+
+        if len(set(y_f)) < 2:
+            skipped.append((gene, "single_class_after_nan_filter"))
+            continue
+
+        x0 = [x for x, yy in zip(x_f, y_f) if yy == 0]
+        x1 = [x for x, yy in zip(x_f, y_f) if yy == 1]
+
+        try:
+            p = mannwhitneyu(x1, x0, alternative="two-sided").pvalue
+        except Exception as e:
+            skipped.append((gene, f"mw_error:{type(e).__name__}"))
+            continue
+
+        try:
+            au = roc_auc_score(y_f, x_f)
+        except Exception:
+            au = float("nan")
+
+        results.append((gene, float(p), float(au)))
+
+    res_df = pd.DataFrame(results, columns=["gene","p_value","auroc"])
+    print("Done. Genes tested:", len(res_df), "Skipped:", len(skipped))
+
+    res_df.to_csv(tmp_dir/"per_gene_stats.csv", index=False)
+    pd.DataFrame(skipped, columns=["gene","reason"]).to_csv(tmp_dir/"skipped_genes.csv", index=False)
+    print("Saved intermediate:", tmp_dir/"per_gene_stats.csv")
+    print("Saved skipped:", tmp_dir/"skipped_genes.csv")
+
+    checklist[1] = checklist[1].replace("[ ]","[✓]")
+    print("\nUpdated plan:\n" + "\n".join(checklist))
+
+    # ---- Step 3
+    res_df.to_csv(out_path, index=False)
+    print("\nStep 3: Saved final CSV:", out_path)
+    print("Preview:\n", res_df.head().to_csv(index=False))
+
+    checklist[2] = checklist[2].replace("[ ]","[✓]")
+    print("\nUpdated plan:\n" + "\n".join(checklist))
+
+main()
+</execute>
+<observation>Research log: clinicalomicsdb_annotate (single-function run)
+
+Initial plan:
+1. [ ] Load expression_data.csv and identify responder/non-responder label column and gene columns.
+2. [ ] Compute per-gene Wilcoxon rank-sum p-values and AUROC (responder vs non-responder), handling missing/constant values.
+3. [ ] Save intermediate artifacts to tmp directory and final CSV to requested output path.
+
+Step 1: Loaded benchmark/dataset/ClinicalOmicsDB/expression_data.csv shape: (51, 21)
+Columns (first 40): ['gene', 'Sample_1', 'Sample_2', 'Sample_3', 'Sample_4', 'Sample_5', 'Sample_6', 'Sample_7', 'Sample_8', 'Sample_9', 'Sample_10', 'Sample_11', 'Sample_12', 'Sample_13', 'Sample_14', 'Sample_15', 'Sample_16', 'Sample_17', 'Sample_18', 'Sample_19', 'Sample_20']
+Chosen response column: Sample_11
+Mapped label counts: {nan: 50, 0.0: 1}
+Excluded: ['Sample_11']
+Gene(numeric) columns: 0
+Saved metadata: /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/clinicalomicsdb_annotate/metadata.json
+
+Updated plan:
+1. [✓] Load expression_data.csv and identify responder/non-responder label column and gene columns.
+2. [ ] Compute per-gene Wilcoxon rank-sum p-values and AUROC (responder vs non-responder), handling missing/constant values.
+3. [ ] Save intermediate artifacts to tmp directory and final CSV to requested output path.
+
+Step 2: Per-gene Wilcoxon rank-sum + AUROC
+Done. Genes tested: 0 Skipped: 0
+Saved intermediate: /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/clinicalomicsdb_annotate/per_gene_stats.csv
+Saved skipped: /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/clinicalomicsdb_annotate/skipped_genes.csv
+
+Updated plan:
+1. [✓] Load expression_data.csv and identify responder/non-responder label column and gene columns.
+2. [✓] Compute per-gene Wilcoxon rank-sum p-values and AUROC (responder vs non-responder), handling missing/constant values.
+3. [ ] Save intermediate artifacts to tmp directory and final CSV to requested output path.
+
+Step 3: Saved final CSV: /root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/clinicalomicsdb_annotate.csv
+Preview:
+ gene,p_value,auroc
+
+
+Updated plan:
+1. [✓] Load expression_data.csv and identify responder/non-responder label column and gene columns.
+2. [✓] Compute per-gene Wilcoxon rank-sum p-values and AUROC (responder vs non-responder), handling missing/constant values.
+3. [✓] Save intermediate artifacts to tmp directory and final CSV to requested output path.
+</observation>
+<execute>
+def main():
+    import json
+    from pathlib import Path
+    import pandas as pd
+    from scipy.stats import mannwhitneyu
+    from sklearn.metrics import roc_auc_score
+
+    print("Research log: clinicalomicsdb_annotate (fix orientation: genes as rows, samples as columns)")
+
+    # Plan checklist
+    plan = [
+        "Load expression_data.csv; detect where responder/non-responder labels live; reshape to long form (sample, gene, expr).",
+        "Compute per-gene Wilcoxon rank-sum p-values and AUROC between responder and non-responder samples.",
+        "Save intermediates to tmp directory and final CSV to requested output path."
+    ]
+    checklist = [f"{i+1}. [ ] {step}" for i, step in enumerate(plan)]
+    print("\nInitial plan:\n" + "\n".join(checklist))
+
+    tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/clinicalomicsdb_annotate")
+    out_path = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/clinicalomicsdb_annotate.csv")
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    in_path = Path("benchmark/dataset/ClinicalOmicsDB/expression_data.csv")
+    df = pd.read_csv(in_path)
+    print("\nStep 1: Loaded", in_path, "shape:", df.shape)
+    print("Columns:", df.columns.tolist())
+
+    # Expect format: first col 'gene', remaining columns are samples; labels likely stored in a special "gene" row.
+    if "gene" not in df.columns:
+        raise ValueError("Expected a 'gene' column with gene names/row labels.")
+
+    sample_cols = [c for c in df.columns if c != "gene"]
+    # find a row that contains responder/non-responder labels across sample columns
+    label_row_idx = None
+    for i in range(df.shape[0]):
+        vals = df.loc[i, sample_cols].astype(str).str.lower()
+        has_resp = vals.str.contains("responder", na=False).any()
+        has_nonresp = vals.str.contains("non", na=False) & vals.str.contains("responder", na=False)
+        if has_resp and has_nonresp.any():
+            label_row_idx = i
+            break
+
+    # if not found, try any row with both responder and non-responder strings
+    if label_row_idx is None:
+        for i in range(df.shape[0]):
+            vals = df.loc[i, sample_cols].astype(str).str.lower()
+            if vals.str.contains("responder", na=False).any() and vals.str.contains("non-responder", na=False).any():
+                label_row_idx = i
+                break
+
+    print("Detected label row index:", label_row_idx)
+    if label_row_idx is None:
+        # Save a hint file for debugging
+        df.head(10).to_csv(tmp_dir / "head10_debug.csv", index=False)
+        raise ValueError("Could not find a row containing responder/non-responder labels across sample columns.")
+
+    label_row_name = str(df.loc[label_row_idx, "gene"])
+    labels_raw = df.loc[label_row_idx, sample_cols].astype(str).str.lower()
+
+    def map_resp(s):
+        if "non" in s and "responder" in s:
+            return 0
+        if "responder" in s:
+            return 1
+        if s in ("1", "true", "yes", "y"):
+            return 1
+        if s in ("0", "false", "no", "n"):
+            return 0
+        return None
+
+    y_map = {sample: map_resp(labels_raw[sample]) for sample in sample_cols}
+    y_series = pd.Series(y_map, name="label")
+    print("Label counts:", y_series.value_counts(dropna=False).to_dict())
+
+    # remove label row from expression matrix
+    expr_df = df.drop(index=label_row_idx).copy()
+
+    # Melt to long: gene, sample, expr
+    long_df = expr_df.melt(id_vars=["gene"], value_vars=sample_cols, var_name="sample", value_name="expr")
+    long_df["label"] = long_df["sample"].map(y_map)
+
+    # Coerce expr to numeric
+    long_df["expr"] = pd.to_numeric(long_df["expr"], errors="coerce")
+
+    # keep only samples with known labels
+    long_df = long_df[long_df["label"].notna()].copy()
+    long_df["label"] = long_df["label"].astype(int)
+
+    # Save intermediates
+    (tmp_dir / "labels.csv").write_text(y_series.to_csv(index=True, header=True))
+    long_df.to_csv(tmp_dir / "long_expression_with_labels.csv", index=False)
+
+    meta = {
+        "input_path": str(in_path),
+        "wide_shape": list(df.shape),
+        "label_row_index": int(label_row_idx),
+        "label_row_name": label_row_name,
+        "n_samples_total": len(sample_cols),
+        "n_samples_labeled": int(y_series.notna().sum()),
+        "label_counts": {str(k): int(v) for k, v in y_series.value_counts(dropna=False).items()},
+        "n_genes_testable": int(long_df["gene"].nunique())
+    }
+    (tmp_dir / "metadata.json").write_text(json.dumps(meta, indent=2))
+    print("Saved metadata/labels/long table to:", tmp_dir)
+
+    checklist[0] = checklist[0].replace("[ ]","[✓]")
+    print("\nUpdated plan:\n" + "\n".join(checklist))
+
+    # Step 2: per gene stats
+    print("\nStep 2: Computing per-gene Mann-Whitney U p-value and AUROC")
+    results = []
+    skipped = []
+
+    for gene, gdf in long_df.groupby("gene", sort=False):
+        # Need both classes
+        if gdf["label"].nunique() < 2:
+            skipped.append((gene, "single_class"))
+            continue
+
+        # Drop NaNs in expression
+        gdf2 = gdf.dropna(subset=["expr"])
+        if gdf2["label"].nunique() < 2:
+            skipped.append((gene, "single_class_after_nan_drop"))
+            continue
+
+        x = gdf2["expr"].tolist()
+        y = gdf2["label"].tolist()
+
+        x0 = [xx for xx, yy in zip(x, y) if yy == 0]
+        x1 = [xx for xx, yy in zip(x, y) if yy == 1]
+        if len(x0) == 0 or len(x1) == 0:
+            skipped.append((gene, "empty_group"))
+            continue
+
+        try:
+            p = mannwhitneyu(x1, x0, alternative="two-sided").pvalue
+        except Exception as e:
+            skipped.append((gene, f"mw_error:{type(e).__name__}"))
+            continue
+
+        try:
+            au = roc_auc_score(y, x)
+        except Exception:
+            au = float("nan")
+
+        results.append((gene, float(p), float(au)))
+
+    res_df = pd.DataFrame(results, columns=["gene", "p_value", "auroc"])
+    res_df.to_csv(tmp_dir / "per_gene_stats.csv", index=False)
+    pd.DataFrame(skipped, columns=["gene", "reason"]).to_csv(tmp_dir / "skipped_genes.csv", index=False)
+
+    print("Genes tested:", res_df.shape[0], "Skipped:", len(skipped))
+    print("Intermediate saved:", tmp_dir / "per_gene_stats.csv")
+
+    checklist[1] = checklist[1].replace("[ ]","[✓]")
+    print("\nUpdated plan:\n" + "\n".join(checklist))
+
+    # Step 3: final save
+    res_df.to_csv(out_path, index=False)
+    print("\nStep 3: Final saved to:", out_path)
+    print("Preview:\n", res_df.head().to_csv(index=False))
+
+    checklist[2] = checklist[2].replace("[ ]","[✓]")
+    print("\nUpdated plan:\n" + "\n".join(checklist))
+
+main()
+</execute>
+<observation>Research log: clinicalomicsdb_annotate (fix orientation: genes as rows, samples as columns)
+
+Initial plan:
+1. [ ] Load expression_data.csv; detect where responder/non-responder labels live; reshape to long form (sample, gene, expr).
+2. [ ] Compute per-gene Wilcoxon rank-sum p-values and AUROC between responder and non-responder samples.
+3. [ ] Save intermediates to tmp directory and final CSV to requested output path.
+
+Step 1: Loaded benchmark/dataset/ClinicalOmicsDB/expression_data.csv shape: (51, 21)
+Columns: ['gene', 'Sample_1', 'Sample_2', 'Sample_3', 'Sample_4', 'Sample_5', 'Sample_6', 'Sample_7', 'Sample_8', 'Sample_9', 'Sample_10', 'Sample_11', 'Sample_12', 'Sample_13', 'Sample_14', 'Sample_15', 'Sample_16', 'Sample_17', 'Sample_18', 'Sample_19', 'Sample_20']
+Detected label row index: 0
+Label counts: {1: 10, 0: 10}
+Saved metadata/labels/long table to: /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/clinicalomicsdb_annotate
+
+Updated plan:
+1. [✓] Load expression_data.csv; detect where responder/non-responder labels live; reshape to long form (sample, gene, expr).
+2. [ ] Compute per-gene Wilcoxon rank-sum p-values and AUROC between responder and non-responder samples.
+3. [ ] Save intermediates to tmp directory and final CSV to requested output path.
+
+Step 2: Computing per-gene Mann-Whitney U p-value and AUROC
+Genes tested: 50 Skipped: 0
+Intermediate saved: /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/clinicalomicsdb_annotate/per_gene_stats.csv
+
+Updated plan:
+1. [✓] Load expression_data.csv; detect where responder/non-responder labels live; reshape to long form (sample, gene, expr).
+2. [✓] Compute per-gene Wilcoxon rank-sum p-values and AUROC between responder and non-responder samples.
+3. [ ] Save intermediates to tmp directory and final CSV to requested output path.
+
+Step 3: Final saved to: /root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/clinicalomicsdb_annotate.csv
+Preview:
+ gene,p_value,auroc
+Gene_1,0.00018267179110955002,1.0
+Gene_2,0.014019277113959953,0.8300000000000001
+Gene_3,0.0211339281291611,0.8099999999999999
+Gene_4,0.017257456083119765,0.8200000000000001
+Gene_5,0.00032983852077799353,0.98
+
+
+Updated plan:
+1. [✓] Load expression_data.csv; detect where responder/non-responder labels live; reshape to long form (sample, gene, expr).
+2. [✓] Compute per-gene Wilcoxon rank-sum p-values and AUROC between responder and non-responder samples.
+3. [✓] Save intermediates to tmp directory and final CSV to requested output path.
+</observation>
+<solution>
+1. [✓] Load expression_data.csv; detect where responder/non-responder labels live; reshape to long form (sample, gene, expr). (completed)
+2. [✓] Compute per-gene Wilcoxon rank-sum p-values and AUROC between responder and non-responder samples. (completed)
+3. [✓] Save intermediates to tmp directory and final CSV to requested output path. (completed)
+
+Files written:
+- Intermediate directory: `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/clinicalomicsdb_annotate/`
+  - `metadata.json`
+  - `labels.csv`
+  - `long_expression_with_labels.csv`
+  - `per_gene_stats.csv`
+  - `skipped_genes.csv`
+- Final results CSV: `/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/clinicalomicsdb_annotate.csv`
+
+Final CSV columns (as requested):
+`gene,p_value,auroc`
+</solution>

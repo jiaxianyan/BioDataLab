@@ -1,0 +1,1726 @@
+Filter the provided SNP data in `benchmark/dataset/PGS-Depot/sample.vcf`. 
+
+The filtering criteria are: remove multi-allelic SNPs, remove SNPs with a minor allele frequency (MAF) less than 0.05, and remove SNPs with a genotype missing rate greater than 0.2. 
+
+Save the resulting filtered data as a VCF file named `/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/pgs_depot_refinement.vcf`.
+
+All intermediate steps should be saved in `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pgs_depot_refinement` directory.
+
+<execute>#!/usr/bin/env python3
+import os, subprocess, textwrap, shutil, sys, glob, json, re, pathlib
+
+print("Research log: PGS-Depot VCF refinement")
+
+# Paths
+in_vcf = "benchmark/dataset/PGS-Depot/sample.vcf"
+workdir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pgs_depot_refinement"
+out_vcf = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/pgs_depot_refinement.vcf"
+
+os.makedirs(workdir, exist_ok=True)
+os.makedirs(os.path.dirname(out_vcf), exist_ok=True)
+
+# Plan checklist
+plan = [
+    "[ ] Inspect input VCF and available tools (bcftools/plink) and set up working directory",
+    "[ ] Step 1: Remove multi-allelic variants (keep biallelic SNPs only) -> intermediate VCF",
+    "[ ] Step 2: Filter by genotype missing rate >0.2 (keep <=0.2) -> intermediate VCF",
+    "[ ] Step 3: Filter by MAF >=0.05 -> final VCF",
+    "[ ] Validate output (counts before/after, quick header check) and write final file"
+]
+def show_plan(status_updates=None):
+    if status_updates:
+        for idx, new in status_updates.items():
+            plan[idx] = new
+    print("\nUpdated plan:")
+    for i,p in enumerate(plan,1):
+        print(f"{i}. {p}")
+    print()
+
+show_plan()
+
+def run(cmd, desc=None):
+    if desc:
+        print(f"\n--- {desc} ---")
+    print("CMD:", " ".join(cmd))
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    print("Return code:", res.returncode)
+    if res.stdout.strip():
+        print("STDOUT:\n", res.stdout[:4000])
+    if res.stderr.strip():
+        print("STDERR:\n", res.stderr[:4000])
+    if res.returncode != 0:
+        raise RuntimeError(f"Command failed: {' '.join(cmd)}")
+    return res
+
+# Step 0: Inspect tools and input
+print("\nStep 0: Inspect tools and input VCF")
+tools = {}
+for t in ["bcftools","plink","samtools"]:
+    tools[t] = shutil.which(t)
+print("Tool availability:", tools)
+
+if not os.path.exists(in_vcf):
+    raise FileNotFoundError(in_vcf)
+
+# Count variants and samples quickly using bcftools if available; otherwise fallback to python parse
+nvar = nsamp = None
+if tools["bcftools"]:
+    res = run(["bcftools","view","-h",in_vcf], "Read header")
+    header = res.stdout.splitlines()
+    for line in header:
+        if line.startswith("#CHROM"):
+            parts = line.split("\t")
+            nsamp = max(0, len(parts)-9)
+    res = run(["bcftools","index","-n",in_vcf], "Variant count via bcftools index -n (works for bgz; may fail for plain vcf)")
+    # bcftools index -n requires compressed; so catch earlier? We'll just do view -H | wc -l
+    res = run(["bash","-lc", f"bcftools view -H {in_vcf} | wc -l"], "Variant count via bcftools view -H | wc -l")
+    nvar = int(res.stdout.strip())
+else:
+    # naive counts
+    with open(in_vcf) as f:
+        for line in f:
+            if line.startswith("#CHROM"):
+                nsamp = max(0, len(line.rstrip("\n").split("\t"))-9)
+                break
+    nvar = sum(1 for line in open(in_vcf) if line and not line.startswith("#"))
+print(f"Input summary: variants={nvar}, samples={nsamp}")
+
+show_plan({0:"[✓] Inspect input VCF and available tools (bcftools/plink) and set up working directory (completed)"})
+
+# Define intermediates
+step1_vcf = os.path.join(workdir, "step1_biallelic_snps.vcf")
+step2_vcf = os.path.join(workdir, "step2_missing_le_0p2.vcf")
+final_vcf_tmp = os.path.join(workdir, "step3_maf_ge_0p05.vcf")
+
+# We will use PLINK for robust MAF/missingness filtering on uncompressed VCF.
+# Step 1: biallelic SNPs only
+print("\nStep 1: Remove multi-allelic variants; keep biallelic SNPs only")
+if not tools["plink"]:
+    raise EnvironmentError("plink not found in PATH; required for filtering criteria.")
+prefix1 = os.path.join(workdir, "step1_plink")
+run(["plink","--vcf",in_vcf,"--double-id","--allow-extra-chr","--snps-only","just-acgt",
+     "--max-alleles","2","--make-bed","--out",prefix1],
+    "PLINK convert to BED keeping biallelic SNPs (A/C/G/T) only")
+# Export back to VCF
+run(["plink","--bfile",prefix1,"--recode","vcf","--out",os.path.splitext(step1_vcf)[0]],
+    "Export biallelic SNPs to VCF")
+# PLINK writes .vcf with .vcf extension appended
+plink_step1_vcf = os.path.splitext(step1_vcf)[0] + ".vcf"
+if plink_step1_vcf != step1_vcf:
+    # move/rename
+    shutil.move(plink_step1_vcf, step1_vcf)
+print("Wrote:", step1_vcf)
+
+show_plan({1:"[✓] Step 1: Remove multi-allelic variants (keep biallelic SNPs only) -> intermediate VCF (completed)"})
+
+# Step 2: missing rate filter (geno missing rate >0.2 removed)
+print("\nStep 2: Filter by genotype missing rate (keep variants with missingness <=0.2)")
+prefix2 = os.path.join(workdir, "step2_plink")
+run(["plink","--vcf",step1_vcf,"--double-id","--allow-extra-chr","--geno","0.2","--make-bed","--out",prefix2],
+    "PLINK filter variants by missingness (--geno 0.2 keeps missing rate <=0.2)")
+run(["plink","--bfile",prefix2,"--recode","vcf","--out",os.path.splitext(step2_vcf)[0]],
+    "Export missingness-filtered variants to VCF")
+plink_step2_vcf = os.path.splitext(step2_vcf)[0] + ".vcf"
+shutil.move(plink_step2_vcf, step2_vcf)
+print("Wrote:", step2_vcf)
+
+show_plan({2:"[✓] Step 2: Filter by genotype missing rate >0.2 (keep <=0.2) -> intermediate VCF (completed)"})
+
+# Step 3: MAF >= 0.05
+print("\nStep 3: Filter by MAF (keep variants with MAF >=0.05)")
+prefix3 = os.path.join(workdir, "step3_plink")
+run(["plink","--vcf",step2_vcf,"--double-id","--allow-extra-chr","--maf","0.05","--make-bed","--out",prefix3],
+    "PLINK filter by MAF (--maf 0.05 keeps variants with MAF >=0.05)")
+run(["plink","--bfile",prefix3,"--recode","vcf","--out",os.path.splitext(final_vcf_tmp)[0]],
+    "Export MAF-filtered variants to VCF")
+plink_step3_vcf = os.path.splitext(final_vcf_tmp)[0] + ".vcf"
+shutil.move(plink_step3_vcf, final_vcf_tmp)
+print("Wrote intermediate final:", final_vcf_tmp)
+
+show_plan({3:"[✓] Step 3: Filter by MAF >=0.05 -> final VCF (completed)"})
+
+# Validation and final copy
+print("\nValidation: counts before/after")
+def count_variants(vcf):
+    return int(subprocess.check_output(["bash","-lc", f"grep -vc '^#' {vcf}"]).decode().strip())
+def head_lines(vcf, n=5):
+    return subprocess.check_output(["bash","-lc", f"head -n {n} {vcf}"]).decode()
+
+counts = {
+    "input": count_variants(in_vcf),
+    "step1_biallelic_snps": count_variants(step1_vcf),
+    "step2_missing_le_0p2": count_variants(step2_vcf),
+    "step3_maf_ge_0p05": count_variants(final_vcf_tmp)
+}
+print("Variant counts:", json.dumps(counts, indent=2))
+print("\nFinal VCF header preview:\n", head_lines(final_vcf_tmp, 15))
+
+# Copy to requested output path
+shutil.copyfile(final_vcf_tmp, out_vcf)
+print("\nSaved final filtered VCF to:", out_vcf)
+
+show_plan({4:"[✓] Validate output (counts before/after, quick header check) and write final file (completed)"})
+
+print("\nDone. Intermediate files are in:", workdir)
+</execute>
+<observation>NameError("name 'plan' is not defined")</observation>
+<execute>#!/usr/bin/env python3
+import os, subprocess, shutil, json
+
+print("Research log: PGS-Depot VCF refinement (rerun with corrected state)")
+
+# Paths
+in_vcf = "benchmark/dataset/PGS-Depot/sample.vcf"
+workdir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pgs_depot_refinement"
+out_vcf = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/pgs_depot_refinement.vcf"
+
+os.makedirs(workdir, exist_ok=True)
+os.makedirs(os.path.dirname(out_vcf), exist_ok=True)
+
+# Plan checklist
+plan = [
+    "[ ] Inspect input VCF and available tools (plink) and set up working directory",
+    "[ ] Step 1: Remove multi-allelic variants (keep biallelic SNPs only) -> intermediate VCF",
+    "[ ] Step 2: Filter by genotype missing rate >0.2 (keep <=0.2) -> intermediate VCF",
+    "[ ] Step 3: Filter by MAF >=0.05 -> final VCF",
+    "[ ] Validate output (counts before/after, quick header check) and write final file",
+]
+def show_plan(update=None):
+    if update:
+        for i,v in update.items():
+            plan[i] = v
+    print("\nUpdated plan:")
+    for idx, item in enumerate(plan, 1):
+        print(f"{idx}. {item}")
+    print()
+
+show_plan()
+
+def run(cmd, desc):
+    print(f"\n--- {desc} ---")
+    print("CMD:", " ".join(cmd))
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    print("Return code:", res.returncode)
+    if res.stdout.strip():
+        print("STDOUT:\n", res.stdout[:4000])
+    if res.stderr.strip():
+        print("STDERR:\n", res.stderr[:4000])
+    if res.returncode != 0:
+        raise RuntimeError(f"Command failed: {' '.join(cmd)}")
+    return res
+
+def count_variants(vcf):
+    return int(subprocess.check_output(["bash","-lc", f"grep -vc '^#' {vcf}"]).decode().strip())
+
+def head_lines(vcf, n=15):
+    return subprocess.check_output(["bash","-lc", f"head -n {n} {vcf}"]).decode()
+
+# Step 0
+print("\nStep 0: Inspect input VCF and tool availability")
+if not os.path.exists(in_vcf):
+    raise FileNotFoundError(in_vcf)
+
+plink = shutil.which("plink")
+print("plink:", plink)
+if not plink:
+    raise EnvironmentError("plink not found in PATH; required to compute MAF/missingness.")
+
+# input summary
+with open(in_vcf) as f:
+    nsamp = None
+    for line in f:
+        if line.startswith("#CHROM"):
+            nsamp = max(0, len(line.rstrip("\n").split("\t")) - 9)
+            break
+nvar_in = count_variants(in_vcf)
+print(f"Input summary: variants={nvar_in}, samples={nsamp}")
+
+show_plan({0:"[✓] Inspect input VCF and available tools (plink) and set up working directory (completed)"})
+
+# Intermediates
+step1_vcf = os.path.join(workdir, "step1_biallelic_snps.vcf")
+step2_vcf = os.path.join(workdir, "step2_missing_le_0p2.vcf")
+step3_vcf = os.path.join(workdir, "step3_maf_ge_0p05.vcf")
+
+# Step 1: remove multiallelic; keep biallelic SNPs only
+print("\nStep 1: Keep biallelic SNPs only (remove multi-allelic; remove non-SNPs)")
+prefix1 = os.path.join(workdir, "step1_plink")
+run([
+    "plink","--vcf",in_vcf,"--double-id","--allow-extra-chr",
+    "--snps-only","just-acgt","--max-alleles","2",
+    "--make-bed","--out",prefix1
+], "PLINK: import VCF -> BED with biallelic A/C/G/T SNPs only")
+run([
+    "plink","--bfile",prefix1,"--recode","vcf","--out",os.path.splitext(step1_vcf)[0]
+], "PLINK: export step1 to VCF")
+tmp = os.path.splitext(step1_vcf)[0] + ".vcf"
+shutil.move(tmp, step1_vcf)
+print("Wrote:", step1_vcf, "variants=", count_variants(step1_vcf))
+
+show_plan({1:"[✓] Step 1: Remove multi-allelic variants (keep biallelic SNPs only) -> intermediate VCF (completed)"})
+
+# Step 2: missing rate <= 0.2
+print("\nStep 2: Filter variants with missingness <=0.2")
+prefix2 = os.path.join(workdir, "step2_plink")
+run([
+    "plink","--vcf",step1_vcf,"--double-id","--allow-extra-chr",
+    "--geno","0.2","--make-bed","--out",prefix2
+], "PLINK: apply --geno 0.2 (drop missingness >0.2)")
+run([
+    "plink","--bfile",prefix2,"--recode","vcf","--out",os.path.splitext(step2_vcf)[0]
+], "PLINK: export step2 to VCF")
+tmp = os.path.splitext(step2_vcf)[0] + ".vcf"
+shutil.move(tmp, step2_vcf)
+print("Wrote:", step2_vcf, "variants=", count_variants(step2_vcf))
+
+show_plan({2:"[✓] Step 2: Filter by genotype missing rate >0.2 (keep <=0.2) -> intermediate VCF (completed)"})
+
+# Step 3: MAF >= 0.05
+print("\nStep 3: Filter variants with MAF >=0.05")
+prefix3 = os.path.join(workdir, "step3_plink")
+run([
+    "plink","--vcf",step2_vcf,"--double-id","--allow-extra-chr",
+    "--maf","0.05","--make-bed","--out",prefix3
+], "PLINK: apply --maf 0.05")
+run([
+    "plink","--bfile",prefix3,"--recode","vcf","--out",os.path.splitext(step3_vcf)[0]
+], "PLINK: export step3 to VCF")
+tmp = os.path.splitext(step3_vcf)[0] + ".vcf"
+shutil.move(tmp, step3_vcf)
+print("Wrote:", step3_vcf, "variants=", count_variants(step3_vcf))
+
+show_plan({3:"[✓] Step 3: Filter by MAF >=0.05 -> final VCF (completed)"})
+
+# Validate + write output
+print("\nValidation and final write")
+counts = {
+    "input": count_variants(in_vcf),
+    "step1_biallelic_snps": count_variants(step1_vcf),
+    "step2_missing_le_0p2": count_variants(step2_vcf),
+    "step3_maf_ge_0p05": count_variants(step3_vcf),
+}
+print("Variant counts:", json.dumps(counts, indent=2))
+print("\nFinal VCF header preview:\n" + head_lines(step3_vcf, 15))
+
+shutil.copyfile(step3_vcf, out_vcf)
+print("\nSaved final filtered VCF to:", out_vcf)
+print("All intermediate files saved in:", workdir)
+
+show_plan({4:"[✓] Validate output (counts before/after, quick header check) and write final file (completed)"})
+</execute>
+<observation>NameError("name 'plan' is not defined")</observation>
+<execute>#!/usr/bin/env python3
+import os, subprocess, shutil, json, textwrap
+
+print("Research log: PGS-Depot VCF refinement (clean rerun)")
+
+# --- Paths ---
+in_vcf = "benchmark/dataset/PGS-Depot/sample.vcf"
+workdir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pgs_depot_refinement"
+out_vcf = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/pgs_depot_refinement.vcf"
+
+os.makedirs(workdir, exist_ok=True)
+os.makedirs(os.path.dirname(out_vcf), exist_ok=True)
+
+# --- Plan (avoid any external state) ---
+PLAN = [
+    "[ ] Inspect input VCF and available tools (plink) and set up working directory",
+    "[ ] Step 1: Remove multi-allelic variants (keep biallelic SNPs only) -> intermediate VCF",
+    "[ ] Step 2: Filter by genotype missing rate >0.2 (keep <=0.2) -> intermediate VCF",
+    "[ ] Step 3: Filter by MAF >=0.05 -> final VCF",
+    "[ ] Validate output (counts before/after, quick header check) and write final file",
+]
+
+def show_plan(update=None):
+    # update: dict(index0based -> new_string)
+    global PLAN
+    if update:
+        for k, v in update.items():
+            PLAN[k] = v
+    print("\nUpdated plan:")
+    for i, item in enumerate(PLAN, 1):
+        print(f"{i}. {item}")
+    print()
+
+show_plan()
+
+def run(cmd, desc):
+    print(f"\n--- {desc} ---")
+    print("CMD:", " ".join(cmd))
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    print("Return code:", res.returncode)
+    if res.stdout.strip():
+        print("STDOUT:\n", res.stdout[:4000])
+    if res.stderr.strip():
+        print("STDERR:\n", res.stderr[:4000])
+    if res.returncode != 0:
+        raise RuntimeError(f"Command failed: {' '.join(cmd)}")
+    return res
+
+def count_variants(vcf):
+    return int(subprocess.check_output(["bash","-lc", f"grep -vc '^#' {vcf}"]).decode().strip())
+
+def head_lines(vcf, n=15):
+    return subprocess.check_output(["bash","-lc", f"head -n {n} {vcf}"]).decode()
+
+# --- Step 0 ---
+print("\nStep 0: Inspect input and tool availability")
+if not os.path.exists(in_vcf):
+    raise FileNotFoundError(in_vcf)
+
+plink_path = shutil.which("plink")
+print("plink:", plink_path)
+if not plink_path:
+    raise EnvironmentError("plink not found in PATH; required for MAF/missingness filtering.")
+
+# Input summary
+with open(in_vcf) as f:
+    nsamp = None
+    for line in f:
+        if line.startswith("#CHROM"):
+            nsamp = max(0, len(line.rstrip("\n").split("\t")) - 9)
+            break
+nvar_in = count_variants(in_vcf)
+print(f"Input summary: variants={nvar_in}, samples={nsamp}")
+
+show_plan({0: "[✓] Inspect input VCF and available tools (plink) and set up working directory (completed)"})
+
+# --- Intermediates ---
+step1_vcf = os.path.join(workdir, "step1_biallelic_snps.vcf")
+step2_vcf = os.path.join(workdir, "step2_missing_le_0p2.vcf")
+step3_vcf = os.path.join(workdir, "step3_maf_ge_0p05.vcf")
+
+# --- Step 1: biallelic SNPs only ---
+print("\nStep 1: Remove multi-allelic variants; keep biallelic SNPs only")
+prefix1 = os.path.join(workdir, "step1_plink")
+run([
+    "plink", "--vcf", in_vcf,
+    "--double-id", "--allow-extra-chr",
+    "--snps-only", "just-acgt",
+    "--max-alleles", "2",
+    "--make-bed", "--out", prefix1
+], "PLINK import: keep biallelic A/C/G/T SNPs only")
+run([
+    "plink", "--bfile", prefix1,
+    "--recode", "vcf", "--out", os.path.splitext(step1_vcf)[0]
+], "PLINK export step1 VCF")
+tmp1 = os.path.splitext(step1_vcf)[0] + ".vcf"
+shutil.move(tmp1, step1_vcf)
+print("Wrote:", step1_vcf, "variants=", count_variants(step1_vcf))
+
+show_plan({1: "[✓] Step 1: Remove multi-allelic variants (keep biallelic SNPs only) -> intermediate VCF (completed)"})
+
+# --- Step 2: missingness <= 0.2 ---
+print("\nStep 2: Remove variants with genotype missing rate >0.2")
+prefix2 = os.path.join(workdir, "step2_plink")
+run([
+    "plink", "--vcf", step1_vcf,
+    "--double-id", "--allow-extra-chr",
+    "--geno", "0.2",
+    "--make-bed", "--out", prefix2
+], "PLINK filter: --geno 0.2 (keep missingness <=0.2)")
+run([
+    "plink", "--bfile", prefix2,
+    "--recode", "vcf", "--out", os.path.splitext(step2_vcf)[0]
+], "PLINK export step2 VCF")
+tmp2 = os.path.splitext(step2_vcf)[0] + ".vcf"
+shutil.move(tmp2, step2_vcf)
+print("Wrote:", step2_vcf, "variants=", count_variants(step2_vcf))
+
+show_plan({2: "[✓] Step 2: Filter by genotype missing rate >0.2 (keep <=0.2) -> intermediate VCF (completed)"})
+
+# --- Step 3: MAF >= 0.05 ---
+print("\nStep 3: Remove variants with MAF <0.05")
+prefix3 = os.path.join(workdir, "step3_plink")
+run([
+    "plink", "--vcf", step2_vcf,
+    "--double-id", "--allow-extra-chr",
+    "--maf", "0.05",
+    "--make-bed", "--out", prefix3
+], "PLINK filter: --maf 0.05 (keep MAF >=0.05)")
+run([
+    "plink", "--bfile", prefix3,
+    "--recode", "vcf", "--out", os.path.splitext(step3_vcf)[0]
+], "PLINK export step3 VCF")
+tmp3 = os.path.splitext(step3_vcf)[0] + ".vcf"
+shutil.move(tmp3, step3_vcf)
+print("Wrote:", step3_vcf, "variants=", count_variants(step3_vcf))
+
+show_plan({3: "[✓] Step 3: Filter by MAF >=0.05 -> final VCF (completed)"})
+
+# --- Validate + write final ---
+print("\nStep 4: Validate and write final output")
+counts = {
+    "input": count_variants(in_vcf),
+    "step1_biallelic_snps": count_variants(step1_vcf),
+    "step2_missing_le_0p2": count_variants(step2_vcf),
+    "step3_maf_ge_0p05": count_variants(step3_vcf),
+}
+print("Variant counts:\n" + json.dumps(counts, indent=2))
+print("\nFinal VCF header preview:\n" + head_lines(step3_vcf, 15))
+
+shutil.copyfile(step3_vcf, out_vcf)
+print("\nSaved final filtered VCF to:", out_vcf)
+print("Intermediate files in:", workdir)
+
+show_plan({4: "[✓] Validate output (counts before/after, quick header check) and write final file (completed)"})
+</execute>
+<observation>NameError("name 'subprocess' is not defined")</observation>
+<execute>#!/usr/bin/env python3
+# NOTE: This script is fully self-contained (imports included).
+import os
+import subprocess
+import shutil
+import json
+
+print("Research log: PGS-Depot VCF refinement (clean rerun; fixed imports)")
+
+# Paths
+in_vcf = "benchmark/dataset/PGS-Depot/sample.vcf"
+workdir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pgs_depot_refinement"
+out_vcf = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/pgs_depot_refinement.vcf"
+
+os.makedirs(workdir, exist_ok=True)
+os.makedirs(os.path.dirname(out_vcf), exist_ok=True)
+
+PLAN = [
+    "[ ] Inspect input VCF and available tools (plink) and set up working directory",
+    "[ ] Step 1: Remove multi-allelic variants (keep biallelic SNPs only) -> intermediate VCF",
+    "[ ] Step 2: Filter by genotype missing rate >0.2 (keep <=0.2) -> intermediate VCF",
+    "[ ] Step 3: Filter by MAF >=0.05 -> final VCF",
+    "[ ] Validate output (counts before/after, quick header check) and write final file",
+]
+def show_plan(update=None):
+    global PLAN
+    if update:
+        for k, v in update.items():
+            PLAN[k] = v
+    print("\nUpdated plan:")
+    for i, item in enumerate(PLAN, 1):
+        print(f"{i}. {item}")
+    print()
+
+show_plan()
+
+def run(cmd, desc):
+    print(f"\n--- {desc} ---")
+    print("CMD:", " ".join(cmd))
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    print("Return code:", res.returncode)
+    if res.stdout.strip():
+        print("STDOUT:\n", res.stdout[:4000])
+    if res.stderr.strip():
+        print("STDERR:\n", res.stderr[:4000])
+    if res.returncode != 0:
+        raise RuntimeError(f"Command failed: {' '.join(cmd)}")
+    return res
+
+def count_variants(vcf):
+    return int(subprocess.check_output(["bash","-lc", f"grep -vc '^#' {vcf}"]).decode().strip())
+
+def head_lines(vcf, n=15):
+    return subprocess.check_output(["bash","-lc", f"head -n {n} {vcf}"]).decode()
+
+# Step 0
+print("\nStep 0: Inspect input and tool availability")
+if not os.path.exists(in_vcf):
+    raise FileNotFoundError(in_vcf)
+
+plink_path = shutil.which("plink")
+print("plink:", plink_path)
+if not plink_path:
+    raise EnvironmentError("plink not found in PATH; required for filtering.")
+
+with open(in_vcf) as f:
+    nsamp = None
+    for line in f:
+        if line.startswith("#CHROM"):
+            nsamp = max(0, len(line.rstrip("\n").split("\t")) - 9)
+            break
+nvar_in = count_variants(in_vcf)
+print(f"Input summary: variants={nvar_in}, samples={nsamp}")
+
+show_plan({0:"[✓] Inspect input VCF and available tools (plink) and set up working directory (completed)"})
+
+# Intermediates
+step1_vcf = os.path.join(workdir, "step1_biallelic_snps.vcf")
+step2_vcf = os.path.join(workdir, "step2_missing_le_0p2.vcf")
+step3_vcf = os.path.join(workdir, "step3_maf_ge_0p05.vcf")
+
+# Step 1: remove multi-allelic; keep biallelic SNPs only
+print("\nStep 1: Keep biallelic SNPs only")
+prefix1 = os.path.join(workdir, "step1_plink")
+run([
+    "plink","--vcf",in_vcf,
+    "--double-id","--allow-extra-chr",
+    "--snps-only","just-acgt",
+    "--max-alleles","2",
+    "--make-bed","--out",prefix1
+], "PLINK import and biallelic SNP-only filter")
+run([
+    "plink","--bfile",prefix1,
+    "--recode","vcf","--out",os.path.splitext(step1_vcf)[0]
+], "PLINK export step1 VCF")
+tmp1 = os.path.splitext(step1_vcf)[0] + ".vcf"
+shutil.move(tmp1, step1_vcf)
+print("Wrote:", step1_vcf, "variants=", count_variants(step1_vcf))
+
+show_plan({1:"[✓] Step 1: Remove multi-allelic variants (keep biallelic SNPs only) -> intermediate VCF (completed)"})
+
+# Step 2: missing rate <= 0.2
+print("\nStep 2: Filter by missing rate (keep <=0.2)")
+prefix2 = os.path.join(workdir, "step2_plink")
+run([
+    "plink","--vcf",step1_vcf,
+    "--double-id","--allow-extra-chr",
+    "--geno","0.2",
+    "--make-bed","--out",prefix2
+], "PLINK --geno 0.2")
+run([
+    "plink","--bfile",prefix2,
+    "--recode","vcf","--out",os.path.splitext(step2_vcf)[0]
+], "PLINK export step2 VCF")
+tmp2 = os.path.splitext(step2_vcf)[0] + ".vcf"
+shutil.move(tmp2, step2_vcf)
+print("Wrote:", step2_vcf, "variants=", count_variants(step2_vcf))
+
+show_plan({2:"[✓] Step 2: Filter by genotype missing rate >0.2 (keep <=0.2) -> intermediate VCF (completed)"})
+
+# Step 3: MAF >= 0.05
+print("\nStep 3: Filter by MAF (keep >=0.05)")
+prefix3 = os.path.join(workdir, "step3_plink")
+run([
+    "plink","--vcf",step2_vcf,
+    "--double-id","--allow-extra-chr",
+    "--maf","0.05",
+    "--make-bed","--out",prefix3
+], "PLINK --maf 0.05")
+run([
+    "plink","--bfile",prefix3,
+    "--recode","vcf","--out",os.path.splitext(step3_vcf)[0]
+], "PLINK export step3 VCF")
+tmp3 = os.path.splitext(step3_vcf)[0] + ".vcf"
+shutil.move(tmp3, step3_vcf)
+print("Wrote:", step3_vcf, "variants=", count_variants(step3_vcf))
+
+show_plan({3:"[✓] Step 3: Filter by MAF >=0.05 -> final VCF (completed)"})
+
+# Validate + write output
+print("\nStep 4: Validate and write final output")
+counts = {
+    "input": count_variants(in_vcf),
+    "step1_biallelic_snps": count_variants(step1_vcf),
+    "step2_missing_le_0p2": count_variants(step2_vcf),
+    "step3_maf_ge_0p05": count_variants(step3_vcf),
+}
+print("Variant counts:\n" + json.dumps(counts, indent=2))
+print("\nFinal VCF header preview:\n" + head_lines(step3_vcf, 15))
+
+shutil.copyfile(step3_vcf, out_vcf)
+print("\nSaved final filtered VCF to:", out_vcf)
+print("All intermediate files saved in:", workdir)
+
+show_plan({4:"[✓] Validate output (counts before/after, quick header check) and write final file (completed)"})
+</execute>
+<observation>NameError("name 'subprocess' is not defined")</observation>
+<execute>#!/usr/bin/env python3
+# Run everything in a single Python process; import inside the functions too
+# to avoid any notebook/kernel state issues.
+
+import os, shutil, json
+
+print("Research log: PGS-Depot VCF refinement (robust rerun; subprocess imported locally)")
+
+in_vcf = "benchmark/dataset/PGS-Depot/sample.vcf"
+workdir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pgs_depot_refinement"
+out_vcf = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/pgs_depot_refinement.vcf"
+
+os.makedirs(workdir, exist_ok=True)
+os.makedirs(os.path.dirname(out_vcf), exist_ok=True)
+
+PLAN = [
+    "[ ] Inspect input VCF and available tools (plink) and set up working directory",
+    "[ ] Step 1: Remove multi-allelic variants (keep biallelic SNPs only) -> intermediate VCF",
+    "[ ] Step 2: Filter by genotype missing rate >0.2 (keep <=0.2) -> intermediate VCF",
+    "[ ] Step 3: Filter by MAF >=0.05 -> final VCF",
+    "[ ] Validate output (counts before/after, quick header check) and write final file",
+]
+def show_plan(update=None):
+    global PLAN
+    if update:
+        for k, v in update.items():
+            PLAN[k] = v
+    print("\nUpdated plan:")
+    for i, item in enumerate(PLAN, 1):
+        print(f"{i}. {item}")
+    print()
+
+def run(cmd, desc):
+    import subprocess
+    print(f"\n--- {desc} ---")
+    print("CMD:", " ".join(cmd))
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    print("Return code:", res.returncode)
+    if res.stdout.strip():
+        print("STDOUT:\n", res.stdout[:4000])
+    if res.stderr.strip():
+        print("STDERR:\n", res.stderr[:4000])
+    if res.returncode != 0:
+        raise RuntimeError(f"Command failed: {' '.join(cmd)}")
+    return res
+
+def count_variants(vcf):
+    import subprocess
+    return int(subprocess.check_output(["bash","-lc", f"grep -vc '^#' {vcf}"]).decode().strip())
+
+def head_lines(vcf, n=15):
+    import subprocess
+    return subprocess.check_output(["bash","-lc", f"head -n {n} {vcf}"]).decode()
+
+show_plan()
+
+# Step 0
+print("\nStep 0: Inspect input and tool availability")
+if not os.path.exists(in_vcf):
+    raise FileNotFoundError(in_vcf)
+
+plink_path = shutil.which("plink")
+print("plink:", plink_path)
+if not plink_path:
+    raise EnvironmentError("plink not found in PATH; required for filtering.")
+
+with open(in_vcf) as f:
+    nsamp = None
+    for line in f:
+        if line.startswith("#CHROM"):
+            nsamp = max(0, len(line.rstrip("\n").split("\t")) - 9)
+            break
+nvar_in = count_variants(in_vcf)
+print(f"Input summary: variants={nvar_in}, samples={nsamp}")
+
+show_plan({0:"[✓] Inspect input VCF and available tools (plink) and set up working directory (completed)"})
+
+# Intermediates
+step1_vcf = os.path.join(workdir, "step1_biallelic_snps.vcf")
+step2_vcf = os.path.join(workdir, "step2_missing_le_0p2.vcf")
+step3_vcf = os.path.join(workdir, "step3_maf_ge_0p05.vcf")
+
+# Step 1
+print("\nStep 1: Keep biallelic SNPs only (remove multi-allelic)")
+prefix1 = os.path.join(workdir, "step1_plink")
+run([
+    "plink","--vcf",in_vcf,
+    "--double-id","--allow-extra-chr",
+    "--snps-only","just-acgt",
+    "--max-alleles","2",
+    "--make-bed","--out",prefix1
+], "PLINK import and biallelic SNP filter")
+run([
+    "plink","--bfile",prefix1,
+    "--recode","vcf","--out",os.path.splitext(step1_vcf)[0]
+], "PLINK export step1 VCF")
+tmp1 = os.path.splitext(step1_vcf)[0] + ".vcf"
+shutil.move(tmp1, step1_vcf)
+print("Wrote:", step1_vcf, "variants=", count_variants(step1_vcf))
+
+show_plan({1:"[✓] Step 1: Remove multi-allelic variants (keep biallelic SNPs only) -> intermediate VCF (completed)"})
+
+# Step 2
+print("\nStep 2: Filter by missing rate (keep <=0.2)")
+prefix2 = os.path.join(workdir, "step2_plink")
+run([
+    "plink","--vcf",step1_vcf,
+    "--double-id","--allow-extra-chr",
+    "--geno","0.2",
+    "--make-bed","--out",prefix2
+], "PLINK --geno 0.2 (drop >0.2)")
+run([
+    "plink","--bfile",prefix2,
+    "--recode","vcf","--out",os.path.splitext(step2_vcf)[0]
+], "PLINK export step2 VCF")
+tmp2 = os.path.splitext(step2_vcf)[0] + ".vcf"
+shutil.move(tmp2, step2_vcf)
+print("Wrote:", step2_vcf, "variants=", count_variants(step2_vcf))
+
+show_plan({2:"[✓] Step 2: Filter by genotype missing rate >0.2 (keep <=0.2) -> intermediate VCF (completed)"})
+
+# Step 3
+print("\nStep 3: Filter by MAF (keep >=0.05)")
+prefix3 = os.path.join(workdir, "step3_plink")
+run([
+    "plink","--vcf",step2_vcf,
+    "--double-id","--allow-extra-chr",
+    "--maf","0.05",
+    "--make-bed","--out",prefix3
+], "PLINK --maf 0.05 (drop <0.05)")
+run([
+    "plink","--bfile",prefix3,
+    "--recode","vcf","--out",os.path.splitext(step3_vcf)[0]
+], "PLINK export step3 VCF")
+tmp3 = os.path.splitext(step3_vcf)[0] + ".vcf"
+shutil.move(tmp3, step3_vcf)
+print("Wrote:", step3_vcf, "variants=", count_variants(step3_vcf))
+
+show_plan({3:"[✓] Step 3: Filter by MAF >=0.05 -> final VCF (completed)"})
+
+# Step 4 validate and write
+print("\nStep 4: Validate and write final output")
+counts = {
+    "input": count_variants(in_vcf),
+    "step1_biallelic_snps": count_variants(step1_vcf),
+    "step2_missing_le_0p2": count_variants(step2_vcf),
+    "step3_maf_ge_0p05": count_variants(step3_vcf),
+}
+print("Variant counts:\n" + json.dumps(counts, indent=2))
+print("\nFinal VCF header preview:\n" + head_lines(step3_vcf, 15))
+
+shutil.copyfile(step3_vcf, out_vcf)
+print("\nSaved final filtered VCF to:", out_vcf)
+print("All intermediate files saved in:", workdir)
+
+show_plan({4:"[✓] Validate output (counts before/after, quick header check) and write final file (completed)"})
+</execute>
+<observation>RuntimeError('Command failed: plink --vcf benchmark/dataset/PGS-Depot/sample.vcf --double-id --allow-extra-chr --snps-only just-acgt --max-alleles 2 --make-bed --out /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pgs_depot_refinement/step1_plink')</observation>
+<execute>#!/usr/bin/env python3
+import os, shutil, subprocess, textwrap, json, sys
+
+print("Research log: Debug PLINK failure; switch to bcftools if needed")
+
+in_vcf = "benchmark/dataset/PGS-Depot/sample.vcf"
+workdir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pgs_depot_refinement"
+out_vcf = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/pgs_depot_refinement.vcf"
+os.makedirs(workdir, exist_ok=True)
+os.makedirs(os.path.dirname(out_vcf), exist_ok=True)
+
+PLAN = [
+    "[ ] Diagnose why PLINK failed (capture full stderr/logs)",
+    "[ ] If PLINK usable: run PLINK pipeline; else run bcftools-based pipeline (biallelic SNPs, missing<=0.2, MAF>=0.05)",
+    "[ ] Save intermediates in workdir and final VCF at requested path; validate counts",
+]
+def show_plan(update=None):
+    global PLAN
+    if update:
+        for k,v in update.items():
+            PLAN[k]=v
+    print("\nUpdated plan:")
+    for i,x in enumerate(PLAN,1):
+        print(f"{i}. {x}")
+    print()
+
+def run(cmd, desc, check=True):
+    print(f"\n--- {desc} ---")
+    print("CMD:", " ".join(cmd))
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    print("Return code:", res.returncode)
+    if res.stdout.strip():
+        print("STDOUT:\n", res.stdout[:4000])
+    if res.stderr.strip():
+        print("STDERR:\n", res.stderr[:4000])
+    if check and res.returncode != 0:
+        raise RuntimeError(f"Command failed: {' '.join(cmd)}")
+    return res
+
+def count_variants(vcf):
+    return int(subprocess.check_output(["bash","-lc", f"grep -vc '^#' {vcf}"]).decode().strip())
+
+show_plan()
+
+# 1) Diagnose PLINK failure
+print("\nStep 1: Diagnose PLINK failure")
+plink = shutil.which("plink")
+bcftools = shutil.which("bcftools")
+print("plink:", plink)
+print("bcftools:", bcftools)
+
+if not os.path.exists(in_vcf):
+    raise FileNotFoundError(in_vcf)
+
+# Re-run the failing PLINK command but DO NOT raise, capture full stderr and any .log
+prefix1 = os.path.join(workdir, "step1_plink")
+res = run([
+    "plink","--vcf",in_vcf,
+    "--double-id","--allow-extra-chr",
+    "--snps-only","just-acgt",
+    "--max-alleles","2",
+    "--make-bed","--out",prefix1
+], "Re-run PLINK step1 to capture error", check=False)
+
+# Save stderr/stdout to files for traceability
+err_path = os.path.join(workdir, "plink_step1.stderr.txt")
+out_path = os.path.join(workdir, "plink_step1.stdout.txt")
+open(err_path,"w").write(res.stderr)
+open(out_path,"w").write(res.stdout)
+print("Saved PLINK diagnostics:")
+print(" -", err_path)
+print(" -", out_path)
+log_path = prefix1 + ".log"
+if os.path.exists(log_path):
+    print(" -", log_path)
+else:
+    print(" - (no .log produced)")
+
+show_plan({0:"[✓] Diagnose why PLINK failed (capture full stderr/logs) (completed)"})
+
+# 2) Choose pipeline
+use_plink = (res.returncode == 0)
+if use_plink:
+    print("\nPLINK step1 succeeded on rerun; will continue with PLINK pipeline.")
+else:
+    print("\nPLINK step1 failed; will attempt bcftools-based pipeline.")
+    if not bcftools:
+        raise EnvironmentError("Neither PLINK pipeline succeeded nor bcftools is available. Cannot proceed.")
+
+# Filenames for intermediates
+step1_vcf = os.path.join(workdir, "step1_biallelic_snps.vcf")
+step2_vcf = os.path.join(workdir, "step2_missing_le_0p2.vcf")
+step3_vcf = os.path.join(workdir, "step3_maf_ge_0p05.vcf")
+
+if use_plink:
+    # Continue PLINK pipeline (not expected if it failed)
+    run(["plink","--bfile",prefix1,"--recode","vcf","--out",os.path.splitext(step1_vcf)[0]],
+        "PLINK export step1 VCF")
+    shutil.move(os.path.splitext(step1_vcf)[0]+".vcf", step1_vcf)
+
+    prefix2 = os.path.join(workdir, "step2_plink")
+    run(["plink","--vcf",step1_vcf,"--double-id","--allow-extra-chr","--geno","0.2","--make-bed","--out",prefix2],
+        "PLINK --geno 0.2")
+    run(["plink","--bfile",prefix2,"--recode","vcf","--out",os.path.splitext(step2_vcf)[0]],
+        "PLINK export step2 VCF")
+    shutil.move(os.path.splitext(step2_vcf)[0]+".vcf", step2_vcf)
+
+    prefix3 = os.path.join(workdir, "step3_plink")
+    run(["plink","--vcf",step2_vcf,"--double-id","--allow-extra-chr","--maf","0.05","--make-bed","--out",prefix3],
+        "PLINK --maf 0.05")
+    run(["plink","--bfile",prefix3,"--recode","vcf","--out",os.path.splitext(step3_vcf)[0]],
+        "PLINK export step3 VCF")
+    shutil.move(os.path.splitext(step3_vcf)[0]+".vcf", step3_vcf)
+
+else:
+    # bcftools pipeline:
+    # Step1: biallelic SNPs only
+    run(["bcftools","view","-m2","-M2","-v","snps","-Ov","-o",step1_vcf,in_vcf],
+        "bcftools step1: keep biallelic SNPs only (-m2 -M2 -v snps)")
+
+    # Step2: missing rate <= 0.2  (F_MISSING <=0.2)
+    run(["bcftools","+fill-tags",step1_vcf,"-Ov","-o",os.path.join(workdir,"step1_biallelic_snps.filled.vcf"),"--","-t","F_MISSING"],
+        "bcftools: fill-tags to compute F_MISSING")
+    step1_filled = os.path.join(workdir,"step1_biallelic_snps.filled.vcf")
+    run(["bcftools","view","-i","F_MISSING<=0.2", "-Ov","-o",step2_vcf, step1_filled],
+        "bcftools step2: filter missingness (F_MISSING<=0.2)")
+
+    # Step3: MAF >= 0.05 (MAF tag)
+    run(["bcftools","+fill-tags",step2_vcf,"-Ov","-o",os.path.join(workdir,"step2_missing_le_0p2.filled.vcf"),"--","-t","MAF"],
+        "bcftools: fill-tags to compute MAF")
+    step2_filled = os.path.join(workdir,"step2_missing_le_0p2.filled.vcf")
+    run(["bcftools","view","-i","MAF>=0.05", "-Ov","-o",step3_vcf, step2_filled],
+        "bcftools step3: filter by MAF (MAF>=0.05)")
+
+# 3) Validate and write final output
+counts = {
+    "input": count_variants(in_vcf),
+    "step1_biallelic_snps": count_variants(step1_vcf),
+    "step2_missing_le_0p2": count_variants(step2_vcf),
+    "step3_maf_ge_0p05": count_variants(step3_vcf),
+}
+print("\nVariant counts:", json.dumps(counts, indent=2))
+
+shutil.copyfile(step3_vcf, out_vcf)
+print("\nFinal written:", out_vcf)
+print("Intermediates in:", workdir)
+
+show_plan({1:"[✓] If PLINK usable: run PLINK pipeline; else run bcftools-based pipeline (biallelic SNPs, missing<=0.2, MAF>=0.05) (completed)",
+           2:"[✓] Save intermediates in workdir and final VCF at requested path; validate counts (completed)"})
+</execute>
+<observation>NameError("name 'subprocess' is not defined")</observation>
+<execute>#!/usr/bin/env python3
+import os, shutil, json
+
+print("Research log: PGS-Depot VCF refinement (final robust run; no global subprocess reliance)")
+
+in_vcf = "benchmark/dataset/PGS-Depot/sample.vcf"
+workdir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pgs_depot_refinement"
+out_vcf = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/pgs_depot_refinement.vcf"
+os.makedirs(workdir, exist_ok=True)
+os.makedirs(os.path.dirname(out_vcf), exist_ok=True)
+
+PLAN = [
+    "[ ] Diagnose why PLINK failed (capture full stderr/logs)",
+    "[ ] Run bcftools-based pipeline (biallelic SNPs, missing<=0.2, MAF>=0.05) with intermediates saved",
+    "[ ] Validate counts and write final VCF to requested path",
+]
+def show_plan(update=None):
+    global PLAN
+    if update:
+        for k,v in update.items():
+            PLAN[k]=v
+    print("\nUpdated plan:")
+    for i,x in enumerate(PLAN,1):
+        print(f"{i}. {x}")
+    print()
+
+def run(cmd, desc, check=True):
+    import subprocess
+    print(f"\n--- {desc} ---")
+    print("CMD:", " ".join(cmd))
+    res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    print("Return code:", res.returncode)
+    if res.stdout.strip():
+        print("STDOUT:\n", res.stdout[:4000])
+    if res.stderr.strip():
+        print("STDERR:\n", res.stderr[:4000])
+    if check and res.returncode != 0:
+        raise RuntimeError(f"Command failed: {' '.join(cmd)}")
+    return res
+
+def count_variants(vcf):
+    import subprocess
+    return int(subprocess.check_output(["bash","-lc", f"grep -vc '^#' {vcf}"]).decode().strip())
+
+show_plan()
+
+# Step 1: Diagnose PLINK failure (capture stderr/log)
+print("\nStep 1: Diagnose PLINK failure (optional; bcftools pipeline will be used regardless)")
+plink = shutil.which("plink")
+bcftools = shutil.which("bcftools")
+print("plink:", plink)
+print("bcftools:", bcftools)
+
+if not os.path.exists(in_vcf):
+    raise FileNotFoundError(in_vcf)
+if not bcftools:
+    raise EnvironmentError("bcftools not found in PATH; required for this robust pipeline.")
+
+# Attempt the original PLINK command just to capture diagnostics
+prefix1 = os.path.join(workdir, "step1_plink")
+if plink:
+    res = run([
+        "plink","--vcf",in_vcf,
+        "--double-id","--allow-extra-chr",
+        "--snps-only","just-acgt",
+        "--max-alleles","2",
+        "--make-bed","--out",prefix1
+    ], "Re-run PLINK step1 to capture error", check=False)
+    open(os.path.join(workdir, "plink_step1.stderr.txt"), "w").write(res.stderr)
+    open(os.path.join(workdir, "plink_step1.stdout.txt"), "w").write(res.stdout)
+    if os.path.exists(prefix1 + ".log"):
+        shutil.copyfile(prefix1 + ".log", os.path.join(workdir, "plink_step1.log"))
+    print("Saved PLINK diagnostics to workdir (if any).")
+else:
+    print("plink not available; skipping PLINK diagnostics.")
+
+show_plan({0:"[✓] Diagnose why PLINK failed (capture full stderr/logs) (completed)"})
+
+# Step 2: bcftools pipeline
+step1_vcf = os.path.join(workdir, "step1_biallelic_snps.vcf")
+step1_filled = os.path.join(workdir, "step1_biallelic_snps.filled.vcf")
+step2_vcf = os.path.join(workdir, "step2_missing_le_0p2.vcf")
+step2_filled = os.path.join(workdir, "step2_missing_le_0p2.filled.vcf")
+step3_vcf = os.path.join(workdir, "step3_maf_ge_0p05.vcf")
+
+# 2.1 Keep biallelic SNPs only
+run(["bcftools","view","-m2","-M2","-v","snps","-Ov","-o",step1_vcf,in_vcf],
+    "bcftools step1: keep biallelic SNPs only (-m2 -M2 -v snps)")
+
+# 2.2 Compute and filter missingness (F_MISSING <= 0.2)
+run(["bcftools","+fill-tags",step1_vcf,"-Ov","-o",step1_filled,"--","-t","F_MISSING"],
+    "bcftools: compute F_MISSING via +fill-tags")
+run(["bcftools","view","-i","F_MISSING<=0.2","-Ov","-o",step2_vcf,step1_filled],
+    "bcftools step2: filter missingness (keep F_MISSING<=0.2)")
+
+# 2.3 Compute and filter MAF (MAF >= 0.05)
+run(["bcftools","+fill-tags",step2_vcf,"-Ov","-o",step2_filled,"--","-t","MAF"],
+    "bcftools: compute MAF via +fill-tags")
+run(["bcftools","view","-i","MAF>=0.05","-Ov","-o",step3_vcf,step2_filled],
+    "bcftools step3: filter MAF (keep MAF>=0.05)")
+
+show_plan({1:"[✓] Run bcftools-based pipeline (biallelic SNPs, missing<=0.2, MAF>=0.05) with intermediates saved (completed)"})
+
+# Step 3: Validate counts and write final output
+counts = {
+    "input": count_variants(in_vcf),
+    "step1_biallelic_snps": count_variants(step1_vcf),
+    "step2_missing_le_0p2": count_variants(step2_vcf),
+    "step3_maf_ge_0p05": count_variants(step3_vcf),
+}
+print("\nVariant counts:", json.dumps(counts, indent=2))
+
+shutil.copyfile(step3_vcf, out_vcf)
+print("\nFinal written:", out_vcf)
+print("Intermediates in:", workdir)
+
+show_plan({2:"[✓] Validate counts and write final VCF to requested path (completed)"})
+</execute>
+<observation>OSError('bcftools not found in PATH; required for this robust pipeline.')</observation>
+<execute>#!/usr/bin/env python3
+import os, shutil
+
+print("Research log: PGS-Depot VCF refinement using pure-Python (pysam)")
+
+# Paths
+in_vcf = "benchmark/dataset/PGS-Depot/sample.vcf"
+workdir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pgs_depot_refinement"
+out_vcf = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/pgs_depot_refinement.vcf"
+os.makedirs(workdir, exist_ok=True)
+os.makedirs(os.path.dirname(out_vcf), exist_ok=True)
+
+PLAN = [
+    "[ ] Inspect VCF with pysam and define filtering logic (biallelic SNP, MAF>=0.05, missing<=0.2)",
+    "[ ] Step 1: Write biallelic SNP-only VCF (remove multi-allelic) -> intermediate",
+    "[ ] Step 2: Compute missing rate + MAF on the fly and write final filtered VCF -> intermediate",
+    "[ ] Copy final VCF to requested output path and write a small JSON report with counts to workdir",
+]
+def show_plan(update=None):
+    global PLAN
+    if update:
+        for k,v in update.items():
+            PLAN[k]=v
+    print("\nUpdated plan:")
+    for i,x in enumerate(PLAN,1):
+        print(f"{i}. {x}")
+    print()
+
+show_plan()
+
+# Step 0: import pysam and inspect
+try:
+    import pysam
+except Exception as e:
+    raise RuntimeError(f"pysam import failed; cannot proceed without bcftools/plink. Error: {e}")
+
+# Helper: SNP check
+def is_snp(ref, alt):
+    return (ref is not None and alt is not None and len(ref) == 1 and len(alt) == 1)
+
+# Helper: compute missingness and allele frequency from GTs
+def compute_stats(rec, nsamples):
+    # Returns: missing_rate, maf, n_called, alt_allele_count, allele_number
+    missing = 0
+    an = 0          # allele number among called genotypes (diploid assumed when present)
+    alt_ac = 0      # alternate allele count among called alleles (0/1 coding)
+    for s in rec.samples.values():
+        gt = s.get("GT", None)
+        if gt is None or len(gt) == 0:
+            missing += 1
+            continue
+        if any(a is None for a in gt):
+            missing += 1
+            continue
+        # count alleles (skip non-diploid cautiously)
+        for a in gt:
+            # a is allele index: 0=REF, 1=ALT, etc.
+            if a is None:
+                continue
+            an += 1
+            if a == 1:
+                alt_ac += 1
+            # if a>1 shouldn't happen after biallelic filter; ignore otherwise
+    called = nsamples - missing
+    miss_rate = (missing / nsamples) if nsamples else 0.0
+    if an == 0:
+        maf = 0.0
+    else:
+        alt_af = alt_ac / an
+        maf = min(alt_af, 1.0 - alt_af)
+    return miss_rate, maf, called, alt_ac, an
+
+# Open input VCF
+inv = pysam.VariantFile(in_vcf)
+nsamples = len(list(inv.header.samples))
+print(f"Input samples: {nsamples}")
+show_plan({0:"[✓] Inspect VCF with pysam and define filtering logic (biallelic SNP, MAF>=0.05, missing<=0.2) (completed)"})
+
+# Step 1: biallelic SNP-only
+step1_vcf = os.path.join(workdir, "step1_biallelic_snps.vcf")
+out1 = pysam.VariantFile(step1_vcf, "w", header=inv.header)
+
+n_in = n_step1 = 0
+inv.reset()
+for rec in inv:
+    n_in += 1
+    # remove multi-allelic: exactly one ALT and non-null
+    if rec.alts is None or len(rec.alts) != 1:
+        continue
+    alt = rec.alts[0]
+    if not is_snp(rec.ref, alt):
+        continue
+    out1.write(rec)
+    n_step1 += 1
+out1.close()
+inv.close()
+
+print(f"Counts: input_variants={n_in}, step1_biallelic_snps={n_step1}")
+show_plan({1:"[✓] Step 1: Write biallelic SNP-only VCF (remove multi-allelic) -> intermediate (completed)"})
+
+# Step 2: missing<=0.2 and MAF>=0.05 on step1
+inv1 = pysam.VariantFile(step1_vcf)
+step2_vcf = os.path.join(workdir, "step2_missing_maf_filtered.vcf")
+out2 = pysam.VariantFile(step2_vcf, "w", header=inv1.header)
+
+n_step2 = 0
+report_rows = []
+for rec in inv1:
+    miss_rate, maf, called, alt_ac, an = compute_stats(rec, nsamples)
+    if miss_rate > 0.2:
+        continue
+    if maf < 0.05:
+        continue
+    out2.write(rec)
+    n_step2 += 1
+    if len(report_rows) < 5:
+        report_rows.append({
+            "id": rec.id,
+            "chrom": rec.chrom,
+            "pos": rec.pos,
+            "ref": rec.ref,
+            "alt": rec.alts[0] if rec.alts else None,
+            "missing_rate": miss_rate,
+            "maf": maf,
+            "AC_alt": alt_ac,
+            "AN": an
+        })
+
+out2.close()
+inv1.close()
+
+print(f"Counts: step2_missing_maf_filtered={n_step2}")
+show_plan({2:"[✓] Step 2: Compute missing rate + MAF on the fly and write final filtered VCF -> intermediate (completed)"})
+
+# Step 3: copy to requested output + write report
+import json
+counts = {
+    "input_variants": n_in,
+    "step1_biallelic_snps": n_step1,
+    "final_variants": n_step2,
+    "criteria": {
+        "biallelic_snps_only": True,
+        "maf_min": 0.05,
+        "missing_rate_max": 0.2
+    }
+}
+report = {
+    "counts": counts,
+    "example_records_after_filtering": report_rows
+}
+report_path = os.path.join(workdir, "pgs_depot_refinement_report.json")
+with open(report_path, "w") as f:
+    json.dump(report, f, indent=2)
+
+shutil.copyfile(step2_vcf, out_vcf)
+
+print("Final VCF:", out_vcf)
+print("Intermediates:", workdir)
+print("Report:", report_path)
+
+show_plan({3:"[✓] Copy final VCF to requested output path and write a small JSON report with counts to workdir (completed)"})
+</execute>
+<observation>OSError(22, "Can't write record: Invalid argument")</observation>
+<execute>#!/usr/bin/env python3
+import os, shutil, json
+
+print("Research log: PGS-Depot VCF refinement using pysam (fix header/record incompatibilities)")
+
+in_vcf = "benchmark/dataset/PGS-Depot/sample.vcf"
+workdir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pgs_depot_refinement"
+out_vcf = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/pgs_depot_refinement.vcf"
+os.makedirs(workdir, exist_ok=True)
+os.makedirs(os.path.dirname(out_vcf), exist_ok=True)
+
+PLAN = [
+    "[ ] Read input VCF and build a clean output header; copy contigs/INFO/FORMAT and add computed INFO tags",
+    "[ ] Step 1: Stream-write biallelic SNP-only records into step1 VCF",
+    "[ ] Step 2: From step1, compute missing rate and MAF, write final filtered VCF with INFO tags",
+    "[ ] Validate counts and save report + final VCF to requested path",
+]
+def show_plan(update=None):
+    global PLAN
+    if update:
+        for k,v in update.items():
+            PLAN[k]=v
+    print("\nUpdated plan:")
+    for i,x in enumerate(PLAN,1):
+        print(f"{i}. {x}")
+    print()
+
+show_plan()
+
+import pysam
+
+def is_snp(ref, alt):
+    return ref is not None and alt is not None and len(ref) == 1 and len(alt) == 1
+
+def compute_stats(rec, nsamples):
+    missing = 0
+    an = 0
+    alt_ac = 0
+    for s in rec.samples.values():
+        gt = s.get("GT", None)
+        if gt is None or len(gt) == 0 or any(a is None for a in gt):
+            missing += 1
+            continue
+        for a in gt:
+            if a is None:
+                continue
+            an += 1
+            if a == 1:
+                alt_ac += 1
+    miss_rate = (missing / nsamples) if nsamples else 0.0
+    if an == 0:
+        maf = 0.0
+    else:
+        af = alt_ac / an
+        maf = min(af, 1.0 - af)
+    return miss_rate, maf, alt_ac, an
+
+# Build a clean header for outputs (avoid "Can't write record" due to header incompatibilities)
+inv = pysam.VariantFile(in_vcf)
+nsamples = len(list(inv.header.samples))
+print("Input samples:", nsamples)
+
+hdr = inv.header.copy()
+
+# Ensure contigs exist; (copy already did)
+# Add INFO tags we may write (safe even if unused)
+for (id_, num, typ, desc) in [
+    ("F_MISSING", "1", "Float", "Fraction of missing genotypes across samples (computed)"),
+    ("MAF", "1", "Float", "Minor allele frequency across samples (computed)"),
+    ("AC", "1", "Integer", "Alternate allele count across called alleles (computed for biallelic)"),
+    ("AN", "1", "Integer", "Total number of called alleles (computed)"),
+]:
+    try:
+        if id_ not in hdr.info:
+            hdr.info.add(id_, num, typ, desc)
+    except Exception:
+        pass
+
+show_plan({0:"[✓] Read input VCF and build a clean output header; copy contigs/INFO/FORMAT and add computed INFO tags (completed)"})
+
+# Step 1: write biallelic SNP-only, but create NEW records to avoid header/record mismatch
+step1_vcf = os.path.join(workdir, "step1_biallelic_snps.vcf")
+out1 = pysam.VariantFile(step1_vcf, "w", header=hdr)
+
+n_in = 0
+n_step1 = 0
+
+for rec in inv:
+    n_in += 1
+    if rec.alts is None or len(rec.alts) != 1:
+        continue
+    alt = rec.alts[0]
+    if not is_snp(rec.ref, alt):
+        continue
+
+    new = out1.new_record(
+        contig=rec.contig,
+        start=rec.start,
+        stop=rec.stop,
+        id=rec.id,
+        alleles=(rec.ref, alt),
+        qual=rec.qual,
+        filter=list(rec.filter.keys()) if rec.filter is not None else None
+    )
+    # Copy INFO fields that are header-defined; ignore failures
+    for k in rec.info.keys():
+        try:
+            new.info[k] = rec.info[k]
+        except Exception:
+            pass
+    # Copy FORMAT + sample fields (only those declared in header)
+    for fmt in rec.format.keys():
+        if fmt in hdr.formats:
+            for sname in hdr.samples:
+                try:
+                    new.samples[sname][fmt] = rec.samples[sname][fmt]
+                except Exception:
+                    pass
+
+    out1.write(new)
+    n_step1 += 1
+
+out1.close()
+inv.close()
+
+print(f"Counts: input_variants={n_in}, step1_biallelic_snps={n_step1}")
+show_plan({1:"[✓] Step 1: Stream-write biallelic SNP-only records into step1 VCF (completed)"})
+
+# Step 2: apply missing/MAF filters; again write NEW records and attach computed INFO
+inv1 = pysam.VariantFile(step1_vcf)
+out2_path = os.path.join(workdir, "step2_missing_maf_filtered.vcf")
+out2 = pysam.VariantFile(out2_path, "w", header=hdr)
+
+n_final = 0
+example = []
+
+for rec in inv1:
+    miss_rate, maf, ac, an = compute_stats(rec, nsamples)
+    if miss_rate > 0.2:
+        continue
+    if maf < 0.05:
+        continue
+
+    new = out2.new_record(
+        contig=rec.contig,
+        start=rec.start,
+        stop=rec.stop,
+        id=rec.id,
+        alleles=rec.alleles,
+        qual=rec.qual,
+        filter=list(rec.filter.keys()) if rec.filter is not None else None
+    )
+    for k in rec.info.keys():
+        try:
+            new.info[k] = rec.info[k]
+        except Exception:
+            pass
+
+    # Attach computed tags
+    new.info["F_MISSING"] = float(miss_rate)
+    new.info["MAF"] = float(maf)
+    new.info["AC"] = int(ac)
+    new.info["AN"] = int(an)
+
+    for fmt in rec.format.keys():
+        if fmt in hdr.formats:
+            for sname in hdr.samples:
+                try:
+                    new.samples[sname][fmt] = rec.samples[sname][fmt]
+                except Exception:
+                    pass
+
+    out2.write(new)
+    n_final += 1
+
+    if len(example) < 5:
+        example.append({
+            "id": rec.id, "chrom": rec.chrom, "pos": rec.pos,
+            "ref": rec.ref, "alt": rec.alts[0] if rec.alts else None,
+            "F_MISSING": miss_rate, "MAF": maf, "AC": ac, "AN": an
+        })
+
+out2.close()
+inv1.close()
+
+print(f"Counts: final_variants={n_final}")
+show_plan({2:"[✓] Step 2: From step1, compute missing rate and MAF, write final filtered VCF with INFO tags (completed)"})
+
+# Step 3: validate and write outputs
+counts = {
+    "input_variants": n_in,
+    "step1_biallelic_snps": n_step1,
+    "final_variants": n_final,
+    "criteria": {"biallelic_snps_only": True, "maf_min": 0.05, "missing_rate_max": 0.2},
+}
+report = {"counts": counts, "example_records_after_filtering": example}
+report_path = os.path.join(workdir, "pgs_depot_refinement_report.json")
+with open(report_path, "w") as f:
+    json.dump(report, f, indent=2)
+
+shutil.copyfile(out2_path, out_vcf)
+
+print("Final VCF:", out_vcf)
+print("Intermediates:", workdir)
+print("Report:", report_path)
+
+show_plan({3:"[✓] Validate counts and save report + final VCF to requested path (completed)"})
+</execute>
+<observation>ValueError('Invalid chromosome/contig')</observation>
+<execute>#!/usr/bin/env python3
+import os, shutil, json
+
+print("Research log: PGS-Depot VCF refinement using pysam (handle missing contig definitions)")
+
+in_vcf = "benchmark/dataset/PGS-Depot/sample.vcf"
+workdir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pgs_depot_refinement"
+out_vcf = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/pgs_depot_refinement.vcf"
+os.makedirs(workdir, exist_ok=True)
+os.makedirs(os.path.dirname(out_vcf), exist_ok=True)
+
+PLAN = [
+    "[ ] Scan input VCF for contig names used and ensure output header contains them (add ##contig lines if missing)",
+    "[ ] Step 1: Write biallelic SNP-only records (new_record) to step1 VCF",
+    "[ ] Step 2: Compute missing rate and MAF; write final filtered VCF with computed INFO tags",
+    "[ ] Save report + copy final VCF to requested output path; print counts",
+]
+def show_plan(update=None):
+    global PLAN
+    if update:
+        for k,v in update.items():
+            PLAN[k]=v
+    print("\nUpdated plan:")
+    for i,x in enumerate(PLAN,1):
+        print(f"{i}. {x}")
+    print()
+
+show_plan()
+
+import pysam
+
+def is_snp(ref, alt):
+    return ref is not None and alt is not None and len(ref) == 1 and len(alt) == 1
+
+def compute_stats(rec, nsamples):
+    missing = 0
+    an = 0
+    alt_ac = 0
+    for s in rec.samples.values():
+        gt = s.get("GT", None)
+        if gt is None or len(gt) == 0 or any(a is None for a in gt):
+            missing += 1
+            continue
+        for a in gt:
+            if a is None:
+                continue
+            an += 1
+            if a == 1:
+                alt_ac += 1
+    miss_rate = (missing / nsamples) if nsamples else 0.0
+    if an == 0:
+        maf = 0.0
+    else:
+        af = alt_ac / an
+        maf = min(af, 1.0 - af)
+    return miss_rate, maf, alt_ac, an
+
+# Open input
+inv = pysam.VariantFile(in_vcf)
+nsamples = len(list(inv.header.samples))
+print("Input samples:", nsamples)
+
+# Scan contigs used in records (single pass) + cache minimal record info to avoid re-reading huge files
+# Here the file is a sample; still, we do a streaming scan and store contig set only.
+contigs_used = set()
+for rec in inv:
+    contigs_used.add(rec.contig)
+inv.close()
+print("Contigs observed in records:", sorted(list(contigs_used))[:20], ("...(more)" if len(contigs_used)>20 else ""))
+
+# Reopen for processing
+inv = pysam.VariantFile(in_vcf)
+hdr = inv.header.copy()
+
+# Add missing contigs to header if not present (required for new_record with pysam/htslib)
+existing_contigs = set(list(hdr.contigs))
+missing_contigs = sorted(list(contigs_used - existing_contigs))
+print("Header contigs:", len(existing_contigs), "Missing contigs to add:", len(missing_contigs))
+for c in missing_contigs:
+    try:
+        hdr.contigs.add(c)
+    except Exception as e:
+        # As a fallback, add with a generic length if add() signature differs
+        try:
+            hdr.add_line(f"##contig=<ID={c}>")
+        except Exception:
+            raise RuntimeError(f"Failed to add contig {c} to header: {e}")
+
+# Add computed INFO tags
+for (id_, num, typ, desc) in [
+    ("F_MISSING", "1", "Float", "Fraction of missing genotypes across samples (computed)"),
+    ("MAF", "1", "Float", "Minor allele frequency across samples (computed)"),
+    ("AC", "1", "Integer", "Alternate allele count across called alleles (computed for biallelic)"),
+    ("AN", "1", "Integer", "Total number of called alleles (computed)"),
+]:
+    if id_ not in hdr.info:
+        try:
+            hdr.info.add(id_, num, typ, desc)
+        except Exception:
+            pass
+
+show_plan({0:"[✓] Scan input VCF for contig names used and ensure output header contains them (add ##contig lines if missing) (completed)"})
+
+# Step 1
+step1_vcf = os.path.join(workdir, "step1_biallelic_snps.vcf")
+out1 = pysam.VariantFile(step1_vcf, "w", header=hdr)
+
+n_in = 0
+n_step1 = 0
+for rec in inv:
+    n_in += 1
+    if rec.alts is None or len(rec.alts) != 1:
+        continue
+    alt = rec.alts[0]
+    if not is_snp(rec.ref, alt):
+        continue
+
+    new = out1.new_record(
+        contig=rec.contig,
+        start=rec.start,
+        stop=rec.stop,
+        id=rec.id,
+        alleles=(rec.ref, alt),
+        qual=rec.qual,
+        filter=list(rec.filter.keys()) if rec.filter is not None else None
+    )
+
+    # Copy INFO (best-effort)
+    for k in rec.info.keys():
+        try:
+            new.info[k] = rec.info[k]
+        except Exception:
+            pass
+
+    # Copy FORMAT/sample values (best-effort; keep only header-declared formats)
+    for fmt in rec.format.keys():
+        if fmt in hdr.formats:
+            for sname in hdr.samples:
+                try:
+                    new.samples[sname][fmt] = rec.samples[sname][fmt]
+                except Exception:
+                    pass
+
+    out1.write(new)
+    n_step1 += 1
+
+out1.close()
+inv.close()
+print(f"Counts: input_variants={n_in}, step1_biallelic_snps={n_step1}")
+
+show_plan({1:"[✓] Step 1: Write biallelic SNP-only records (new_record) to step1 VCF (completed)"})
+
+# Step 2
+inv1 = pysam.VariantFile(step1_vcf)
+out2_path = os.path.join(workdir, "step2_missing_maf_filtered.vcf")
+out2 = pysam.VariantFile(out2_path, "w", header=hdr)
+
+n_final = 0
+example = []
+
+for rec in inv1:
+    miss_rate, maf, ac, an = compute_stats(rec, nsamples)
+    if miss_rate > 0.2:
+        continue
+    if maf < 0.05:
+        continue
+
+    new = out2.new_record(
+        contig=rec.contig,
+        start=rec.start,
+        stop=rec.stop,
+        id=rec.id,
+        alleles=rec.alleles,
+        qual=rec.qual,
+        filter=list(rec.filter.keys()) if rec.filter is not None else None
+    )
+    for k in rec.info.keys():
+        try:
+            new.info[k] = rec.info[k]
+        except Exception:
+            pass
+
+    new.info["F_MISSING"] = float(miss_rate)
+    new.info["MAF"] = float(maf)
+    new.info["AC"] = int(ac)
+    new.info["AN"] = int(an)
+
+    for fmt in rec.format.keys():
+        if fmt in hdr.formats:
+            for sname in hdr.samples:
+                try:
+                    new.samples[sname][fmt] = rec.samples[sname][fmt]
+                except Exception:
+                    pass
+
+    out2.write(new)
+    n_final += 1
+
+    if len(example) < 5:
+        example.append({
+            "id": rec.id, "chrom": rec.chrom, "pos": rec.pos,
+            "ref": rec.ref, "alt": rec.alts[0] if rec.alts else None,
+            "F_MISSING": miss_rate, "MAF": maf, "AC": ac, "AN": an
+        })
+
+out2.close()
+inv1.close()
+print(f"Counts: final_variants={n_final}")
+
+show_plan({2:"[✓] Step 2: Compute missing rate and MAF; write final filtered VCF with computed INFO tags (completed)"})
+
+# Step 3 outputs
+counts = {
+    "input_variants": n_in,
+    "step1_biallelic_snps": n_step1,
+    "final_variants": n_final,
+    "criteria": {"biallelic_snps_only": True, "maf_min": 0.05, "missing_rate_max": 0.2},
+}
+report = {"counts": counts, "example_records_after_filtering": example}
+report_path = os.path.join(workdir, "pgs_depot_refinement_report.json")
+with open(report_path, "w") as f:
+    json.dump(report, f, indent=2)
+
+shutil.copyfile(out2_path, out_vcf)
+print("Final VCF:", out_vcf)
+print("Intermediates:", workdir)
+print("Report:", report_path)
+
+show_plan({3:"[✓] Save report + copy final VCF to requested output path; print counts (completed)"})
+</execute>
+<observation>Research log: PGS-Depot VCF refinement using pysam (handle missing contig definitions)
+
+Updated plan:
+1. [ ] Scan input VCF for contig names used and ensure output header contains them (add ##contig lines if missing)
+2. [ ] Step 1: Write biallelic SNP-only records (new_record) to step1 VCF
+3. [ ] Step 2: Compute missing rate and MAF; write final filtered VCF with computed INFO tags
+4. [ ] Save report + copy final VCF to requested output path; print counts
+
+Input samples: 3
+Contigs observed in records: ['19', '20', 'X'] 
+Header contigs: 0 Missing contigs to add: 3
+
+Updated plan:
+1. [✓] Scan input VCF for contig names used and ensure output header contains them (add ##contig lines if missing) (completed)
+2. [ ] Step 1: Write biallelic SNP-only records (new_record) to step1 VCF
+3. [ ] Step 2: Compute missing rate and MAF; write final filtered VCF with computed INFO tags
+4. [ ] Save report + copy final VCF to requested output path; print counts
+
+Counts: input_variants=9, step1_biallelic_snps=4
+
+Updated plan:
+1. [✓] Scan input VCF for contig names used and ensure output header contains them (add ##contig lines if missing) (completed)
+2. [✓] Step 1: Write biallelic SNP-only records (new_record) to step1 VCF (completed)
+3. [ ] Step 2: Compute missing rate and MAF; write final filtered VCF with computed INFO tags
+4. [ ] Save report + copy final VCF to requested output path; print counts
+
+Counts: final_variants=4
+
+Updated plan:
+1. [✓] Scan input VCF for contig names used and ensure output header contains them (add ##contig lines if missing) (completed)
+2. [✓] Step 1: Write biallelic SNP-only records (new_record) to step1 VCF (completed)
+3. [✓] Step 2: Compute missing rate and MAF; write final filtered VCF with computed INFO tags (completed)
+4. [ ] Save report + copy final VCF to requested output path; print counts
+
+Final VCF: /root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/pgs_depot_refinement.vcf
+Intermediates: /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pgs_depot_refinement
+Report: /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pgs_depot_refinement/pgs_depot_refinement_report.json
+
+Updated plan:
+1. [✓] Scan input VCF for contig names used and ensure output header contains them (add ##contig lines if missing) (completed)
+2. [✓] Step 1: Write biallelic SNP-only records (new_record) to step1 VCF (completed)
+3. [✓] Step 2: Compute missing rate and MAF; write final filtered VCF with computed INFO tags (completed)
+4. [✓] Save report + copy final VCF to requested output path; print counts (completed)
+
+</observation>
+<solution>
+1. [✓] Scan input VCF for contig names used and ensure output header contains them (add ##contig lines if missing) (completed)
+2. [✓] Step 1: Write biallelic SNP-only records (new_record) to step1 VCF (completed)
+3. [✓] Step 2: Compute missing rate and MAF; write final filtered VCF with computed INFO tags (completed)
+4. [✓] Save report + copy final VCF to requested output path; print counts (completed)
+
+Output:
+- Final filtered VCF saved to:
+  /root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/pgs_depot_refinement.vcf
+
+Intermediates (all saved under):
+- /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/pgs_depot_refinement
+  - step1_biallelic_snps.vcf
+  - step2_missing_maf_filtered.vcf
+  - pgs_depot_refinement_report.json
+
+Filtering applied:
+- Removed multi-allelic sites (kept exactly 1 ALT) and kept SNPs only (REF/ALT length 1)
+- Removed variants with genotype missing rate > 0.2
+- Removed variants with MAF < 0.05
+
+Counts:
+- Input variants: 9
+- After biallelic SNP filter: 4
+- Final variants: 4
+</solution>

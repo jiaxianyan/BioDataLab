@@ -1,0 +1,909 @@
+Annotate the disease feature in the images in the directory `benchmark/dataset/PlantPAD`.
+
+Three features should be identified, including Color Of Diseases, Texture Of Diseases, and Leaf Morphology.
+
+Optional values for each features:
+  Color Of Diseases: Black, Green, Yellow, Brown, Gray, Red Brown, White
+  Texture Of Diseases: Spotted, Striped, Ring Spot, Netted Spot, Random Spot
+  Leaf Morphology: Atrophy, Wilt, Rot, Burn, Perforation
+
+Saving the results to `/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/plantpad_annotate.csv`.
+
+The output result should following the format (for reference):
+image,color,texture,morphology
+image_1.jpg,Black,Spotted,Atrophy
+image_2.jpg,Green,Striped,Wilt
+image_3.jpg,Yellow,Ring Spot,Rot
+
+All intermediate results should be save in `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/plantpad_annotate` directory.
+
+<execute>#!BASH
+set -euo pipefail
+
+echo "Research log: PlantPAD disease-feature annotation"
+echo "1) Inspect input directory and count images"
+INPUT_DIR="benchmark/dataset/PlantPAD"
+TMP_DIR="/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/plantpad_annotate"
+OUT_CSV="/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/plantpad_annotate.csv"
+
+mkdir -p "$TMP_DIR"
+mkdir -p "$(dirname "$OUT_CSV")"
+
+echo "Input: $INPUT_DIR"
+echo "Tmp:   $TMP_DIR"
+echo "Out:   $OUT_CSV"
+
+if [ ! -d "$INPUT_DIR" ]; then
+  echo "ERROR: input directory not found: $INPUT_DIR" >&2
+  exit 1
+fi
+
+# find images
+python - <<'PY'
+import os, glob, json
+inp="benchmark/dataset/PlantPAD"
+exts=["*.jpg","*.jpeg","*.png","*.bmp","*.tif","*.tiff","*.webp"]
+paths=[]
+for e in exts:
+    paths += glob.glob(os.path.join(inp,"**",e), recursive=True)
+paths=sorted(set(paths))
+print("Found images:", len(paths))
+print("First 20 paths:")
+for p in paths[:20]:
+    print(" -", p)
+# save manifest
+tmp="/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/plantpad_annotate"
+os.makedirs(tmp, exist_ok=True)
+with open(os.path.join(tmp,"image_manifest.json"),"w") as f:
+    json.dump(paths,f,indent=2)
+print("Saved manifest to", os.path.join(tmp,"image_manifest.json"))
+PY
+
+echo
+echo "Updated plan:"
+cat <<'PLAN'
+1. [✓] Enumerate images under benchmark/dataset/PlantPAD and create a manifest
+2. [ ] Run a rule-based + vision model/OCR-assisted pipeline to infer (color, texture, morphology) per image; save per-image intermediate artifacts
+3. [ ] Validate allowed-label constraints, write final CSV to the requested output path
+PLAN</execute>
+<observation>Research log: PlantPAD disease-feature annotation
+1) Inspect input directory and count images
+Input: benchmark/dataset/PlantPAD
+Tmp:   /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/plantpad_annotate
+Out:   /root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/plantpad_annotate.csv
+Found images: 3
+First 20 paths:
+ - benchmark/dataset/PlantPAD/image_1.jpg
+ - benchmark/dataset/PlantPAD/image_2.jpg
+ - benchmark/dataset/PlantPAD/image_3.jpg
+Saved manifest to /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/plantpad_annotate/image_manifest.json
+
+Updated plan:
+1. [✓] Enumerate images under benchmark/dataset/PlantPAD and create a manifest
+2. [ ] Run a rule-based + vision model/OCR-assisted pipeline to infer (color, texture, morphology) per image; save per-image intermediate artifacts
+3. [ ] Validate allowed-label constraints, write final CSV to the requested output path
+</observation>
+Proceed to load each image, compute simple color/texture cues (HSV clustering, lesion mask via saturation/value thresholds), and map to the closest allowed labels; also save intermediate PNGs (original copy, lesion mask, overlay) and a JSON per image with extracted metrics. Then compile CSV and enforce label constraints.
+<execute>python - <<'PY'
+import os, json, glob
+from PIL import Image, ImageOps
+import numpy as np
+
+INPUT_DIR="benchmark/dataset/PlantPAD"
+TMP_DIR="/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/plantpad_annotate"
+OUT_CSV="/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/plantpad_annotate.csv"
+
+allowed_color=["Black","Green","Yellow","Brown","Gray","Red Brown","White"]
+allowed_texture=["Spotted","Striped","Ring Spot","Netted Spot","Random Spot"]
+allowed_morph=["Atrophy","Wilt","Rot","Burn","Perforation"]
+
+def rgb2hsv_np(rgb):
+    rgb = rgb.astype(np.float32)/255.0
+    r,g,b = rgb[...,0], rgb[...,1], rgb[...,2]
+    mx = np.max(rgb, axis=-1)
+    mn = np.min(rgb, axis=-1)
+    df = mx - mn
+    h = np.zeros_like(mx)
+    mask = df!=0
+    # hue
+    idx = (mx==r) & mask
+    h[idx] = ((g[idx]-b[idx])/df[idx]) % 6
+    idx = (mx==g) & mask
+    h[idx] = ((b[idx]-r[idx])/df[idx]) + 2
+    idx = (mx==b) & mask
+    h[idx] = ((r[idx]-g[idx])/df[idx]) + 4
+    h = h/6.0
+    s = np.zeros_like(mx)
+    s[mx!=0] = df[mx!=0]/mx[mx!=0]
+    v = mx
+    return h,s,v
+
+def color_label_from_hsv(h,s,v):
+    # heuristics on mean hue/sat/value of lesion pixels
+    # h in [0,1)
+    if v < 0.25:
+        return "Black"
+    if v > 0.85 and s < 0.20:
+        return "White"
+    if s < 0.18 and 0.25 < v < 0.85:
+        return "Gray"
+    # hue bins
+    deg = (h*360.0) % 360.0
+    if 60 <= deg < 170:
+        return "Green"
+    if 35 <= deg < 70:
+        return "Yellow"
+    if 15 <= deg < 35:
+        return "Brown"  # yellow-brown
+    if (deg >= 330 or deg < 15) and v < 0.75:
+        return "Red Brown"
+    if 15 <= deg < 35 and v < 0.45:
+        return "Brown"
+    if 170 <= deg < 330:
+        return "Gray"
+    return "Brown"
+
+def texture_label(mask, rgb):
+    # basic connected-component area stats without scipy:
+    # use downsample + count blobs by simple grid labeling via BFS on small image
+    # also detect stripes via anisotropy of gradient energy
+    m = mask.astype(np.uint8)
+    # downsample for speed
+    ds=4
+    m2=m[::ds,::ds]
+    H,W=m2.shape
+    visited=np.zeros((H,W),dtype=bool)
+    comps=[]
+    for i in range(H):
+        for j in range(W):
+            if m2[i,j] and not visited[i,j]:
+                stack=[(i,j)]
+                visited[i,j]=True
+                area=0
+                while stack:
+                    x,y=stack.pop()
+                    area+=1
+                    for dx,dy in ((1,0),(-1,0),(0,1),(0,-1)):
+                        nx,ny=x+dx,y+dy
+                        if 0<=nx<H and 0<=ny<W and m2[nx,ny] and not visited[nx,ny]:
+                            visited[nx,ny]=True
+                            stack.append((nx,ny))
+                comps.append(area)
+    ncomp=len(comps)
+    if ncomp==0:
+        return "Random Spot"
+    comps_sorted=sorted(comps, reverse=True)
+    # stripe detection via directional gradients on grayscale
+    gray = (0.299*rgb[...,0]+0.587*rgb[...,1]+0.114*rgb[...,2]).astype(np.float32)
+    gx = np.abs(gray[:,1:]-gray[:,:-1]).mean()
+    gy = np.abs(gray[1:,:]-gray[:-1,:]).mean()
+    anis = (max(gx,gy)+1e-6)/(min(gx,gy)+1e-6)
+    # ring spot: many medium components and hollow-ish (approx by edge density)
+    # edge density inside mask via simple perimeter estimation
+    perim = (np.abs(np.diff(m.astype(np.int16),axis=0)).sum() + np.abs(np.diff(m.astype(np.int16),axis=1)).sum())
+    area = m.sum()
+    edge_density = perim/(area+1e-6)
+    if anis > 1.25 and ncomp < 30:
+        return "Striped"
+    if edge_density > 0.22 and ncomp>10 and (np.median(comps_sorted[:min(10,ncomp)])<200):
+        return "Ring Spot"
+    if ncomp > 80:
+        return "Netted Spot"
+    if ncomp > 10:
+        return "Spotted"
+    return "Random Spot"
+
+def morphology_label(mask, rgb):
+    # heuristic: perforation if large holes (mask inside leaf missing) not detectable reliably.
+    # Use overall leaf area vs background by simple green threshold to find leaf silhouette.
+    hsv = np.stack(rgb2hsv_np(rgb), axis=-1)
+    h,s,v = hsv[...,0], hsv[...,1], hsv[...,2]
+    leaf = (s>0.2) & (v>0.2)  # broad leaf/background separation
+    leaf_area = leaf.sum()
+    if leaf_area==0:
+        leaf_area = rgb.shape[0]*rgb.shape[1]
+    lesion_area = mask.sum()
+    frac = lesion_area/leaf_area
+    # burn tends to dark brown/black with high lesion fraction at margins
+    # rot tends to brown with high lesion fraction but softer
+    # wilt/atrophy are morphology-level; approximated by low saturation overall and droop not visible; choose Atrophy if lesion small.
+    # perforation if mask includes many small holes (high components) and low lesion fraction.
+    # We'll map based on lesion fraction and darkness.
+    h2,s2,v2 = rgb2hsv_np(rgb)
+    lesion_v = float(v2[mask].mean()) if lesion_area>0 else float(v2.mean())
+    lesion_s = float(s2[mask].mean()) if lesion_area>0 else float(s2.mean())
+    if frac > 0.35 and lesion_v < 0.35:
+        return "Burn"
+    if frac > 0.25 and lesion_s > 0.25:
+        return "Rot"
+    # perforation proxy: many components + small area
+    # compute components count on downsampled
+    ds=4
+    m2=mask[::ds,::ds].astype(np.uint8)
+    H,W=m2.shape
+    visited=np.zeros((H,W),dtype=bool)
+    ncomp=0
+    for i in range(H):
+        for j in range(W):
+            if m2[i,j] and not visited[i,j]:
+                ncomp+=1
+                stack=[(i,j)]
+                visited[i,j]=True
+                while stack:
+                    x,y=stack.pop()
+                    for dx,dy in ((1,0),(-1,0),(0,1),(0,-1)):
+                        nx,ny=x+dx,y+dy
+                        if 0<=nx<H and 0<=ny<W and m2[nx,ny] and not visited[nx,ny]:
+                            visited[nx,ny]=True
+                            stack.append((nx,ny))
+    if frac < 0.08 and ncomp > 40:
+        return "Perforation"
+    if frac < 0.10:
+        return "Atrophy"
+    if frac < 0.22 and lesion_v < 0.55:
+        return "Wilt"
+    return "Rot"
+
+def lesion_mask(rgb):
+    # lesion: pixels not "healthy green"
+    h,s,v = rgb2hsv_np(rgb)
+    deg = (h*360)%360
+    healthy = (deg>60) & (deg<170) & (s>0.25) & (v>0.2)
+    # lesion candidates among leaf-like pixels
+    leaf = (s>0.15) & (v>0.15)
+    mask = leaf & (~healthy)
+    # clean small speckles by majority filter (3x3)
+    m=mask.astype(np.uint8)
+    pad=np.pad(m,1)
+    out=np.zeros_like(m)
+    for i in range(m.shape[0]):
+        for j in range(m.shape[1]):
+            block=pad[i:i+3,j:j+3]
+            out[i,j]=1 if block.sum()>=5 else 0
+    return out.astype(bool)
+
+def save_overlay(img, mask, out_path):
+    rgba=img.convert("RGBA")
+    arr=np.array(rgba)
+    overlay=np.zeros_like(arr)
+    overlay[...,0]=255
+    overlay[...,3]=(mask.astype(np.uint8)*120)
+    out = Image.fromarray(np.clip(arr+overlay,0,255).astype(np.uint8))
+    out.save(out_path)
+
+# load manifest
+with open(os.path.join(TMP_DIR,"image_manifest.json")) as f:
+    paths=json.load(f)
+
+rows=[]
+for p in paths:
+    name=os.path.basename(p)
+    img=Image.open(p).convert("RGB")
+    img2=ImageOps.exif_transpose(img)
+    rgb=np.array(img2)
+    m=lesion_mask(rgb)
+    # color from lesion pixels
+    if m.sum()>0:
+        h,s,v=rgb2hsv_np(rgb)
+        ch=float(h[m].mean()); cs=float(s[m].mean()); cv=float(v[m].mean())
+    else:
+        h,s,v=rgb2hsv_np(rgb)
+        ch=float(h.mean()); cs=float(s.mean()); cv=float(v.mean())
+    color=color_label_from_hsv(ch,cs,cv)
+    texture=texture_label(m, rgb)
+    morph=morphology_label(m, rgb)
+
+    # save intermediates
+    base=os.path.join(TMP_DIR, os.path.splitext(name)[0])
+    os.makedirs(base, exist_ok=True)
+    img2.save(os.path.join(base,"original.png"))
+    Image.fromarray((m*255).astype(np.uint8)).save(os.path.join(base,"lesion_mask.png"))
+    save_overlay(img2, m, os.path.join(base,"overlay.png"))
+    metrics={
+        "image": name,
+        "lesion_pixels": int(m.sum()),
+        "total_pixels": int(m.size),
+        "lesion_fraction": float(m.sum()/m.size),
+        "lesion_mean_h": ch, "lesion_mean_s": cs, "lesion_mean_v": cv,
+        "pred_color": color, "pred_texture": texture, "pred_morphology": morph
+    }
+    with open(os.path.join(base,"metrics.json"),"w") as f:
+        json.dump(metrics,f,indent=2)
+    rows.append((name,color,texture,morph))
+    print(f"[{name}] color={color}, texture={texture}, morphology={morph} | lesion_frac={metrics['lesion_fraction']:.3f}")
+
+# validate labels
+for r in rows:
+    assert r[1] in allowed_color
+    assert r[2] in allowed_texture
+    assert r[3] in allowed_morph
+
+# write csv
+os.makedirs(os.path.dirname(OUT_CSV), exist_ok=True)
+with open(OUT_CSV,"w") as f:
+    f.write("image,color,texture,morphology\n")
+    for name,color,texture,morph in rows:
+        f.write(f"{name},{color},{texture},{morph}\n")
+print("Wrote CSV:", OUT_CSV)
+PY
+
+echo
+echo "Updated plan:"
+cat <<'PLAN'
+1. [✓] Enumerate images under benchmark/dataset/PlantPAD and create a manifest
+2. [✓] Run a rule-based pipeline to infer (color, texture, morphology) per image; save per-image intermediate artifacts (original, lesion_mask, overlay, metrics.json)
+3. [✓] Validate allowed-label constraints, write final CSV to the requested output path
+PLAN
+
+echo
+echo "Preview output CSV:"
+cat "$OUT_CSV"
+</execute>
+<observation>SyntaxError("invalid character '✓' (U+2713)", ('<string>', 247, 5, '1. [✓] Enumerate images under benchmark/dataset/PlantPAD and create a manifest', 247, 5))</observation>
+<execute>#!BASH
+set -euo pipefail
+
+echo "Fix: previous run failed because the unicode checkmark was interpreted inside the Python heredoc."
+echo "Re-running step 2-3 with ASCII-only logging."
+
+INPUT_DIR="benchmark/dataset/PlantPAD"
+TMP_DIR="/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/plantpad_annotate"
+OUT_CSV="/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/plantpad_annotate.csv"
+
+python - <<'PY'
+import os, json
+from PIL import Image, ImageOps
+import numpy as np
+
+TMP_DIR="/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/plantpad_annotate"
+OUT_CSV="/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/plantpad_annotate.csv"
+
+allowed_color=["Black","Green","Yellow","Brown","Gray","Red Brown","White"]
+allowed_texture=["Spotted","Striped","Ring Spot","Netted Spot","Random Spot"]
+allowed_morph=["Atrophy","Wilt","Rot","Burn","Perforation"]
+
+def rgb2hsv_np(rgb):
+    rgb = rgb.astype(np.float32)/255.0
+    r,g,b = rgb[...,0], rgb[...,1], rgb[...,2]
+    mx = np.max(rgb, axis=-1)
+    mn = np.min(rgb, axis=-1)
+    df = mx - mn
+    h = np.zeros_like(mx)
+    mask = df!=0
+    idx = (mx==r) & mask
+    h[idx] = ((g[idx]-b[idx])/df[idx]) % 6
+    idx = (mx==g) & mask
+    h[idx] = ((b[idx]-r[idx])/df[idx]) + 2
+    idx = (mx==b) & mask
+    h[idx] = ((r[idx]-g[idx])/df[idx]) + 4
+    h = h/6.0
+    s = np.zeros_like(mx)
+    s[mx!=0] = df[mx!=0]/mx[mx!=0]
+    v = mx
+    return h,s,v
+
+def color_label_from_hsv(h,s,v):
+    if v < 0.25:
+        return "Black"
+    if v > 0.85 and s < 0.20:
+        return "White"
+    if s < 0.18 and 0.25 < v < 0.85:
+        return "Gray"
+    deg = (h*360.0) % 360.0
+    if 60 <= deg < 170:
+        return "Green"
+    if 35 <= deg < 70:
+        return "Yellow"
+    if 15 <= deg < 35:
+        return "Brown"
+    if (deg >= 330 or deg < 15) and v < 0.75:
+        return "Red Brown"
+    if 170 <= deg < 330:
+        return "Gray"
+    return "Brown"
+
+def lesion_mask(rgb):
+    h,s,v = rgb2hsv_np(rgb)
+    deg = (h*360)%360
+    healthy = (deg>60) & (deg<170) & (s>0.25) & (v>0.2)
+    leaf = (s>0.15) & (v>0.15)
+    mask = leaf & (~healthy)
+    m=mask.astype(np.uint8)
+    pad=np.pad(m,1)
+    out=np.zeros_like(m)
+    for i in range(m.shape[0]):
+        for j in range(m.shape[1]):
+            out[i,j]=1 if pad[i:i+3,j:j+3].sum()>=5 else 0
+    return out.astype(bool)
+
+def texture_label(mask, rgb):
+    m = mask.astype(np.uint8)
+    ds=4
+    m2=m[::ds,::ds]
+    H,W=m2.shape
+    visited=np.zeros((H,W),dtype=bool)
+    comps=[]
+    for i in range(H):
+        for j in range(W):
+            if m2[i,j] and not visited[i,j]:
+                stack=[(i,j)]
+                visited[i,j]=True
+                area=0
+                while stack:
+                    x,y=stack.pop()
+                    area+=1
+                    for dx,dy in ((1,0),(-1,0),(0,1),(0,-1)):
+                        nx,ny=x+dx,y+dy
+                        if 0<=nx<H and 0<=ny<W and m2[nx,ny] and not visited[nx,ny]:
+                            visited[nx,ny]=True
+                            stack.append((nx,ny))
+                comps.append(area)
+    ncomp=len(comps)
+    if ncomp==0:
+        return "Random Spot"
+    gray = (0.299*rgb[...,0]+0.587*rgb[...,1]+0.114*rgb[...,2]).astype(np.float32)
+    gx = np.abs(gray[:,1:]-gray[:,:-1]).mean()
+    gy = np.abs(gray[1:,:]-gray[:-1,:]).mean()
+    anis = (max(gx,gy)+1e-6)/(min(gx,gy)+1e-6)
+    perim = (np.abs(np.diff(m.astype(np.int16),axis=0)).sum() + np.abs(np.diff(m.astype(np.int16),axis=1)).sum())
+    area = m.sum()
+    edge_density = perim/(area+1e-6)
+    if anis > 1.25 and ncomp < 30:
+        return "Striped"
+    comps_sorted=sorted(comps, reverse=True)
+    if edge_density > 0.22 and ncomp>10 and (np.median(comps_sorted[:min(10,ncomp)])<200):
+        return "Ring Spot"
+    if ncomp > 80:
+        return "Netted Spot"
+    if ncomp > 10:
+        return "Spotted"
+    return "Random Spot"
+
+def morphology_label(mask, rgb):
+    h2,s2,v2 = rgb2hsv_np(rgb)
+    leaf = (s2>0.2) & (v2>0.2)
+    leaf_area = int(leaf.sum()) if leaf.sum()>0 else rgb.shape[0]*rgb.shape[1]
+    lesion_area = int(mask.sum())
+    frac = lesion_area/(leaf_area+1e-6)
+    lesion_v = float(v2[mask].mean()) if lesion_area>0 else float(v2.mean())
+    lesion_s = float(s2[mask].mean()) if lesion_area>0 else float(s2.mean())
+
+    if frac > 0.35 and lesion_v < 0.35:
+        return "Burn"
+    if frac > 0.25 and lesion_s > 0.25:
+        return "Rot"
+
+    ds=4
+    m2=mask[::ds,::ds].astype(np.uint8)
+    H,W=m2.shape
+    visited=np.zeros((H,W),dtype=bool)
+    ncomp=0
+    for i in range(H):
+        for j in range(W):
+            if m2[i,j] and not visited[i,j]:
+                ncomp+=1
+                stack=[(i,j)]
+                visited[i,j]=True
+                while stack:
+                    x,y=stack.pop()
+                    for dx,dy in ((1,0),(-1,0),(0,1),(0,-1)):
+                        nx,ny=x+dx,y+dy
+                        if 0<=nx<H and 0<=ny<W and m2[nx,ny] and not visited[nx,ny]:
+                            visited[nx,ny]=True
+                            stack.append((nx,ny))
+    if frac < 0.08 and ncomp > 40:
+        return "Perforation"
+    if frac < 0.10:
+        return "Atrophy"
+    if frac < 0.22 and lesion_v < 0.55:
+        return "Wilt"
+    return "Rot"
+
+def save_overlay(img, mask, out_path):
+    rgba=img.convert("RGBA")
+    arr=np.array(rgba)
+    overlay=np.zeros_like(arr)
+    overlay[...,0]=255
+    overlay[...,3]=(mask.astype(np.uint8)*120)
+    out = Image.fromarray(np.clip(arr+overlay,0,255).astype(np.uint8))
+    out.save(out_path)
+
+with open(os.path.join(TMP_DIR,"image_manifest.json")) as f:
+    paths=json.load(f)
+
+rows=[]
+for p in paths:
+    name=os.path.basename(p)
+    img=Image.open(p).convert("RGB")
+    img=ImageOps.exif_transpose(img)
+    rgb=np.array(img)
+
+    m=lesion_mask(rgb)
+
+    if m.sum()>0:
+        h,s,v=rgb2hsv_np(rgb)
+        ch=float(h[m].mean()); cs=float(s[m].mean()); cv=float(v[m].mean())
+    else:
+        h,s,v=rgb2hsv_np(rgb)
+        ch=float(h.mean()); cs=float(s.mean()); cv=float(v.mean())
+
+    color=color_label_from_hsv(ch,cs,cv)
+    texture=texture_label(m, rgb)
+    morph=morphology_label(m, rgb)
+
+    base=os.path.join(TMP_DIR, os.path.splitext(name)[0])
+    os.makedirs(base, exist_ok=True)
+    img.save(os.path.join(base,"original.png"))
+    Image.fromarray((m*255).astype(np.uint8)).save(os.path.join(base,"lesion_mask.png"))
+    save_overlay(img, m, os.path.join(base,"overlay.png"))
+
+    metrics={
+        "image": name,
+        "lesion_pixels": int(m.sum()),
+        "total_pixels": int(m.size),
+        "lesion_fraction_of_image": float(m.sum()/m.size),
+        "lesion_mean_h": ch, "lesion_mean_s": cs, "lesion_mean_v": cv,
+        "pred_color": color, "pred_texture": texture, "pred_morphology": morph
+    }
+    with open(os.path.join(base,"metrics.json"),"w") as f:
+        json.dump(metrics,f,indent=2)
+
+    rows.append((name,color,texture,morph))
+    print(f"[PRED] {name}: color={color}, texture={texture}, morphology={morph}")
+
+for (name,color,texture,morph) in rows:
+    assert color in allowed_color
+    assert texture in allowed_texture
+    assert morph in allowed_morph
+
+os.makedirs(os.path.dirname(OUT_CSV), exist_ok=True)
+with open(OUT_CSV,"w") as f:
+    f.write("image,color,texture,morphology\n")
+    for name,color,texture,morph in rows:
+        f.write(f"{name},{color},{texture},{morph}\n")
+
+print("Wrote CSV:", OUT_CSV)
+PY
+
+echo
+echo "Updated plan:"
+cat <<'PLAN'
+1. [DONE] Enumerate images under benchmark/dataset/PlantPAD and create a manifest
+2. [DONE] Run a rule-based pipeline to infer (color, texture, morphology) per image; save intermediates (original, lesion_mask, overlay, metrics.json)
+3. [DONE] Validate allowed-label constraints, write final CSV to the requested output path
+PLAN
+
+echo
+echo "Output CSV:"
+cat "$OUT_CSV"
+</execute>
+<observation>Error running Bash script (exit code 1):
+Traceback (most recent call last):
+  File "<stdin>", line 2, in <module>
+  File "/root/miniconda3/envs/biomni_e1/lib/python3.11/site-packages/PIL/Image.py", line 90, in <module>
+    from . import _imaging as core
+ImportError: /root/miniconda3/envs/biomni_e1/lib/python3.11/site-packages/PIL/../../../libtiff.so.6: undefined symbol: jpeg12_write_raw_data, version LIBJPEG_8.0
+</observation>
+<execute>#!BASH
+set -euo pipefail
+
+echo "Reasoning: PIL/Pillow is broken in this environment due to a libtiff/libjpeg symbol mismatch."
+echo "Workaround: avoid Pillow entirely; use ImageMagick for image IO + simple OpenCV-free numpy metrics via converting to raw PPM."
+echo "Plan: use 'magick' (or 'convert') to export each image to PPM, parse PPM in python, compute heuristics, save intermediates via ImageMagick."
+
+INPUT_DIR="benchmark/dataset/PlantPAD"
+TMP_DIR="/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/plantpad_annotate"
+OUT_CSV="/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/plantpad_annotate.csv"
+MANIFEST="$TMP_DIR/image_manifest.json"
+
+mkdir -p "$TMP_DIR"
+mkdir -p "$(dirname "$OUT_CSV")"
+
+echo "2) Check ImageMagick availability"
+if command -v magick >/dev/null 2>&1; then
+  IM_CMD="magick"
+elif command -v convert >/dev/null 2>&1; then
+  IM_CMD="convert"
+else
+  echo "ERROR: Neither 'magick' nor 'convert' found; cannot read images without Pillow." >&2
+  exit 1
+fi
+echo "Using ImageMagick command: $IM_CMD"
+
+echo "3) Run annotation pipeline without Pillow"
+python - <<PY
+import os, json, subprocess, numpy as np, textwrap
+
+IM_CMD = os.environ.get("IM_CMD","")  # not used; we call via bash variable injection below
+TMP_DIR="$TMP_DIR"
+OUT_CSV="$OUT_CSV"
+MANIFEST="$MANIFEST"
+IM="$IM_CMD"
+
+allowed_color=["Black","Green","Yellow","Brown","Gray","Red Brown","White"]
+allowed_texture=["Spotted","Striped","Ring Spot","Netted Spot","Random Spot"]
+allowed_morph=["Atrophy","Wilt","Rot","Burn","Perforation"]
+
+def run(cmd):
+    r=subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+    return r
+
+def read_ppm(ppm_path):
+    # binary P6 ppm
+    with open(ppm_path,'rb') as f:
+        magic=f.readline().strip()
+        if magic!=b'P6':
+            raise ValueError("Not P6 PPM")
+        line=f.readline()
+        while line.startswith(b'#'):
+            line=f.readline()
+        w,h=map(int,line.split())
+        maxv=int(f.readline().strip())
+        if maxv!=255:
+            raise ValueError("Unsupported maxv")
+        data=f.read(w*h*3)
+    arr=np.frombuffer(data, dtype=np.uint8).reshape((h,w,3))
+    return arr
+
+def rgb2hsv_np(rgb):
+    rgb = rgb.astype(np.float32)/255.0
+    r,g,b = rgb[...,0], rgb[...,1], rgb[...,2]
+    mx = np.max(rgb, axis=-1)
+    mn = np.min(rgb, axis=-1)
+    df = mx - mn
+    h = np.zeros_like(mx)
+    mask = df!=0
+    idx = (mx==r) & mask
+    h[idx] = ((g[idx]-b[idx])/df[idx]) % 6
+    idx = (mx==g) & mask
+    h[idx] = ((b[idx]-r[idx])/df[idx]) + 2
+    idx = (mx==b) & mask
+    h[idx] = ((r[idx]-g[idx])/df[idx]) + 4
+    h = h/6.0
+    s = np.zeros_like(mx)
+    s[mx!=0] = df[mx!=0]/mx[mx!=0]
+    v = mx
+    return h,s,v
+
+def color_label_from_hsv(h,s,v):
+    if v < 0.25:
+        return "Black"
+    if v > 0.85 and s < 0.20:
+        return "White"
+    if s < 0.18 and 0.25 < v < 0.85:
+        return "Gray"
+    deg = (h*360.0) % 360.0
+    if 60 <= deg < 170:
+        return "Green"
+    if 35 <= deg < 70:
+        return "Yellow"
+    if 15 <= deg < 35:
+        return "Brown"
+    if (deg >= 330 or deg < 15) and v < 0.75:
+        return "Red Brown"
+    if 170 <= deg < 330:
+        return "Gray"
+    return "Brown"
+
+def lesion_mask(rgb):
+    h,s,v = rgb2hsv_np(rgb)
+    deg = (h*360)%360
+    healthy = (deg>60) & (deg<170) & (s>0.25) & (v>0.2)
+    leaf = (s>0.15) & (v>0.15)
+    mask = leaf & (~healthy)
+    m=mask.astype(np.uint8)
+    pad=np.pad(m,1)
+    out=np.zeros_like(m)
+    for i in range(m.shape[0]):
+        for j in range(m.shape[1]):
+            out[i,j]=1 if pad[i:i+3,j:j+3].sum()>=5 else 0
+    return out.astype(bool)
+
+def texture_label(mask, rgb):
+    m = mask.astype(np.uint8)
+    ds=4
+    m2=m[::ds,::ds]
+    H,W=m2.shape
+    visited=np.zeros((H,W),dtype=bool)
+    comps=[]
+    for i in range(H):
+        for j in range(W):
+            if m2[i,j] and not visited[i,j]:
+                stack=[(i,j)]
+                visited[i,j]=True
+                area=0
+                while stack:
+                    x,y=stack.pop()
+                    area+=1
+                    for dx,dy in ((1,0),(-1,0),(0,1),(0,-1)):
+                        nx,ny=x+dx,y+dy
+                        if 0<=nx<H and 0<=ny<W and m2[nx,ny] and not visited[nx,ny]:
+                            visited[nx,ny]=True
+                            stack.append((nx,ny))
+                comps.append(area)
+    ncomp=len(comps)
+    if ncomp==0:
+        return "Random Spot"
+    gray = (0.299*rgb[...,0]+0.587*rgb[...,1]+0.114*rgb[...,2]).astype(np.float32)
+    gx = np.abs(gray[:,1:]-gray[:,:-1]).mean()
+    gy = np.abs(gray[1:,:]-gray[:-1,:]).mean()
+    anis = (max(gx,gy)+1e-6)/(min(gx,gy)+1e-6)
+    perim = (np.abs(np.diff(m.astype(np.int16),axis=0)).sum() + np.abs(np.diff(m.astype(np.int16),axis=1)).sum())
+    area = m.sum()
+    edge_density = perim/(area+1e-6)
+    if anis > 1.25 and ncomp < 30:
+        return "Striped"
+    comps_sorted=sorted(comps, reverse=True)
+    if edge_density > 0.22 and ncomp>10 and (np.median(comps_sorted[:min(10,ncomp)])<200):
+        return "Ring Spot"
+    if ncomp > 80:
+        return "Netted Spot"
+    if ncomp > 10:
+        return "Spotted"
+    return "Random Spot"
+
+def morphology_label(mask, rgb):
+    h2,s2,v2 = rgb2hsv_np(rgb)
+    leaf = (s2>0.2) & (v2>0.2)
+    leaf_area = int(leaf.sum()) if leaf.sum()>0 else rgb.shape[0]*rgb.shape[1]
+    lesion_area = int(mask.sum())
+    frac = lesion_area/(leaf_area+1e-6)
+    lesion_v = float(v2[mask].mean()) if lesion_area>0 else float(v2.mean())
+    lesion_s = float(s2[mask].mean()) if lesion_area>0 else float(s2.mean())
+    if frac > 0.35 and lesion_v < 0.35:
+        return "Burn"
+    if frac > 0.25 and lesion_s > 0.25:
+        return "Rot"
+    ds=4
+    m2=mask[::ds,::ds].astype(np.uint8)
+    H,W=m2.shape
+    visited=np.zeros((H,W),dtype=bool)
+    ncomp=0
+    for i in range(H):
+        for j in range(W):
+            if m2[i,j] and not visited[i,j]:
+                ncomp+=1
+                stack=[(i,j)]
+                visited[i,j]=True
+                while stack:
+                    x,y=stack.pop()
+                    for dx,dy in ((1,0),(-1,0),(0,1),(0,-1)):
+                        nx,ny=x+dx,y+dy
+                        if 0<=nx<H and 0<=ny<W and m2[nx,ny] and not visited[nx,ny]:
+                            visited[nx,ny]=True
+                            stack.append((nx,ny))
+    if frac < 0.08 and ncomp > 40:
+        return "Perforation"
+    if frac < 0.10:
+        return "Atrophy"
+    if frac < 0.22 and lesion_v < 0.55:
+        return "Wilt"
+    return "Rot"
+
+with open(MANIFEST) as f:
+    paths=json.load(f)
+
+rows=[]
+for p in paths:
+    name=os.path.basename(p)
+    base=os.path.join(TMP_DIR, os.path.splitext(name)[0])
+    os.makedirs(base, exist_ok=True)
+
+    # save a copy of original (for intermediates)
+    run([IM, p, os.path.join(base,"original.png")])
+
+    ppm_path=os.path.join(base,"image.ppm")
+    run([IM, p, "-colorspace", "sRGB", "-depth", "8", ppm_path])
+    rgb=read_ppm(ppm_path)
+
+    m=lesion_mask(rgb)
+
+    if m.sum()>0:
+        h,s,v=rgb2hsv_np(rgb)
+        ch=float(h[m].mean()); cs=float(s[m].mean()); cv=float(v[m].mean())
+    else:
+        h,s,v=rgb2hsv_np(rgb)
+        ch=float(h.mean()); cs=float(s.mean()); cv=float(v.mean())
+
+    color=color_label_from_hsv(ch,cs,cv)
+    texture=texture_label(m, rgb)
+    morph=morphology_label(m, rgb)
+
+    # save lesion mask and overlay using ImageMagick
+    mask_png=os.path.join(base,"lesion_mask.png")
+    overlay_png=os.path.join(base,"overlay.png")
+    # write mask as pgm first
+    pgm=os.path.join(base,"lesion_mask.pgm")
+    hgt,wid=m.shape
+    with open(pgm,"wb") as f:
+        f.write(b"P5\n%d %d\n255\n" % (wid,hgt))
+        f.write((m.astype(np.uint8)*255).tobytes())
+    run([IM, pgm, mask_png])
+    # overlay: tint mask red with 50% alpha
+    run([IM, os.path.join(base,"original.png"),
+         "(", mask_png, "-alpha", "set", "-channel", "A", "-evaluate", "set", "50%", "+channel", "-fill", "red", "-colorize", "100%", ")",
+         "-compose", "over", "-composite", overlay_png])
+
+    metrics={
+        "image": name,
+        "lesion_pixels": int(m.sum()),
+        "total_pixels": int(m.size),
+        "lesion_fraction_of_image": float(m.sum()/m.size),
+        "lesion_mean_h": ch, "lesion_mean_s": cs, "lesion_mean_v": cv,
+        "pred_color": color, "pred_texture": texture, "pred_morphology": morph
+    }
+    with open(os.path.join(base,"metrics.json"),"w") as f:
+        json.dump(metrics,f,indent=2)
+
+    rows.append((name,color,texture,morph))
+    print("[PRED]", name, "=>", color, "|", texture, "|", morph)
+
+for (name,color,texture,morph) in rows:
+    assert color in allowed_color
+    assert texture in allowed_texture
+    assert morph in allowed_morph
+
+os.makedirs(os.path.dirname(OUT_CSV), exist_ok=True)
+with open(OUT_CSV,"w") as f:
+    f.write("image,color,texture,morphology\n")
+    for name,color,texture,morph in rows:
+        f.write(f"{name},{color},{texture},{morph}\n")
+
+print("Wrote CSV:", OUT_CSV)
+PY
+
+echo
+echo "Updated plan:"
+cat <<'PLAN'
+1. [✓] Enumerate images under benchmark/dataset/PlantPAD and create a manifest
+2. [✗] Run Pillow-based pipeline (failed: Pillow ImportError due to libtiff/libjpeg mismatch)
+3. [✓] Re-run pipeline without Pillow using ImageMagick + numpy (save intermediates and predictions)
+4. [✓] Validate allowed-label constraints, write final CSV to the requested output path
+PLAN
+
+echo
+echo "Output CSV:"
+cat "$OUT_CSV"
+</execute>
+<observation>Reasoning: PIL/Pillow is broken in this environment due to a libtiff/libjpeg symbol mismatch.
+Workaround: avoid Pillow entirely; use ImageMagick for image IO + simple OpenCV-free numpy metrics via converting to raw PPM.
+Plan: use 'magick' (or 'convert') to export each image to PPM, parse PPM in python, compute heuristics, save intermediates via ImageMagick.
+2) Check ImageMagick availability
+Using ImageMagick command: convert
+3) Run annotation pipeline without Pillow
+[PRED] image_1.jpg => Green | Ring Spot | Rot
+[PRED] image_2.jpg => Yellow | Random Spot | Rot
+[PRED] image_3.jpg => Green | Ring Spot | Rot
+Wrote CSV: /root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/plantpad_annotate.csv
+
+Updated plan:
+1. [✓] Enumerate images under benchmark/dataset/PlantPAD and create a manifest
+2. [✗] Run Pillow-based pipeline (failed: Pillow ImportError due to libtiff/libjpeg mismatch)
+3. [✓] Re-run pipeline without Pillow using ImageMagick + numpy (save intermediates and predictions)
+4. [✓] Validate allowed-label constraints, write final CSV to the requested output path
+
+Output CSV:
+image,color,texture,morphology
+image_1.jpg,Green,Ring Spot,Rot
+image_2.jpg,Yellow,Random Spot,Rot
+image_3.jpg,Green,Ring Spot,Rot
+</observation>
+<solution>
+Reasoning: Pillow failed to import due to a libtiff/libjpeg mismatch, so I used ImageMagick for image I/O and generated lesion masks + overlays, then inferred (color, texture, morphology) via simple HSV/connected-component heuristics. All intermediates were saved per-image under the requested tmp directory.
+
+Updated plan:
+1. [✓] Enumerate images under benchmark/dataset/PlantPAD and create a manifest
+2. [✗] Run Pillow-based pipeline (failed: Pillow ImportError due to libtiff/libjpeg mismatch)
+3. [✓] Re-run pipeline without Pillow using ImageMagick + numpy (save intermediates and predictions)
+4. [✓] Validate allowed-label constraints, write final CSV to the requested output path
+
+Saved results:
+- CSV: /root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/plantpad_annotate.csv
+- Intermediates: /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/plantpad_annotate/{image_1,image_2,image_3}/ (original.png, lesion_mask.png, overlay.png, metrics.json)
+
+CSV content:
+image,color,texture,morphology
+image_1.jpg,Green,Ring Spot,Rot
+image_2.jpg,Yellow,Random Spot,Rot
+image_3.jpg,Green,Ring Spot,Rot
+</solution>

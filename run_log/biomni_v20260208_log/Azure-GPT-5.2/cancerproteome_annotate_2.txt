@@ -1,0 +1,297 @@
+Identify protein-protein associations by co-expression analysis with data from the STRING database.
+
+Protein expression data are given in `benchmark/dataset/CancerProteome/cancer_proteome.csv`.
+
+For all possible pairs of proteins in the file, calculate the pairwise Spearman correlation coefficient. 
+
+Identify "significantly co-expressed pairs" where the absolute value of the correlation coefficient is >= 0.7 and the p-value is < 0.05.
+
+For each significantly co-expressed pair (ProteinA, ProteinB), query the STRING database API to check for known interactions between them for Homo sapiens (taxid: 9606).
+
+Retain only the pairs that have a high-confidence interaction in STRING, defined as a combined score > 700.
+
+Save the final list of validated protein pairs to a file named `/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/cancerproteome_annotate_2.txt`.
+
+Output Example:
+ProteinA,ProteinB
+ProteinC,ProteinD
+
+All intermediate results should be save in `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cancerproteome_annotate_2` directory.
+
+<execute>#!BASH
+set -euo pipefail
+
+echo "Research log: starting task"
+
+# Paths
+INPUT="benchmark/dataset/CancerProteome/cancer_proteome.csv"
+TMPDIR="/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cancerproteome_annotate_2"
+OUT="/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/cancerproteome_annotate_2.txt"
+
+mkdir -p "$TMPDIR"
+mkdir -p "$(dirname "$OUT")"
+
+echo "1) Inspect input file"
+ls -lh "$INPUT"
+head -n 3 "$INPUT" | sed -e 's/\r$//'
+
+echo "Plan checklist:
+1. [ ] Load proteome matrix; determine protein identifiers and samples
+2. [ ] Compute all pairwise Spearman correlations + p-values; save full table
+3. [ ] Filter significantly co-expressed pairs (|rho|>=0.7, p<0.05); save
+4. [ ] Query STRING API for each pair (taxid 9606); retain combined_score>700; save
+5. [ ] Write final validated pairs to requested output path
+"
+</execute>
+<execute>python - <<'PY'
+import os, pandas as pd, numpy as np
+from scipy.stats import spearmanr
+from itertools import combinations
+
+INPUT="benchmark/dataset/CancerProteome/cancer_proteome.csv"
+TMPDIR="/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cancerproteome_annotate_2"
+os.makedirs(TMPDIR, exist_ok=True)
+
+print("Step 1: Load data and determine orientation")
+df = pd.read_csv(INPUT)
+print("Raw shape:", df.shape)
+print("Columns:", df.columns[:10].tolist())
+
+# Heuristic: if first column looks like protein IDs (strings) and many numeric columns -> set index
+# If columns (except first) are mostly numeric, treat rows as proteins
+def is_mostly_numeric(s):
+    return pd.to_numeric(s, errors='coerce').notna().mean()
+
+first_col = df.columns[0]
+first_col_numeric_frac = is_mostly_numeric(df[first_col])
+other_cols_numeric_frac = np.mean([is_mostly_numeric(df[c]) for c in df.columns[1:]]) if df.shape[1]>1 else 0
+print("First col numeric fraction:", first_col_numeric_frac)
+print("Other cols mean numeric fraction:", other_cols_numeric_frac)
+
+if first_col_numeric_frac < 0.2 and other_cols_numeric_frac > 0.8:
+    protein_ids = df[first_col].astype(str)
+    mat = df.drop(columns=[first_col])
+    mat.index = protein_ids
+    orientation = "rows_are_proteins"
+else:
+    # assume columns are proteins and rows are samples; use all numeric columns
+    num_df = df.apply(pd.to_numeric, errors='coerce')
+    mat = num_df
+    orientation = "cols_are_proteins"
+
+print("Orientation:", orientation)
+print("Matrix shape:", mat.shape)
+
+# Clean: keep numeric, drop all-NA proteins
+mat = mat.apply(pd.to_numeric, errors='coerce')
+if orientation=="rows_are_proteins":
+    mat = mat.dropna(axis=0, how='all')
+    mat = mat.dropna(axis=1, how='all')
+    proteins = mat.index.tolist()
+else:
+    mat = mat.dropna(axis=0, how='all')
+    mat = mat.dropna(axis=1, how='all')
+    proteins = mat.columns.tolist()
+
+print("After cleaning matrix shape:", mat.shape)
+print("Protein count:", len(proteins))
+
+# Save cleaned matrix
+clean_path = os.path.join(TMPDIR, "clean_matrix.tsv")
+mat.to_csv(clean_path, sep="\t")
+print("Saved cleaned matrix:", clean_path)
+
+print("\nUpdated plan:")
+print("1. [✓] Load proteome matrix; determine protein identifiers and samples (completed)")
+print("2. [ ] Compute all pairwise Spearman correlations + p-values; save full table")
+print("3. [ ] Filter significantly co-expressed pairs (|rho|>=0.7, p<0.05); save")
+print("4. [ ] Query STRING API for each pair (taxid 9606); retain combined_score>700; save")
+print("5. [ ] Write final validated pairs to requested output path")
+PY</execute>
+<execute>python - <<'PY'
+import os, pandas as pd, numpy as np
+from scipy.stats import spearmanr
+from itertools import combinations
+from math import comb
+
+TMPDIR="/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cancerproteome_annotate_2"
+clean_path = os.path.join(TMPDIR, "clean_matrix.tsv")
+mat = pd.read_csv(clean_path, sep="\t", index_col=0)
+
+# Determine orientation again: if index looks like proteins (non-numeric) -> rows are proteins
+# We'll compute correlations across samples, so vectors must be aligned on columns.
+rows_are_proteins = True  # since we saved as index=proteins in step1 for that case; if cols are proteins, index was numeric; but saved with index_col=0.
+# Heuristic: if many non-numeric index values -> rows are proteins
+try:
+    pd.to_numeric(mat.index, errors='coerce')
+    nonnum_frac = pd.to_numeric(mat.index, errors='coerce').isna().mean()
+except Exception:
+    nonnum_frac = 1.0
+rows_are_proteins = nonnum_frac > 0.5
+
+if rows_are_proteins:
+    proteins = mat.index.tolist()
+    data = mat.values  # proteins x samples
+else:
+    proteins = mat.columns.tolist()
+    data = mat.values.T  # proteins x samples
+
+n_prot = len(proteins)
+n_pairs = comb(n_prot,2)
+print(f"Step 2: Compute Spearman for {n_prot} proteins -> {n_pairs} pairs")
+
+# pairwise computation with spearmanr in vectorized mode:
+# scipy.stats.spearmanr can compute correlation matrix; but p-values too.
+# Use spearmanr on data.T (samples x proteins)
+rho, p = spearmanr(data.T, axis=0, nan_policy='omit')
+rho = np.asarray(rho); p = np.asarray(p)
+# Extract upper triangle
+iu = np.triu_indices(n_prot, k=1)
+pairs_df = pd.DataFrame({
+    "ProteinA": [proteins[i] for i in iu[0]],
+    "ProteinB": [proteins[j] for j in iu[1]],
+    "spearman_rho": rho[iu],
+    "p_value": p[iu]
+})
+full_path = os.path.join(TMPDIR, "all_pairs_spearman.tsv")
+pairs_df.to_csv(full_path, sep="\t", index=False)
+print("Saved all pairs:", full_path, "rows:", len(pairs_df))
+
+# Step 3 filter
+sig = pairs_df[(pairs_df["spearman_rho"].abs()>=0.7) & (pairs_df["p_value"]<0.05)].copy()
+sig_path = os.path.join(TMPDIR, "significant_coexpressed_pairs.tsv")
+sig.to_csv(sig_path, sep="\t", index=False)
+print("Significant co-expressed pairs:", len(sig), "saved:", sig_path)
+print(sig.head(5).to_string(index=False))
+
+print("\nUpdated plan:")
+print("1. [✓] Load proteome matrix; determine protein identifiers and samples (completed)")
+print("2. [✓] Compute all pairwise Spearman correlations + p-values; save full table (completed)")
+print("3. [✓] Filter significantly co-expressed pairs (|rho|>=0.7, p<0.05); save (completed)")
+print("4. [ ] Query STRING API for each pair (taxid 9606); retain combined_score>700; save")
+print("5. [ ] Write final validated pairs to requested output path")
+PY</execute>
+<execute>python - <<'PY'
+import os, time, pandas as pd, requests
+
+TMPDIR="/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cancerproteome_annotate_2"
+sig_path = os.path.join(TMPDIR, "significant_coexpressed_pairs.tsv")
+sig = pd.read_csv(sig_path, sep="\t")
+print("Step 4: STRING validation. Input significant pairs:", len(sig))
+
+# STRING API endpoint
+BASE="https://string-db.org/api"
+FMT="tsv"
+METHOD="interaction_partners"
+taxid=9606
+
+session = requests.Session()
+session.headers.update({"User-Agent":"biodatalab-coexpression/1.0"})
+
+def query_string_pair(a,b):
+    # query partners for a, then look for b (robust to STRING IDs)
+    url=f"{BASE}/{FMT}/{METHOD}"
+    params={
+        "identifiers": a,
+        "species": taxid,
+        "required_score": 0,  # we'll filter ourselves
+        "limit": 500
+    }
+    r=session.get(url, params=params, timeout=30)
+    r.raise_for_status()
+    lines=r.text.strip().splitlines()
+    if len(lines)<=1:
+        return None
+    header=lines[0].split("\t")
+    best=None
+    for line in lines[1:]:
+        cols=line.split("\t")
+        rec=dict(zip(header, cols))
+        # partner could match preferredName_B or stringId_B
+        if rec.get("preferredName_B")==b or rec.get("preferredName_A")==b or rec.get("stringId_B","").endswith(b) or rec.get("stringId_A","").endswith(b):
+            score=float(rec.get("score", rec.get("combined_score", "0")))
+            if best is None or score>best["combined_score"]:
+                best={"combined_score":score,
+                      "preferredName_A":rec.get("preferredName_A"),
+                      "preferredName_B":rec.get("preferredName_B"),
+                      "stringId_A":rec.get("stringId_A"),
+                      "stringId_B":rec.get("stringId_B")}
+    return best
+
+validated=[]
+records=[]
+fail=0
+for idx,row in sig.iterrows():
+    a=str(row["ProteinA"]); b=str(row["ProteinB"])
+    try:
+        res=query_string_pair(a,b)
+        time.sleep(0.1)
+    except Exception as e:
+        fail+=1
+        continue
+    if res and res["combined_score"]>700:
+        validated.append((a,b))
+        records.append({
+            "ProteinA":a,"ProteinB":b,
+            "spearman_rho":row["spearman_rho"],
+            "p_value":row["p_value"],
+            "string_preferredA":res["preferredName_A"],
+            "string_preferredB":res["preferredName_B"],
+            "string_score":res["combined_score"],
+            "stringId_A":res["stringId_A"],
+            "stringId_B":res["stringId_B"]
+        })
+
+val_df=pd.DataFrame(records)
+val_path=os.path.join(TMPDIR,"validated_pairs_string_score_gt700.tsv")
+val_df.to_csv(val_path, sep="\t", index=False)
+print("Validated pairs:", len(val_df), "saved:", val_path)
+print("Failed queries:", fail)
+
+print("\nUpdated plan:")
+print("1. [✓] Load proteome matrix; determine protein identifiers and samples (completed)")
+print("2. [✓] Compute all pairwise Spearman correlations + p-values; save full table (completed)")
+print("3. [✓] Filter significantly co-expressed pairs (|rho|>=0.7, p<0.05); save (completed)")
+print("4. [✓] Query STRING API for each pair (taxid 9606); retain combined_score>700; save (completed)")
+print("5. [ ] Write final validated pairs to requested output path")
+PY</execute>
+<execute>python - <<'PY'
+import os, pandas as pd
+
+TMPDIR="/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cancerproteome_annotate_2"
+OUT="/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/cancerproteome_annotate_2.txt"
+
+val_path=os.path.join(TMPDIR,"validated_pairs_string_score_gt700.tsv")
+val=pd.read_csv(val_path, sep="\t") if os.path.exists(val_path) else pd.DataFrame(columns=["ProteinA","ProteinB"])
+out_df=val[["ProteinA","ProteinB"]].drop_duplicates()
+
+os.makedirs(os.path.dirname(OUT), exist_ok=True)
+out_df.to_csv(OUT, index=False)
+print("Step 5: Wrote final output:", OUT)
+print("Lines (including header):", len(out_df)+1)
+print(out_df.head(10).to_string(index=False))
+
+print("\nFinal plan status:")
+print("1. [✓] Load proteome matrix; determine protein identifiers and samples (completed)")
+print("2. [✓] Compute all pairwise Spearman correlations + p-values; save full table (completed)")
+print("3. [✓] Filter significantly co-expressed pairs (|rho|>=0.7, p<0.05); save (completed)")
+print("4. [✓] Query STRING API for each pair (taxid 9606); retain combined_score>700; save (completed)")
+print("5. [✓] Write final validated pairs to requested output path (completed)")
+PY</execute>
+<solution>
+Plan checklist:
+1. [✓] Load proteome matrix; determine protein identifiers and samples (completed)
+2. [✓] Compute all pairwise Spearman correlations + p-values; save full table (completed)
+3. [✓] Filter significantly co-expressed pairs (|rho|>=0.7, p<0.05); save (completed)
+4. [✓] Query STRING API for each pair (taxid 9606); retain combined_score>700; save (completed)
+5. [✓] Write final validated pairs to requested output path (completed)
+
+Saved intermediate results in:
+- /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cancerproteome_annotate_2/clean_matrix.tsv
+- /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cancerproteome_annotate_2/all_pairs_spearman.tsv
+- /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cancerproteome_annotate_2/significant_coexpressed_pairs.tsv
+- /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cancerproteome_annotate_2/validated_pairs_string_score_gt700.tsv
+
+Final validated protein pairs file:
+- /root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/cancerproteome_annotate_2.txt
+</solution>

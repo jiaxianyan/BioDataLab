@@ -1,0 +1,961 @@
+Perform quality control on a single-cell RNA-seq dataset. 
+
+Load the raw PBMC3k dataset from `benchmark/dataset/CellCommuNet/pbmc3k_raw.h5ad`. 
+
+First, filter out cells that express fewer than 200 genes. 
+
+Second, filter out cells that express more than 2500 genes. 
+
+Third, calculate the percentage of counts from mitochondrial genes for each cell and remove any cell where this percentage exceeds 5%.
+
+Finally, save the filtered data as an AnnData object to `/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/cellcommunet_refinement.h5ad`.
+
+All intermediate results should be stored in the `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cellcommunet_refinement` directory.
+
+<execute>
+import os
+from pathlib import Path
+import scanpy as sc
+
+print("Research log: PBMC3k QC pipeline (CellCommuNet)")
+
+# Plan
+plan = [
+    "[ ] Create/verify intermediate and output directories",
+    "[ ] Load raw PBMC3k AnnData from provided path",
+    "[ ] Compute QC metrics (n_genes, mito pct) and apply sequential filters (<200 genes, >2500 genes, mito>5%)",
+    "[ ] Save filtered AnnData to requested output path and write intermediate artifacts",
+]
+def show_plan(plan):
+    for i, p in enumerate(plan, 1):
+        print(f"{i}. {p}")
+
+show_plan(plan)
+
+# Step 1: directories
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cellcommunet_refinement")
+out_path = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/cellcommunet_refinement.h5ad")
+tmp_dir.mkdir(parents=True, exist_ok=True)
+out_path.parent.mkdir(parents=True, exist_ok=True)
+
+plan[0] = "[✓] Create/verify intermediate and output directories (completed)"
+show_plan(plan)
+
+# Step 2: load data
+in_path = Path("benchmark/dataset/CellCommuNet/pbmc3k_raw.h5ad")
+print("\nStep 2: Loading input:", in_path.resolve())
+adata = sc.read_h5ad(in_path)
+print("Loaded AnnData:", adata)
+print("obs columns:", list(adata.obs.columns)[:10], "...")
+print("var columns:", list(adata.var.columns)[:10], "...")
+
+plan[1] = "[✓] Load raw PBMC3k AnnData from provided path (completed)"
+show_plan(plan)
+
+# Step 3: QC metrics + filtering
+print("\nStep 3: Computing QC metrics and filtering")
+
+# Ensure gene symbols are in var_names; mito genes often start with 'MT-' (human)
+adata.var["mt"] = adata.var_names.str.upper().str.startswith("MT-")
+
+# Calculate QC metrics: n_genes_by_counts, total_counts, pct_counts_mt
+sc.pp.calculate_qc_metrics(adata, qc_vars=["mt"], percent_top=None, log1p=False, inplace=True)
+
+qc_before = {
+    "n_cells": adata.n_obs,
+    "n_genes": adata.n_vars,
+    "min_n_genes_by_counts": float(adata.obs["n_genes_by_counts"].min()),
+    "median_n_genes_by_counts": float(adata.obs["n_genes_by_counts"].median()),
+    "max_n_genes_by_counts": float(adata.obs["n_genes_by_counts"].max()),
+    "max_pct_counts_mt": float(adata.obs["pct_counts_mt"].max()),
+}
+print("QC summary (before):", qc_before)
+
+# Save pre-filter QC table
+qc_table_path = tmp_dir / "qc_metrics_before.csv"
+adata.obs[["total_counts","n_genes_by_counts","pct_counts_mt"]].to_csv(qc_table_path)
+print("Wrote:", qc_table_path)
+
+# Sequential filters
+n0 = adata.n_obs
+# Filter out cells with <200 genes expressed
+mask1 = adata.obs["n_genes_by_counts"] >= 200
+adata1 = adata[mask1].copy()
+print(f"Filter1 (n_genes_by_counts >=200): {n0} -> {adata1.n_obs}")
+
+# Filter out cells with >2500 genes expressed
+n1 = adata1.n_obs
+mask2 = adata1.obs["n_genes_by_counts"] <= 2500
+adata2 = adata1[mask2].copy()
+print(f"Filter2 (n_genes_by_counts <=2500): {n1} -> {adata2.n_obs}")
+
+# Filter out cells with mitochondrial percentage >5
+n2 = adata2.n_obs
+mask3 = adata2.obs["pct_counts_mt"] <= 5.0
+adata_filt = adata2[mask3].copy()
+print(f"Filter3 (pct_counts_mt <=5): {n2} -> {adata_filt.n_obs}")
+
+# Store intermediate AnnData objects
+path_f1 = tmp_dir / "pbmc3k_after_filter1_min200genes.h5ad"
+path_f2 = tmp_dir / "pbmc3k_after_filter2_max2500genes.h5ad"
+path_f3 = tmp_dir / "pbmc3k_after_filter3_mito5pct.h5ad"
+
+adata1.write_h5ad(path_f1)
+adata2.write_h5ad(path_f2)
+adata_filt.write_h5ad(path_f3)
+print("Saved intermediate files:")
+print(" -", path_f1)
+print(" -", path_f2)
+print(" -", path_f3)
+
+qc_after = {
+    "n_cells": adata_filt.n_obs,
+    "n_genes": adata_filt.n_vars,
+    "min_n_genes_by_counts": float(adata_filt.obs["n_genes_by_counts"].min()),
+    "median_n_genes_by_counts": float(adata_filt.obs["n_genes_by_counts"].median()),
+    "max_n_genes_by_counts": float(adata_filt.obs["n_genes_by_counts"].max()),
+    "max_pct_counts_mt": float(adata_filt.obs["pct_counts_mt"].max()),
+}
+print("QC summary (after):", qc_after)
+
+qc_table_after_path = tmp_dir / "qc_metrics_after.csv"
+adata_filt.obs[["total_counts","n_genes_by_counts","pct_counts_mt"]].to_csv(qc_table_after_path)
+print("Wrote:", qc_table_after_path)
+
+plan[2] = "[✓] Compute QC metrics (n_genes, mito pct) and apply sequential filters (<200 genes, >2500 genes, mito>5%) (completed)"
+show_plan(plan)
+
+# Step 4: Save final output
+print("\nStep 4: Saving final filtered AnnData to:", out_path)
+adata_filt.write_h5ad(out_path)
+print("Saved final:", out_path)
+
+plan[3] = "[✓] Save filtered AnnData to requested output path and write intermediate artifacts (completed)"
+show_plan(plan)
+
+print("\nDone.")
+</execute>
+<observation>ModuleNotFoundError("No module named 'scanpy'")</observation>
+<execute>
+import sys, os
+print("Reasoning: scanpy is unavailable in this environment, so I'll redo the QC using anndata + numpy/scipy only (no new installs).")
+print("Next: check available packages (anndata, numpy, scipy), then implement QC metrics and filters manually, save intermediates and final h5ad.")
+
+# Plan
+plan = [
+    "[ ] Verify required packages (anndata, numpy, scipy/pandas) are available",
+    "[ ] Create/verify intermediate and output directories",
+    "[ ] Load raw PBMC3k AnnData (.h5ad)",
+    "[ ] Compute per-cell n_genes_by_counts, total_counts, pct_counts_mt (MT- genes) and apply sequential filters",
+    "[ ] Save intermediate and final AnnData objects to requested paths",
+]
+def show_plan(p):
+    for i, s in enumerate(p, 1):
+        print(f"{i}. {s}")
+show_plan(plan)
+
+# Step 1: verify packages
+import importlib
+mods = ["anndata", "numpy", "scipy", "pandas"]
+avail = {}
+for m in mods:
+    try:
+        importlib.import_module(m)
+        avail[m] = True
+    except Exception as e:
+        avail[m] = repr(e)
+print("Package availability:", avail)
+
+plan[0] = "[✓] Verify required packages (anndata, numpy, scipy/pandas) are available (completed)"
+show_plan(plan)
+</execute>
+<observation>Reasoning: scanpy is unavailable in this environment, so I'll redo the QC using anndata + numpy/scipy only (no new installs).
+Next: check available packages (anndata, numpy, scipy), then implement QC metrics and filters manually, save intermediates and final h5ad.
+1. [ ] Verify required packages (anndata, numpy, scipy/pandas) are available
+2. [ ] Create/verify intermediate and output directories
+3. [ ] Load raw PBMC3k AnnData (.h5ad)
+4. [ ] Compute per-cell n_genes_by_counts, total_counts, pct_counts_mt (MT- genes) and apply sequential filters
+5. [ ] Save intermediate and final AnnData objects to requested paths
+Package availability: {'anndata': True, 'numpy': True, 'scipy': True, 'pandas': True}
+1. [✓] Verify required packages (anndata, numpy, scipy/pandas) are available (completed)
+2. [ ] Create/verify intermediate and output directories
+3. [ ] Load raw PBMC3k AnnData (.h5ad)
+4. [ ] Compute per-cell n_genes_by_counts, total_counts, pct_counts_mt (MT- genes) and apply sequential filters
+5. [ ] Save intermediate and final AnnData objects to requested paths
+</observation>
+<execute>
+import os
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import scipy.sparse as sp
+import anndata as ad
+
+print("Research log: PBMC3k QC pipeline without scanpy (anndata/numpy/scipy)")
+
+# Updated plan tracker
+plan = [
+    "[✓] Verify required packages (anndata, numpy, scipy/pandas) are available (completed)",
+    "[ ] Create/verify intermediate and output directories",
+    "[ ] Load raw PBMC3k AnnData (.h5ad)",
+    "[ ] Compute per-cell n_genes_by_counts, total_counts, pct_counts_mt (MT- genes) and apply sequential filters",
+    "[ ] Save intermediate and final AnnData objects to requested paths",
+]
+def show_plan(p):
+    for i, s in enumerate(p, 1):
+        print(f"{i}. {s}")
+show_plan(plan)
+
+# Step 2: directories
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cellcommunet_refinement")
+out_path = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/cellcommunet_refinement.h5ad")
+tmp_dir.mkdir(parents=True, exist_ok=True)
+out_path.parent.mkdir(parents=True, exist_ok=True)
+
+plan[1] = "[✓] Create/verify intermediate and output directories (completed)"
+show_plan(plan)
+
+# Step 3: load data
+in_path = Path("benchmark/dataset/CellCommuNet/pbmc3k_raw.h5ad")
+print("\nLoading:", in_path.resolve())
+adata = ad.read_h5ad(in_path)
+print("Loaded AnnData:", adata)
+
+plan[2] = "[✓] Load raw PBMC3k AnnData (.h5ad) (completed)"
+show_plan(plan)
+
+# Helpers for QC
+X = adata.X
+if not (sp.issparse(X) or isinstance(X, np.ndarray)):
+    raise TypeError(f"Unsupported X type: {type(X)}")
+
+def row_sum(mat):
+    if sp.issparse(mat):
+        return np.asarray(mat.sum(axis=1)).ravel()
+    return mat.sum(axis=1)
+
+def row_nnz(mat):
+    if sp.issparse(mat):
+        return np.diff(mat.tocsr().indptr)
+    return (mat != 0).sum(axis=1)
+
+# Step 4: compute metrics + sequential filters
+print("\nComputing QC metrics...")
+
+# mito genes: human convention "MT-"
+var_names = adata.var_names.astype(str)
+mt_mask = np.char.startswith(np.char.upper(var_names.values), "MT-")
+adata.var["mt"] = mt_mask
+
+total_counts = row_sum(X)
+n_genes_by_counts = row_nnz(X)
+
+if mt_mask.any():
+    X_mt = X[:, mt_mask]
+    mt_counts = row_sum(X_mt)
+else:
+    mt_counts = np.zeros(adata.n_obs, dtype=float)
+
+pct_counts_mt = np.where(total_counts > 0, (mt_counts / total_counts) * 100.0, 0.0)
+
+# store in obs
+adata.obs["total_counts"] = total_counts
+adata.obs["n_genes_by_counts"] = n_genes_by_counts
+adata.obs["pct_counts_mt"] = pct_counts_mt
+
+qc_before = {
+    "n_cells": int(adata.n_obs),
+    "n_genes": int(adata.n_vars),
+    "min_n_genes_by_counts": float(np.min(n_genes_by_counts)),
+    "median_n_genes_by_counts": float(np.median(n_genes_by_counts)),
+    "max_n_genes_by_counts": float(np.max(n_genes_by_counts)),
+    "max_pct_counts_mt": float(np.max(pct_counts_mt)),
+    "n_mito_genes": int(mt_mask.sum()),
+}
+print("QC summary (before):", qc_before)
+
+# write QC table before
+qc_before_path = tmp_dir / "qc_metrics_before.csv"
+adata.obs[["total_counts", "n_genes_by_counts", "pct_counts_mt"]].to_csv(qc_before_path)
+print("Wrote:", qc_before_path)
+
+# Sequential filtering
+n0 = adata.n_obs
+
+mask1 = adata.obs["n_genes_by_counts"].to_numpy() >= 200
+adata1 = adata[mask1].copy()
+print(f"Filter1 (remove <200 genes): {n0} -> {adata1.n_obs}")
+
+mask2 = adata1.obs["n_genes_by_counts"].to_numpy() <= 2500
+adata2 = adata1[mask2].copy()
+print(f"Filter2 (remove >2500 genes): {adata1.n_obs} -> {adata2.n_obs}")
+
+mask3 = adata2.obs["pct_counts_mt"].to_numpy() <= 5.0
+adata_filt = adata2[mask3].copy()
+print(f"Filter3 (remove mito% >5): {adata2.n_obs} -> {adata_filt.n_obs}")
+
+# Save intermediate h5ad
+path_f1 = tmp_dir / "pbmc3k_after_filter1_min200genes.h5ad"
+path_f2 = tmp_dir / "pbmc3k_after_filter2_max2500genes.h5ad"
+path_f3 = tmp_dir / "pbmc3k_after_filter3_mito5pct.h5ad"
+adata1.write_h5ad(path_f1)
+adata2.write_h5ad(path_f2)
+adata_filt.write_h5ad(path_f3)
+print("Saved intermediate files:")
+print(" -", path_f1)
+print(" -", path_f2)
+print(" -", path_f3)
+
+qc_after = {
+    "n_cells": int(adata_filt.n_obs),
+    "n_genes": int(adata_filt.n_vars),
+    "min_n_genes_by_counts": float(adata_filt.obs["n_genes_by_counts"].min()),
+    "median_n_genes_by_counts": float(adata_filt.obs["n_genes_by_counts"].median()),
+    "max_n_genes_by_counts": float(adata_filt.obs["n_genes_by_counts"].max()),
+    "max_pct_counts_mt": float(adata_filt.obs["pct_counts_mt"].max()),
+}
+print("QC summary (after):", qc_after)
+
+qc_after_path = tmp_dir / "qc_metrics_after.csv"
+adata_filt.obs[["total_counts", "n_genes_by_counts", "pct_counts_mt"]].to_csv(qc_after_path)
+print("Wrote:", qc_after_path)
+
+plan[3] = "[✓] Compute per-cell n_genes_by_counts, total_counts, pct_counts_mt (MT- genes) and apply sequential filters (completed)"
+show_plan(plan)
+
+# Step 5: save final output
+print("\nSaving final filtered AnnData to:", out_path)
+adata_filt.write_h5ad(out_path)
+print("Saved final:", out_path)
+
+plan[4] = "[✓] Save intermediate and final AnnData objects to requested paths (completed)"
+show_plan(plan)
+
+print("\nQC pipeline completed successfully.")
+</execute>
+<observation>TypeError('string operation on non-string array')</observation>
+<execute>
+import numpy as np
+import scipy.sparse as sp
+from pathlib import Path
+import anndata as ad
+
+print("Reasoning: The error comes from using np.char.* on a non-string dtype array. I'll coerce var_names to a pure string numpy array via astype(str) on the underlying numpy array, then recompute mito mask safely and rerun QC+filters.")
+
+# Plan
+plan = [
+    "[ ] Re-load AnnData and safely coerce var_names to strings",
+    "[ ] Recompute mitochondrial gene mask and QC metrics",
+    "[ ] Apply the three sequential filters and save intermediate + final h5ad files",
+]
+def show_plan(p):
+    for i, s in enumerate(p, 1):
+        print(f"{i}. {s}")
+show_plan(plan)
+
+# Paths
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cellcommunet_refinement")
+out_path = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/cellcommunet_refinement.h5ad")
+in_path = Path("benchmark/dataset/CellCommuNet/pbmc3k_raw.h5ad")
+tmp_dir.mkdir(parents=True, exist_ok=True)
+out_path.parent.mkdir(parents=True, exist_ok=True)
+
+# Step 1: reload and coerce var_names safely
+adata = ad.read_h5ad(in_path)
+print("Loaded:", adata)
+
+# Coerce to numpy array of Python strings robustly
+var_arr = np.asarray(adata.var_names)
+var_arr_str = var_arr.astype(str)  # ensures dtype '<U...'
+upper = np.char.upper(var_arr_str)
+mt_mask = np.char.startswith(upper, "MT-")
+adata.var["mt"] = mt_mask
+print(f"Detected mito genes (MT-): {int(mt_mask.sum())} / {adata.n_vars}")
+
+plan[0] = "[✓] Re-load AnnData and safely coerce var_names to strings (completed)"
+show_plan(plan)
+
+# Helpers
+X = adata.X
+def row_sum(mat):
+    if sp.issparse(mat):
+        return np.asarray(mat.sum(axis=1)).ravel()
+    return np.asarray(mat.sum(axis=1)).ravel()
+
+def row_nnz(mat):
+    if sp.issparse(mat):
+        return np.diff(mat.tocsr().indptr)
+    return np.asarray((mat != 0).sum(axis=1)).ravel()
+
+# Step 2: QC metrics
+total_counts = row_sum(X)
+n_genes_by_counts = row_nnz(X)
+if mt_mask.any():
+    mt_counts = row_sum(X[:, mt_mask])
+else:
+    mt_counts = np.zeros(adata.n_obs, dtype=float)
+pct_counts_mt = np.where(total_counts > 0, (mt_counts / total_counts) * 100.0, 0.0)
+
+adata.obs["total_counts"] = total_counts
+adata.obs["n_genes_by_counts"] = n_genes_by_counts
+adata.obs["pct_counts_mt"] = pct_counts_mt
+
+print("QC summary (before):",
+      {"n_cells": int(adata.n_obs),
+       "min_genes": int(n_genes_by_counts.min()),
+       "median_genes": float(np.median(n_genes_by_counts)),
+       "max_genes": int(n_genes_by_counts.max()),
+       "max_mito_pct": float(pct_counts_mt.max())})
+
+plan[1] = "[✓] Recompute mitochondrial gene mask and QC metrics (completed)"
+show_plan(plan)
+
+# Step 3: filters + save
+qc_before_path = tmp_dir / "qc_metrics_before.csv"
+adata.obs[["total_counts","n_genes_by_counts","pct_counts_mt"]].to_csv(qc_before_path)
+print("Wrote:", qc_before_path)
+
+mask1 = adata.obs["n_genes_by_counts"].to_numpy() >= 200
+adata1 = adata[mask1].copy()
+print("After filter1 (>=200 genes):", adata1.n_obs)
+
+mask2 = adata1.obs["n_genes_by_counts"].to_numpy() <= 2500
+adata2 = adata1[mask2].copy()
+print("After filter2 (<=2500 genes):", adata2.n_obs)
+
+mask3 = adata2.obs["pct_counts_mt"].to_numpy() <= 5.0
+adata_filt = adata2[mask3].copy()
+print("After filter3 (mito%<=5):", adata_filt.n_obs)
+
+# Save intermediates
+path_f1 = tmp_dir / "pbmc3k_after_filter1_min200genes.h5ad"
+path_f2 = tmp_dir / "pbmc3k_after_filter2_max2500genes.h5ad"
+path_f3 = tmp_dir / "pbmc3k_after_filter3_mito5pct.h5ad"
+adata1.write_h5ad(path_f1)
+adata2.write_h5ad(path_f2)
+adata_filt.write_h5ad(path_f3)
+print("Saved intermediates:", path_f1, path_f2, path_f3, sep="\n - ")
+
+qc_after_path = tmp_dir / "qc_metrics_after.csv"
+adata_filt.obs[["total_counts","n_genes_by_counts","pct_counts_mt"]].to_csv(qc_after_path)
+print("Wrote:", qc_after_path)
+
+print("Saving final to:", out_path)
+adata_filt.write_h5ad(out_path)
+print("Saved final:", out_path)
+
+plan[2] = "[✓] Apply the three sequential filters and save intermediate + final h5ad files (completed)"
+show_plan(plan)
+</execute>
+<observation>NameError("name 'sp' is not defined")</observation>
+<execute>
+import numpy as np
+import pandas as pd
+import scipy.sparse as sp
+from pathlib import Path
+import anndata as ad
+
+print("Reasoning: scipy.sparse wasn't imported in the last run, causing sp to be undefined. I'll rerun the QC+filter pipeline end-to-end with the correct imports and save all requested outputs.")
+
+# Plan
+plan = [
+    "[ ] Set up paths and load PBMC3k raw AnnData",
+    "[ ] Compute QC metrics (total_counts, n_genes_by_counts, pct_counts_mt) with robust mito gene detection",
+    "[ ] Apply sequential filters (<200 genes, >2500 genes, mito%>5) and save intermediate + final h5ad files",
+]
+def show_plan(p):
+    for i, s in enumerate(p, 1):
+        print(f"{i}. {s}")
+show_plan(plan)
+
+# Step 1: paths + load
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cellcommunet_refinement")
+out_path = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/cellcommunet_refinement.h5ad")
+in_path = Path("benchmark/dataset/CellCommuNet/pbmc3k_raw.h5ad")
+tmp_dir.mkdir(parents=True, exist_ok=True)
+out_path.parent.mkdir(parents=True, exist_ok=True)
+
+adata = ad.read_h5ad(in_path)
+print("Loaded:", adata)
+
+plan[0] = "[✓] Set up paths and load PBMC3k raw AnnData (completed)"
+show_plan(plan)
+
+# Step 2: QC metrics
+X = adata.X
+
+def row_sum(mat):
+    if sp.issparse(mat):
+        return np.asarray(mat.sum(axis=1)).ravel()
+    return np.asarray(mat.sum(axis=1)).ravel()
+
+def row_nnz(mat):
+    if sp.issparse(mat):
+        return np.diff(mat.tocsr().indptr)
+    return np.asarray((mat != 0).sum(axis=1)).ravel()
+
+var_arr_str = np.asarray(adata.var_names).astype(str)
+mt_mask = np.char.startswith(np.char.upper(var_arr_str), "MT-")
+adata.var["mt"] = mt_mask
+
+total_counts = row_sum(X)
+n_genes_by_counts = row_nnz(X)
+mt_counts = row_sum(X[:, mt_mask]) if mt_mask.any() else np.zeros(adata.n_obs, dtype=float)
+pct_counts_mt = np.where(total_counts > 0, (mt_counts / total_counts) * 100.0, 0.0)
+
+adata.obs["total_counts"] = total_counts
+adata.obs["n_genes_by_counts"] = n_genes_by_counts
+adata.obs["pct_counts_mt"] = pct_counts_mt
+
+qc_before = {
+    "n_cells": int(adata.n_obs),
+    "n_genes": int(adata.n_vars),
+    "n_mito_genes": int(mt_mask.sum()),
+    "min_n_genes_by_counts": int(n_genes_by_counts.min()),
+    "median_n_genes_by_counts": float(np.median(n_genes_by_counts)),
+    "max_n_genes_by_counts": int(n_genes_by_counts.max()),
+    "max_pct_counts_mt": float(pct_counts_mt.max()),
+}
+print("QC summary (before):", qc_before)
+
+qc_before_path = tmp_dir / "qc_metrics_before.csv"
+adata.obs[["total_counts","n_genes_by_counts","pct_counts_mt"]].to_csv(qc_before_path)
+print("Wrote:", qc_before_path)
+
+plan[1] = "[✓] Compute QC metrics (total_counts, n_genes_by_counts, pct_counts_mt) with robust mito gene detection (completed)"
+show_plan(plan)
+
+# Step 3: filters + saves
+mask1 = adata.obs["n_genes_by_counts"].to_numpy() >= 200
+adata1 = adata[mask1].copy()
+print(f"Filter1 (keep >=200 genes): {adata.n_obs} -> {adata1.n_obs}")
+
+mask2 = adata1.obs["n_genes_by_counts"].to_numpy() <= 2500
+adata2 = adata1[mask2].copy()
+print(f"Filter2 (keep <=2500 genes): {adata1.n_obs} -> {adata2.n_obs}")
+
+mask3 = adata2.obs["pct_counts_mt"].to_numpy() <= 5.0
+adata_filt = adata2[mask3].copy()
+print(f"Filter3 (keep mito% <=5): {adata2.n_obs} -> {adata_filt.n_obs}")
+
+# Save intermediate AnnData
+path_f1 = tmp_dir / "pbmc3k_after_filter1_min200genes.h5ad"
+path_f2 = tmp_dir / "pbmc3k_after_filter2_max2500genes.h5ad"
+path_f3 = tmp_dir / "pbmc3k_after_filter3_mito5pct.h5ad"
+adata1.write_h5ad(path_f1)
+adata2.write_h5ad(path_f2)
+adata_filt.write_h5ad(path_f3)
+print("Saved intermediates:")
+print(" -", path_f1)
+print(" -", path_f2)
+print(" -", path_f3)
+
+qc_after = {
+    "n_cells": int(adata_filt.n_obs),
+    "n_genes": int(adata_filt.n_vars),
+    "min_n_genes_by_counts": int(adata_filt.obs["n_genes_by_counts"].min()),
+    "median_n_genes_by_counts": float(adata_filt.obs["n_genes_by_counts"].median()),
+    "max_n_genes_by_counts": int(adata_filt.obs["n_genes_by_counts"].max()),
+    "max_pct_counts_mt": float(adata_filt.obs["pct_counts_mt"].max()),
+}
+print("QC summary (after):", qc_after)
+
+qc_after_path = tmp_dir / "qc_metrics_after.csv"
+adata_filt.obs[["total_counts","n_genes_by_counts","pct_counts_mt"]].to_csv(qc_after_path)
+print("Wrote:", qc_after_path)
+
+# Save final
+adata_filt.write_h5ad(out_path)
+print("Saved final:", out_path)
+
+plan[2] = "[✓] Apply sequential filters (<200 genes, >2500 genes, mito%>5) and save intermediate + final h5ad files (completed)"
+show_plan(plan)
+</execute>
+<observation>NameError("name 'sp' is not defined")</observation>
+<execute>
+import numpy as np
+from pathlib import Path
+import anndata as ad
+
+print("Reasoning: Despite importing scipy.sparse previously, 'sp' is still undefined at runtime. To avoid relying on any alias, I'll remove 'sp' entirely and use only AnnData/NumPy ops plus attribute checks for sparse matrices (issparse) imported directly.")
+
+# Plan
+plan = [
+    "[ ] Import issparse safely and load PBMC3k raw AnnData",
+    "[ ] Compute QC metrics without using 'sp' alias",
+    "[ ] Apply filters and save intermediate + final outputs",
+]
+def show_plan(p):
+    for i, s in enumerate(p, 1):
+        print(f"{i}. {s}")
+show_plan(plan)
+
+# Step 1: safe import + load
+from scipy.sparse import issparse  # avoids sp alias entirely
+
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cellcommunet_refinement")
+out_path = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/cellcommunet_refinement.h5ad")
+in_path = Path("benchmark/dataset/CellCommuNet/pbmc3k_raw.h5ad")
+tmp_dir.mkdir(parents=True, exist_ok=True)
+out_path.parent.mkdir(parents=True, exist_ok=True)
+
+adata = ad.read_h5ad(in_path)
+print("Loaded:", adata)
+
+plan[0] = "[✓] Import issparse safely and load PBMC3k raw AnnData (completed)"
+show_plan(plan)
+
+# Step 2: QC metrics
+X = adata.X
+
+def row_sum(mat):
+    if issparse(mat):
+        return np.asarray(mat.sum(axis=1)).ravel()
+    return np.asarray(mat.sum(axis=1)).ravel()
+
+def row_nnz(mat):
+    if issparse(mat):
+        # CSR indptr trick
+        mat_csr = mat.tocsr()
+        return np.diff(mat_csr.indptr)
+    return np.asarray((mat != 0).sum(axis=1)).ravel()
+
+var_arr_str = np.asarray(adata.var_names).astype(str)
+mt_mask = np.char.startswith(np.char.upper(var_arr_str), "MT-")
+adata.var["mt"] = mt_mask
+
+total_counts = row_sum(X)
+n_genes_by_counts = row_nnz(X)
+mt_counts = row_sum(X[:, mt_mask]) if mt_mask.any() else np.zeros(adata.n_obs, dtype=float)
+pct_counts_mt = np.where(total_counts > 0, (mt_counts / total_counts) * 100.0, 0.0)
+
+adata.obs["total_counts"] = total_counts
+adata.obs["n_genes_by_counts"] = n_genes_by_counts
+adata.obs["pct_counts_mt"] = pct_counts_mt
+
+qc_before_path = tmp_dir / "qc_metrics_before.csv"
+adata.obs[["total_counts","n_genes_by_counts","pct_counts_mt"]].to_csv(qc_before_path)
+print("Wrote:", qc_before_path)
+print("QC summary (before):",
+      {"n_cells": int(adata.n_obs),
+       "n_mito_genes": int(mt_mask.sum()),
+       "min_genes": int(n_genes_by_counts.min()),
+       "median_genes": float(np.median(n_genes_by_counts)),
+       "max_genes": int(n_genes_by_counts.max()),
+       "max_mito_pct": float(pct_counts_mt.max())})
+
+plan[1] = "[✓] Compute QC metrics without using 'sp' alias (completed)"
+show_plan(plan)
+
+# Step 3: filters + save
+mask1 = adata.obs["n_genes_by_counts"].to_numpy() >= 200
+adata1 = adata[mask1].copy()
+
+mask2 = adata1.obs["n_genes_by_counts"].to_numpy() <= 2500
+adata2 = adata1[mask2].copy()
+
+mask3 = adata2.obs["pct_counts_mt"].to_numpy() <= 5.0
+adata_filt = adata2[mask3].copy()
+
+print("Cell counts:",
+      {"start": int(adata.n_obs),
+       "after_min200": int(adata1.n_obs),
+       "after_max2500": int(adata2.n_obs),
+       "after_mito5": int(adata_filt.n_obs)})
+
+# Save intermediates
+path_f1 = tmp_dir / "pbmc3k_after_filter1_min200genes.h5ad"
+path_f2 = tmp_dir / "pbmc3k_after_filter2_max2500genes.h5ad"
+path_f3 = tmp_dir / "pbmc3k_after_filter3_mito5pct.h5ad"
+adata1.write_h5ad(path_f1)
+adata2.write_h5ad(path_f2)
+adata_filt.write_h5ad(path_f3)
+print("Saved intermediates:", path_f1, path_f2, path_f3, sep="\n - ")
+
+# After QC table
+qc_after_path = tmp_dir / "qc_metrics_after.csv"
+adata_filt.obs[["total_counts","n_genes_by_counts","pct_counts_mt"]].to_csv(qc_after_path)
+print("Wrote:", qc_after_path)
+
+# Save final
+adata_filt.write_h5ad(out_path)
+print("Saved final:", out_path)
+
+plan[2] = "[✓] Apply filters and save intermediate + final outputs (completed)"
+show_plan(plan)
+</execute>
+<observation>NameError("name 'issparse' is not defined")</observation>
+<execute>
+import numpy as np
+from pathlib import Path
+import anndata as ad
+import scipy.sparse  # use fully-qualified name to avoid any missing symbol in scope
+
+print("Reasoning: 'issparse' wasn't in scope at runtime. I'll avoid it entirely by calling scipy.sparse.issparse via the module namespace, and rerun end-to-end.")
+
+# Plan
+plan = [
+    "[ ] Load PBMC3k raw AnnData and set up output directories",
+    "[ ] Compute QC metrics using scipy.sparse.issparse (no local aliases)",
+    "[ ] Apply requested filters and save intermediate + final .h5ad files",
+]
+def show_plan(p):
+    for i, s in enumerate(p, 1):
+        print(f"{i}. {s}")
+show_plan(plan)
+
+# Step 1: load + dirs
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cellcommunet_refinement")
+out_path = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/cellcommunet_refinement.h5ad")
+in_path = Path("benchmark/dataset/CellCommuNet/pbmc3k_raw.h5ad")
+tmp_dir.mkdir(parents=True, exist_ok=True)
+out_path.parent.mkdir(parents=True, exist_ok=True)
+
+adata = ad.read_h5ad(in_path)
+print("Loaded:", adata)
+
+plan[0] = "[✓] Load PBMC3k raw AnnData and set up output directories (completed)"
+show_plan(plan)
+
+# Step 2: QC metrics
+X = adata.X
+
+def is_sparse(mat):
+    return scipy.sparse.issparse(mat)
+
+def row_sum(mat):
+    if is_sparse(mat):
+        return np.asarray(mat.sum(axis=1)).ravel()
+    return np.asarray(mat.sum(axis=1)).ravel()
+
+def row_nnz(mat):
+    if is_sparse(mat):
+        mat_csr = mat.tocsr()
+        return np.diff(mat_csr.indptr)
+    return np.asarray((mat != 0).sum(axis=1)).ravel()
+
+var_arr_str = np.asarray(adata.var_names).astype(str)
+mt_mask = np.char.startswith(np.char.upper(var_arr_str), "MT-")
+adata.var["mt"] = mt_mask
+
+total_counts = row_sum(X)
+n_genes_by_counts = row_nnz(X)
+mt_counts = row_sum(X[:, mt_mask]) if mt_mask.any() else np.zeros(adata.n_obs, dtype=float)
+pct_counts_mt = np.where(total_counts > 0, (mt_counts / total_counts) * 100.0, 0.0)
+
+adata.obs["total_counts"] = total_counts
+adata.obs["n_genes_by_counts"] = n_genes_by_counts
+adata.obs["pct_counts_mt"] = pct_counts_mt
+
+qc_before_path = tmp_dir / "qc_metrics_before.csv"
+adata.obs[["total_counts","n_genes_by_counts","pct_counts_mt"]].to_csv(qc_before_path)
+print("Wrote:", qc_before_path)
+print("QC summary (before):",
+      {"n_cells": int(adata.n_obs),
+       "n_mito_genes": int(mt_mask.sum()),
+       "min_genes": int(n_genes_by_counts.min()),
+       "median_genes": float(np.median(n_genes_by_counts)),
+       "max_genes": int(n_genes_by_counts.max()),
+       "max_mito_pct": float(pct_counts_mt.max())})
+
+plan[1] = "[✓] Compute QC metrics using scipy.sparse.issparse (no local aliases) (completed)"
+show_plan(plan)
+
+# Step 3: filters + save
+mask1 = adata.obs["n_genes_by_counts"].to_numpy() >= 200
+adata1 = adata[mask1].copy()
+
+mask2 = adata1.obs["n_genes_by_counts"].to_numpy() <= 2500
+adata2 = adata1[mask2].copy()
+
+mask3 = adata2.obs["pct_counts_mt"].to_numpy() <= 5.0
+adata_filt = adata2[mask3].copy()
+
+print("Cell counts:",
+      {"start": int(adata.n_obs),
+       "after_min200": int(adata1.n_obs),
+       "after_max2500": int(adata2.n_obs),
+       "after_mito5": int(adata_filt.n_obs)})
+
+# Save intermediates
+path_f1 = tmp_dir / "pbmc3k_after_filter1_min200genes.h5ad"
+path_f2 = tmp_dir / "pbmc3k_after_filter2_max2500genes.h5ad"
+path_f3 = tmp_dir / "pbmc3k_after_filter3_mito5pct.h5ad"
+adata1.write_h5ad(path_f1)
+adata2.write_h5ad(path_f2)
+adata_filt.write_h5ad(path_f3)
+print("Saved intermediates:", path_f1, path_f2, path_f3, sep="\n - ")
+
+qc_after_path = tmp_dir / "qc_metrics_after.csv"
+adata_filt.obs[["total_counts","n_genes_by_counts","pct_counts_mt"]].to_csv(qc_after_path)
+print("Wrote:", qc_after_path)
+
+adata_filt.write_h5ad(out_path)
+print("Saved final:", out_path)
+
+plan[2] = "[✓] Apply requested filters and save intermediate + final .h5ad files (completed)"
+show_plan(plan)
+</execute>
+<observation>NameError("name 'is_sparse' is not defined")</observation>
+<execute>
+import numpy as np
+from pathlib import Path
+import anndata as ad
+import scipy.sparse
+
+print("Reasoning: A helper function name wasn't in scope. I'll remove *all* helper function dependencies and compute sums/nnz with explicit inline checks, then filter and save.")
+
+# Plan
+plan = [
+    "[ ] Load data + create directories",
+    "[ ] Compute total_counts, n_genes_by_counts, pct_counts_mt with inline sparse/dense handling",
+    "[ ] Apply filters and save intermediate + final outputs",
+]
+def show_plan(p):
+    for i, s in enumerate(p, 1):
+        print(f"{i}. {s}")
+show_plan(plan)
+
+# Step 1
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cellcommunet_refinement")
+out_path = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/cellcommunet_refinement.h5ad")
+in_path = Path("benchmark/dataset/CellCommuNet/pbmc3k_raw.h5ad")
+tmp_dir.mkdir(parents=True, exist_ok=True)
+out_path.parent.mkdir(parents=True, exist_ok=True)
+
+adata = ad.read_h5ad(in_path)
+X = adata.X
+print("Loaded:", adata, "| X type:", type(X))
+
+plan[0] = "[✓] Load data + create directories (completed)"
+show_plan(plan)
+
+# Step 2: metrics (no helper functions)
+var_arr_str = np.asarray(adata.var_names).astype(str)
+mt_mask = np.char.startswith(np.char.upper(var_arr_str), "MT-")
+adata.var["mt"] = mt_mask
+
+if scipy.sparse.issparse(X):
+    X_csr = X.tocsr()
+    total_counts = np.asarray(X_csr.sum(axis=1)).ravel()
+    n_genes_by_counts = np.diff(X_csr.indptr)
+    if mt_mask.any():
+        mt_counts = np.asarray(X_csr[:, mt_mask].sum(axis=1)).ravel()
+    else:
+        mt_counts = np.zeros(adata.n_obs, dtype=float)
+else:
+    X_dense = np.asarray(X)
+    total_counts = X_dense.sum(axis=1)
+    n_genes_by_counts = (X_dense != 0).sum(axis=1)
+    mt_counts = X_dense[:, mt_mask].sum(axis=1) if mt_mask.any() else np.zeros(adata.n_obs, dtype=float)
+
+pct_counts_mt = np.where(total_counts > 0, (mt_counts / total_counts) * 100.0, 0.0)
+
+adata.obs["total_counts"] = total_counts
+adata.obs["n_genes_by_counts"] = n_genes_by_counts
+adata.obs["pct_counts_mt"] = pct_counts_mt
+
+qc_before_path = tmp_dir / "qc_metrics_before.csv"
+adata.obs[["total_counts","n_genes_by_counts","pct_counts_mt"]].to_csv(qc_before_path)
+print("Wrote:", qc_before_path)
+print("QC summary (before):",
+      {"n_cells": int(adata.n_obs),
+       "n_mito_genes": int(mt_mask.sum()),
+       "min_genes": int(np.min(n_genes_by_counts)),
+       "median_genes": float(np.median(n_genes_by_counts)),
+       "max_genes": int(np.max(n_genes_by_counts)),
+       "max_mito_pct": float(np.max(pct_counts_mt))})
+
+plan[1] = "[✓] Compute total_counts, n_genes_by_counts, pct_counts_mt with inline sparse/dense handling (completed)"
+show_plan(plan)
+
+# Step 3: filters + save
+mask1 = adata.obs["n_genes_by_counts"].to_numpy() >= 200
+adata1 = adata[mask1].copy()
+
+mask2 = adata1.obs["n_genes_by_counts"].to_numpy() <= 2500
+adata2 = adata1[mask2].copy()
+
+mask3 = adata2.obs["pct_counts_mt"].to_numpy() <= 5.0
+adata_filt = adata2[mask3].copy()
+
+print("Cell counts:",
+      {"start": int(adata.n_obs),
+       "after_min200": int(adata1.n_obs),
+       "after_max2500": int(adata2.n_obs),
+       "after_mito5": int(adata_filt.n_obs)})
+
+# Save intermediates
+path_f1 = tmp_dir / "pbmc3k_after_filter1_min200genes.h5ad"
+path_f2 = tmp_dir / "pbmc3k_after_filter2_max2500genes.h5ad"
+path_f3 = tmp_dir / "pbmc3k_after_filter3_mito5pct.h5ad"
+adata1.write_h5ad(path_f1)
+adata2.write_h5ad(path_f2)
+adata_filt.write_h5ad(path_f3)
+print("Saved intermediates:")
+print(" -", path_f1)
+print(" -", path_f2)
+print(" -", path_f3)
+
+qc_after_path = tmp_dir / "qc_metrics_after.csv"
+adata_filt.obs[["total_counts","n_genes_by_counts","pct_counts_mt"]].to_csv(qc_after_path)
+print("Wrote:", qc_after_path)
+
+adata_filt.write_h5ad(out_path)
+print("Saved final:", out_path)
+
+plan[2] = "[✓] Apply filters and save intermediate + final outputs (completed)"
+show_plan(plan)
+</execute>
+<observation>Reasoning: A helper function name wasn't in scope. I'll remove *all* helper function dependencies and compute sums/nnz with explicit inline checks, then filter and save.
+1. [ ] Load data + create directories
+2. [ ] Compute total_counts, n_genes_by_counts, pct_counts_mt with inline sparse/dense handling
+3. [ ] Apply filters and save intermediate + final outputs
+Loaded: AnnData object with n_obs × n_vars = 2700 × 32738
+    var: 'gene_ids' | X type: <class 'scipy.sparse._csr.csr_matrix'>
+1. [✓] Load data + create directories (completed)
+2. [ ] Compute total_counts, n_genes_by_counts, pct_counts_mt with inline sparse/dense handling
+3. [ ] Apply filters and save intermediate + final outputs
+Wrote: /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cellcommunet_refinement/qc_metrics_before.csv
+QC summary (before): {'n_cells': 2700, 'n_mito_genes': 13, 'min_genes': 212, 'median_genes': 817.0, 'max_genes': 3422, 'max_mito_pct': 22.569026947021484}
+1. [✓] Load data + create directories (completed)
+2. [✓] Compute total_counts, n_genes_by_counts, pct_counts_mt with inline sparse/dense handling (completed)
+3. [ ] Apply filters and save intermediate + final outputs
+Cell counts: {'start': 2700, 'after_min200': 2700, 'after_max2500': 2695, 'after_mito5': 2638}
+Saved intermediates:
+ - /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cellcommunet_refinement/pbmc3k_after_filter1_min200genes.h5ad
+ - /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cellcommunet_refinement/pbmc3k_after_filter2_max2500genes.h5ad
+ - /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cellcommunet_refinement/pbmc3k_after_filter3_mito5pct.h5ad
+Wrote: /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cellcommunet_refinement/qc_metrics_after.csv
+Saved final: /root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/cellcommunet_refinement.h5ad
+1. [✓] Load data + create directories (completed)
+2. [✓] Compute total_counts, n_genes_by_counts, pct_counts_mt with inline sparse/dense handling (completed)
+3. [✓] Apply filters and save intermediate + final outputs (completed)
+</observation>
+<solution>
+QC completed on `benchmark/dataset/CellCommuNet/pbmc3k_raw.h5ad` with the requested sequential filters:
+
+Checklist:
+1. [✓] Load data + create directories (completed)
+2. [✓] Compute total_counts, n_genes_by_counts, pct_counts_mt with inline sparse/dense handling (completed)
+3. [✓] Apply filters and save intermediate + final outputs (completed)
+
+Results:
+- Input shape: 2700 cells × 32738 genes
+- Mito genes detected (prefix `MT-`): 13
+- Filtering outcomes (sequential):
+  - Remove cells with <200 genes: 2700 → 2700
+  - Remove cells with >2500 genes: 2700 → 2695
+  - Remove cells with mitochondrial % > 5%: 2695 → 2638
+
+Intermediate artifacts saved to:
+`/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cellcommunet_refinement/`
+- `qc_metrics_before.csv`
+- `qc_metrics_after.csv`
+- `pbmc3k_after_filter1_min200genes.h5ad`
+- `pbmc3k_after_filter2_max2500genes.h5ad`
+- `pbmc3k_after_filter3_mito5pct.h5ad`
+
+Final filtered AnnData saved to:
+`/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/cellcommunet_refinement.h5ad`
+</solution>

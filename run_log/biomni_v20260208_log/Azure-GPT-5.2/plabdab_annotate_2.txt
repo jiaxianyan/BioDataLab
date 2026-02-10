@@ -1,0 +1,1056 @@
+# Core Task
+You are a specialized Bioinformatics NLP Agent expert in Antibody-Antigen entity recognition. Your core competency is parsing biomedical literature titles to identify the specific target antigen of an antibody. You must distinguish between the subject (the antibody) and the object (the antigen) and return the standardized abbreviation or common name of the targeted molecule.
+
+# Workflow Instructions
+- `Data Loading`: Read the input CSV containing "ID" and "Title" columns.
+- `Antigen Entity Recognition`: For each "Title", identify the specific antigen being targeted.
+- `Target Mention Labeling`: Extract the standardized antigen abbreviation or the single word (e.g., use "VEGF" for "Vascular Endothelial Growth Factor") where possible. If a Title describes a method or polypeptide improvement without a specific antigen target mentioned, return "None".
+- `Table Construction`: Map the extracted "target_mention" back to its original ID.
+
+# Output Requirements & File Path
+Generate a CSV file with exactly two columns:
+- `ID`: The original unique identifier from the input file.
+- `target_mention`: The identified antigen abbreviation, single word or "None".
+
+Input Path: Read the input file from: `benchmark/dataset/PLAbDab/plabdab_annotate_2_input.csv`
+Save Path: Save the result to: `/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/plabdab_annotate_2.csv`
+
+# Output Example (For Reference Only)
+["DEFB1", "PD-1", "CHL1", "None"]
+
+# Intermediate Results
+All intermediate files generated should be saved in the directly `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/plabdab_annotate_2`
+
+<execute>
+import os, re, pandas as pd
+from pathlib import Path
+
+# Paths
+inp = Path("benchmark/dataset/PLAbDab/plabdab_annotate_2_input.csv")
+out = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/plabdab_annotate_2.csv")
+tmpdir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/plabdab_annotate_2")
+tmpdir.mkdir(parents=True, exist_ok=True)
+out.parent.mkdir(parents=True, exist_ok=True)
+
+print("Step 1: Load input CSV")
+df = pd.read_csv(inp)
+print(df.head(), "\nColumns:", df.columns.tolist(), "\nRows:", len(df))
+
+# Helper rules for antigen extraction
+# Heuristics: look for "anti-X", "X antibody", "antibodies against X", "binds X", "targeting X", "to X", etc.
+# Also map common long forms to abbreviations.
+abbr_map = {
+    r"programmed death[- ]?1": "PD-1",
+    r"programmed death ligand[- ]?1": "PD-L1",
+    r"cytotoxic t[- ]?lymphocyte[- ]?associated protein[- ]?4": "CTLA-4",
+    r"vascular endothelial growth factor(?:[- ]?a)?": "VEGF",
+    r"epidermal growth factor receptor": "EGFR",
+    r"human epidermal growth factor receptor 2": "HER2",
+    r"tumor necrosis factor(?:[- ]?alpha)?": "TNF",
+    r"interleukin[- ]?6": "IL-6",
+    r"interleukin[- ]?1 beta": "IL-1β",
+    r"interleukin[- ]?17a": "IL-17A",
+    r"c[- ]?reactive protein": "CRP",
+    r"severe acute respiratory syndrome coronavirus 2": "SARS-CoV-2",
+    r"spike (?:glyco)?protein": "Spike",
+    r"receptor binding domain": "RBD",
+    r"human immunodeficiency virus type 1": "HIV-1",
+}
+# Known generic/non-target phrases
+non_target_patterns = [
+    r"\bplatform\b", r"\bmethod\b", r"\bimproved\b", r"\bengineering\b", r"\bhumanization\b",
+    r"\bphage display\b", r"\bantibody library\b", r"\bformat\b", r"\bmanufactur", r"\bexpression\b",
+    r"\bpurification\b", r"\bcrystallization\b", r"\bstructure\b", r"\bstructural\b",
+]
+# Candidate extraction patterns (capture group is antigen mention)
+candidate_patterns = [
+    r"\banti[- ]([A-Za-z0-9][A-Za-z0-9\-_/ ]{0,40})\b",
+    r"\bantibod(?:y|ies) (?:to|against|for|specific for|specific to|directed against|targeting) ([A-Za-z0-9][A-Za-z0-9\-_/ ]{0,60})\b",
+    r"\b([A-Za-z0-9][A-Za-z0-9\-_/]{1,30})[- ]specific antibod(?:y|ies)\b",
+    r"\b([A-Za-z0-9][A-Za-z0-9\-_/]{1,30}) antibody\b",
+    r"\bbinds? ([A-Za-z0-9][A-Za-z0-9\-_/ ]{0,60})\b",
+    r"\bneutraliz(?:e|ing) ([A-Za-z0-9][A-Za-z0-9\-_/ ]{0,60})\b",
+]
+# Cleanup stopwords after capture
+stop_after = set(["antibody","antibodies","mab","monoclonal","polyclonal","igg","fragment","fab","scfv","nanobody",
+                  "human","murine","mouse","rabbit","rat","camelid","single","domain","variable","vhh","receptor",
+                  "protein","proteins","antigen","antigens","epitope","epitopes"])
+
+def normalize_target(raw: str):
+    if raw is None:
+        return None
+    s = raw.strip()
+    # trim at common delimiters
+    s = re.split(r"[;:,()\[\]\.]", s)[0].strip()
+    # remove leading articles
+    s = re.sub(r"^(the|a|an)\s+", "", s, flags=re.I).strip()
+    # remove trailing generic words
+    tokens = s.split()
+    cleaned=[]
+    for t in tokens:
+        if t.lower() in stop_after:
+            break
+        cleaned.append(t)
+    s = " ".join(cleaned).strip()
+    # collapse spaces
+    s = re.sub(r"\s+", " ", s)
+    # if too long, keep first 4 tokens
+    if len(s.split())>4:
+        s=" ".join(s.split()[:4])
+    # standardize some common symbols
+    s = s.replace("α","alpha").replace("β","beta")
+    return s if s else None
+
+def map_abbr(title_lower: str):
+    for pat, abbr in abbr_map.items():
+        if re.search(pat, title_lower):
+            return abbr
+    return None
+
+def extract_target(title: str):
+    if not isinstance(title,str) or not title.strip():
+        return "None"
+    tl = title.lower()
+    # if explicit known long-form mapping exists, use it
+    m = map_abbr(tl)
+    # but if it maps to generic like Spike/RBD and there's explicit antigen like "SARS-CoV-2 spike", keep Spike
+    if m:
+        return m
+    # if looks like purely method with no target cues, may be None
+    # but still try patterns first.
+    for pat in candidate_patterns:
+        mo = re.search(pat, title, flags=re.I)
+        if mo:
+            cand = normalize_target(mo.group(1))
+            if cand:
+                # if candidate starts with common prefixes like "human", drop them
+                cand = re.sub(r"^(human|mouse|murine|rat|rabbit|bovine)\s+", "", cand, flags=re.I).strip()
+                # compress to common antigen-like token: if contains spaces and last token looks like a gene/protein (e.g., PD-1), keep as is
+                # if multiple tokens and first token is acronym, keep first token
+                if len(cand.split())>1:
+                    first=cand.split()[0]
+                    if re.fullmatch(r"[A-Z0-9\-]{2,}", first):
+                        cand=first
+                return cand
+    # secondary: look for standalone all-caps antigen tokens preceded by anti
+    mo = re.search(r"\banti[- ]?([A-Z0-9\-]{2,20})\b", title)
+    if mo:
+        return mo.group(1)
+    # if no target found, decide None
+    return "None"
+
+print("\nStep 2: Extract targets with heuristics")
+df["target_mention"] = df["Title"].apply(extract_target)
+
+print(df[["ID","Title","target_mention"]].head(20))
+
+# Save intermediate
+intermediate_path = tmpdir/"plabdab_annotate_2_with_targets.csv"
+df[["ID","target_mention"]].to_csv(intermediate_path, index=False)
+print("\nSaved intermediate:", intermediate_path)
+
+print("\nStep 3: Save final CSV to required location")
+df[["ID","target_mention"]].to_csv(out, index=False)
+print("Saved output:", out)
+print("Output preview:", pd.read_csv(out).head())
+</execute>
+<observation>NameError("name 'map_abbr' is not defined")</observation>
+<execute>
+import os, re, pandas as pd
+from pathlib import Path
+
+# Plan
+plan = [
+    "Load the input CSV (ID, Title) and validate columns.",
+    "Implement/repair antigen extraction functions (including abbreviation mapping) and run extraction for all titles.",
+    "Write intermediate artifacts to the tmp directory.",
+    "Save final 2-column CSV (ID, target_mention) to the required output path and sanity-check."
+]
+status = ["[ ]"]*len(plan)
+def show_plan():
+    for i,(s,p) in enumerate(zip(status,plan),1):
+        print(f"{i}. {s} {p}")
+print("PLAN:")
+show_plan()
+
+# Paths
+inp = Path("benchmark/dataset/PLAbDab/plabdab_annotate_2_input.csv")
+out = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/plabdab_annotate_2.csv")
+tmpdir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/plabdab_annotate_2")
+tmpdir.mkdir(parents=True, exist_ok=True)
+out.parent.mkdir(parents=True, exist_ok=True)
+
+print("\nStep 1: Load input CSV")
+df = pd.read_csv(inp)
+assert "ID" in df.columns and "Title" in df.columns, f"Missing required columns. Found: {df.columns.tolist()}"
+print(df.head())
+print("Rows:", len(df))
+status[0] = "[✓]"
+print("\nUPDATED PLAN:")
+show_plan()
+
+print("\nStep 2: Define extraction functions (fix NameError) + run extraction")
+
+# Abbreviation/long-form mapping
+ABBR_MAP = {
+    r"\bprogrammed death[- ]?1\b": "PD-1",
+    r"\bprogrammed death[- ]?ligand[- ]?1\b": "PD-L1",
+    r"\bcytotoxic t[- ]?lymphocyte[- ]?associated protein[- ]?4\b": "CTLA-4",
+    r"\bvascular endothelial growth factor(?:[- ]?a)?\b": "VEGF",
+    r"\bepidermal growth factor receptor\b": "EGFR",
+    r"\bhuman epidermal growth factor receptor 2\b": "HER2",
+    r"\bcluster of differentiation 20\b": "CD20",
+    r"\bcluster of differentiation 3\b": "CD3",
+    r"\bcluster of differentiation 19\b": "CD19",
+    r"\btumou?r necrosis factor(?:[- ]?alpha)?\b": "TNF",
+    r"\binterleukin[- ]?6\b": "IL-6",
+    r"\binterleukin[- ]?1 beta\b": "IL-1β",
+    r"\binterleukin[- ]?17a\b": "IL-17A",
+    r"\bc[- ]?reactive protein\b": "CRP",
+    r"\bsevere acute respiratory syndrome coronavirus 2\b": "SARS-CoV-2",
+    r"\breceptor binding domain\b": "RBD",
+    r"\bspike (?:glyco)?protein\b": "Spike",
+    r"\bhuman immunodeficiency virus type 1\b": "HIV-1",
+}
+
+STOP_AFTER = set([
+    "antibody","antibodies","mab","monoclonal","polyclonal","igg","fragment","fab","scfv","nanobody",
+    "single","domain","variable","vhh","antigen","antigens","epitope","epitopes","binding","binds"
+])
+
+CANDIDATE_PATTERNS = [
+    r"\banti[- ]([A-Za-z0-9][A-Za-z0-9\-_/ ]{0,60})\b",
+    r"\bantibod(?:y|ies) (?:to|against|for|specific for|specific to|directed against|targeting) ([A-Za-z0-9][A-Za-z0-9\-_/ ]{0,80})\b",
+    r"\b([A-Za-z0-9][A-Za-z0-9\-_/]{1,30})[- ]specific antibod(?:y|ies)\b",
+    r"\b([A-Za-z0-9][A-Za-z0-9\-_/]{1,30}) antibody\b",
+    r"\btargeting ([A-Za-z0-9][A-Za-z0-9\-_/ ]{0,80})\b",
+    r"\bbinds? ([A-Za-z0-9][A-Za-z0-9\-_/ ]{0,80})\b",
+]
+
+def map_abbr(title_lower: str):
+    for pat, abbr in ABBR_MAP.items():
+        if re.search(pat, title_lower):
+            return abbr
+    return None
+
+def normalize_target(raw: str):
+    if raw is None:
+        return None
+    s = raw.strip()
+    s = re.split(r"[;:,\(\)\[\]\.]", s)[0].strip()
+    s = re.sub(r"^(the|a|an)\s+", "", s, flags=re.I).strip()
+    # truncate at generic trailing terms
+    toks = s.split()
+    out=[]
+    for t in toks:
+        if t.lower() in STOP_AFTER:
+            break
+        out.append(t)
+    s = " ".join(out).strip()
+    s = re.sub(r"\s+", " ", s)
+    # remove leading species adjectives
+    s = re.sub(r"^(human|mouse|murine|rat|rabbit|bovine)\s+", "", s, flags=re.I).strip()
+    if not s:
+        return None
+    # if multiword and starts with acronym, keep acronym
+    if len(s.split()) > 1:
+        first = s.split()[0]
+        if re.fullmatch(r"[A-Z0-9\-]{2,}", first):
+            s = first
+    # cap extremely long remnants
+    if len(s) > 40:
+        s = " ".join(s.split()[:4])
+    return s
+
+def extract_target(title: str):
+    if not isinstance(title, str) or not title.strip():
+        return "None"
+    tl = title.lower()
+
+    # 1) Prefer curated long-form->abbr matches
+    ab = map_abbr(tl)
+    if ab:
+        return ab
+
+    # 2) Pattern-based extraction
+    for pat in CANDIDATE_PATTERNS:
+        m = re.search(pat, title, flags=re.I)
+        if m:
+            cand = normalize_target(m.group(1))
+            if cand:
+                return cand
+
+    # 3) Fallback: "anti-XYZ" uppercase token
+    m = re.search(r"\banti[- ]?([A-Z0-9\-]{2,20})\b", title)
+    if m:
+        return m.group(1)
+
+    return "None"
+
+df["target_mention"] = df["Title"].apply(extract_target)
+
+print(df[["ID","Title","target_mention"]].head(25))
+print("Value counts (top 20):")
+print(df["target_mention"].value_counts().head(20))
+
+status[1] = "[✓]"
+print("\nUPDATED PLAN:")
+show_plan()
+
+print("\nStep 3: Save intermediate files")
+intermediate_with_titles = tmpdir/"plabdab_annotate_2_with_titles_and_targets.csv"
+intermediate_two_col = tmpdir/"plabdab_annotate_2_ID_target_mention.csv"
+df[["ID","Title","target_mention"]].to_csv(intermediate_with_titles, index=False)
+df[["ID","target_mention"]].to_csv(intermediate_two_col, index=False)
+print("Saved:", intermediate_with_titles)
+print("Saved:", intermediate_two_col)
+
+status[2] = "[✓]"
+print("\nUPDATED PLAN:")
+show_plan()
+
+print("\nStep 4: Save final output CSV")
+df[["ID","target_mention"]].to_csv(out, index=False)
+
+# Sanity-check
+out_df = pd.read_csv(out)
+assert list(out_df.columns) == ["ID","target_mention"], out_df.columns.tolist()
+assert len(out_df) == len(df)
+print("Saved final:", out)
+print(out_df.head())
+
+status[3] = "[✓]"
+print("\nUPDATED PLAN:")
+show_plan()
+</execute>
+<observation>NameError("name 'status' is not defined")</observation>
+<execute>
+import re, pandas as pd
+from pathlib import Path
+
+# 1) Plan (self-contained; avoid relying on prior state)
+plan = [
+    "Load the input CSV (ID, Title) and validate columns.",
+    "Implement antigen extraction (abbr mapping + title heuristics) and run for all rows.",
+    "Write intermediate files to the required tmp directory.",
+    "Save final 2-column CSV (ID, target_mention) to the required output path and sanity-check."
+]
+status = ["[ ]"] * len(plan)
+def show_plan():
+    for i, (s, p) in enumerate(zip(status, plan), 1):
+        print(f"{i}. {s} {p}")
+
+print("PLAN:")
+show_plan()
+
+# Paths
+inp = Path("benchmark/dataset/PLAbDab/plabdab_annotate_2_input.csv")
+out = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/plabdab_annotate_2.csv")
+tmpdir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/plabdab_annotate_2")
+tmpdir.mkdir(parents=True, exist_ok=True)
+out.parent.mkdir(parents=True, exist_ok=True)
+
+# 2) Step 1: Load
+print("\nStep 1: Load input CSV")
+df = pd.read_csv(inp)
+assert "ID" in df.columns and "Title" in df.columns, f"Missing required columns. Found: {df.columns.tolist()}"
+print("Rows:", len(df))
+print(df.head())
+status[0] = "[✓]"
+print("\nUPDATED PLAN:")
+show_plan()
+
+# 3) Step 2: Extraction
+print("\nStep 2: Extract antigen targets")
+
+ABBR_MAP = {
+    r"\bprogrammed death[- ]?1\b": "PD-1",
+    r"\bprogrammed death[- ]?ligand[- ]?1\b": "PD-L1",
+    r"\bcytotoxic t[- ]?lymphocyte[- ]?associated protein[- ]?4\b": "CTLA-4",
+    r"\bvascular endothelial growth factor(?:[- ]?a)?\b": "VEGF",
+    r"\bepidermal growth factor receptor\b": "EGFR",
+    r"\bhuman epidermal growth factor receptor 2\b": "HER2",
+    r"\bcluster of differentiation 20\b": "CD20",
+    r"\bcluster of differentiation 3\b": "CD3",
+    r"\bcluster of differentiation 19\b": "CD19",
+    r"\btumou?r necrosis factor(?:[- ]?alpha)?\b": "TNF",
+    r"\binterleukin[- ]?6\b": "IL-6",
+    r"\binterleukin[- ]?1 beta\b": "IL-1β",
+    r"\binterleukin[- ]?17a\b": "IL-17A",
+    r"\bc[- ]?reactive protein\b": "CRP",
+    r"\bsevere acute respiratory syndrome coronavirus 2\b": "SARS-CoV-2",
+    r"\breceptor binding domain\b": "RBD",
+    r"\bspike (?:glyco)?protein\b": "Spike",
+    r"\bhuman immunodeficiency virus type 1\b": "HIV-1",
+}
+
+STOP_AFTER = set([
+    "antibody","antibodies","mab","monoclonal","polyclonal","igg","fragment","fab","scfv","nanobody",
+    "single","domain","variable","vhh","antigen","antigens","epitope","epitopes","binding","binds"
+])
+
+CANDIDATE_PATTERNS = [
+    r"\banti[- ]([A-Za-z0-9][A-Za-z0-9\-_/ ]{0,80})\b",
+    r"\bantibod(?:y|ies) (?:to|against|for|specific for|specific to|directed against|targeting) ([A-Za-z0-9][A-Za-z0-9\-_/ ]{0,100})\b",
+    r"\b([A-Za-z0-9][A-Za-z0-9\-_/]{1,30})[- ]specific antibod(?:y|ies)\b",
+    r"\b([A-Za-z0-9][A-Za-z0-9\-_/]{1,30}) antibody\b",
+    r"\btargeting ([A-Za-z0-9][A-Za-z0-9\-_/ ]{0,100})\b",
+    r"\bbinds? ([A-Za-z0-9][A-Za-z0-9\-_/ ]{0,100})\b",
+]
+
+def map_abbr(title_lower: str):
+    for pat, abbr in ABBR_MAP.items():
+        if re.search(pat, title_lower):
+            return abbr
+    return None
+
+def normalize_target(raw: str):
+    if raw is None:
+        return None
+    s = raw.strip()
+    s = re.split(r"[;:,\(\)\[\]\.]", s)[0].strip()
+    s = re.sub(r"^(the|a|an)\s+", "", s, flags=re.I).strip()
+    toks = s.split()
+    out=[]
+    for t in toks:
+        if t.lower() in STOP_AFTER:
+            break
+        out.append(t)
+    s = " ".join(out).strip()
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"^(human|mouse|murine|rat|rabbit|bovine)\s+", "", s, flags=re.I).strip()
+    if not s:
+        return None
+    if len(s.split()) > 1:
+        first = s.split()[0]
+        if re.fullmatch(r"[A-Z0-9\-]{2,}", first):
+            s = first
+    if len(s) > 60:
+        s = " ".join(s.split()[:4])
+    return s
+
+def extract_target(title: str):
+    if not isinstance(title, str) or not title.strip():
+        return "None"
+    tl = title.lower()
+
+    ab = map_abbr(tl)
+    if ab:
+        return ab
+
+    for pat in CANDIDATE_PATTERNS:
+        m = re.search(pat, title, flags=re.I)
+        if m:
+            cand = normalize_target(m.group(1))
+            if cand:
+                return cand
+
+    m = re.search(r"\banti[- ]?([A-Z0-9\-]{2,20})\b", title)
+    if m:
+        return m.group(1)
+
+    return "None"
+
+df["target_mention"] = df["Title"].apply(extract_target)
+print(df[["ID","Title","target_mention"]].head(25))
+print("\nTop target_mention counts:")
+print(df["target_mention"].value_counts().head(20))
+
+status[1] = "[✓]"
+print("\nUPDATED PLAN:")
+show_plan()
+
+# 4) Step 3: Intermediate outputs
+print("\nStep 3: Save intermediate files")
+intermediate_with_titles = tmpdir / "plabdab_annotate_2_with_titles_and_targets.csv"
+intermediate_two_col = tmpdir / "plabdab_annotate_2_ID_target_mention.csv"
+df[["ID","Title","target_mention"]].to_csv(intermediate_with_titles, index=False)
+df[["ID","target_mention"]].to_csv(intermediate_two_col, index=False)
+print("Saved:", intermediate_with_titles)
+print("Saved:", intermediate_two_col)
+
+status[2] = "[✓]"
+print("\nUPDATED PLAN:")
+show_plan()
+
+# 5) Step 4: Final output
+print("\nStep 4: Save final output CSV + sanity checks")
+df[["ID","target_mention"]].to_csv(out, index=False)
+out_df = pd.read_csv(out)
+assert list(out_df.columns) == ["ID","target_mention"], f"Bad columns: {out_df.columns.tolist()}"
+assert len(out_df) == len(df), "Row count mismatch"
+print("Saved final:", out)
+print(out_df.head())
+
+status[3] = "[✓]"
+print("\nUPDATED PLAN:")
+show_plan()
+</execute>
+<observation>NameError("name 'status' is not defined")</observation>
+<execute>
+# Research log: rerun in a fully self-contained way and avoid any dependency on prior variables/state.
+
+import re, pandas as pd
+from pathlib import Path
+
+print("=== START: Self-contained run ===")
+
+# ----- PLAN (printed only; not used later to avoid any NameError surprises) -----
+PLAN = [
+    "Load input CSV and validate columns",
+    "Extract antigen targets from Title",
+    "Save intermediates to tmpdir",
+    "Save final output CSV and sanity-check",
+]
+print("PLAN:")
+for i, p in enumerate(PLAN, 1):
+    print(f"{i}. [ ] {p}")
+
+# ----- PATHS -----
+inp = Path("benchmark/dataset/PLAbDab/plabdab_annotate_2_input.csv")
+out = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/plabdab_annotate_2.csv")
+tmpdir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/plabdab_annotate_2")
+tmpdir.mkdir(parents=True, exist_ok=True)
+out.parent.mkdir(parents=True, exist_ok=True)
+
+# ----- STEP 1 -----
+print("\n[Step 1/4] Load input CSV")
+df = pd.read_csv(inp)
+if "ID" not in df.columns or "Title" not in df.columns:
+    raise ValueError(f"Missing required columns. Found: {df.columns.tolist()}")
+print("Rows:", len(df))
+print("Head:\n", df.head())
+
+print("\nPLAN (update):")
+for i, p in enumerate(PLAN, 1):
+    chk = "[✓]" if i == 1 else "[ ]"
+    print(f"{i}. {chk} {p}")
+
+# ----- STEP 2: EXTRACTION -----
+print("\n[Step 2/4] Extract antigen targets")
+
+ABBR_MAP = {
+    r"\bprogrammed death[- ]?1\b": "PD-1",
+    r"\bprogrammed death[- ]?ligand[- ]?1\b": "PD-L1",
+    r"\bcytotoxic t[- ]?lymphocyte[- ]?associated protein[- ]?4\b": "CTLA-4",
+    r"\bvascular endothelial growth factor(?:[- ]?a)?\b": "VEGF",
+    r"\bepidermal growth factor receptor\b": "EGFR",
+    r"\bhuman epidermal growth factor receptor 2\b": "HER2",
+    r"\bcluster of differentiation 20\b": "CD20",
+    r"\bcluster of differentiation 3\b": "CD3",
+    r"\bcluster of differentiation 19\b": "CD19",
+    r"\btumou?r necrosis factor(?:[- ]?alpha)?\b": "TNF",
+    r"\binterleukin[- ]?6\b": "IL-6",
+    r"\binterleukin[- ]?1 beta\b": "IL-1β",
+    r"\binterleukin[- ]?17a\b": "IL-17A",
+    r"\bc[- ]?reactive protein\b": "CRP",
+    r"\bsevere acute respiratory syndrome coronavirus 2\b": "SARS-CoV-2",
+    r"\breceptor binding domain\b": "RBD",
+    r"\bspike (?:glyco)?protein\b": "Spike",
+    r"\bhuman immunodeficiency virus type 1\b": "HIV-1",
+}
+
+STOP_AFTER = set([
+    "antibody","antibodies","mab","monoclonal","polyclonal","igg","fragment","fab","scfv","nanobody",
+    "single","domain","variable","vhh","antigen","antigens","epitope","epitopes","binding","binds"
+])
+
+CANDIDATE_PATTERNS = [
+    r"\banti[- ]([A-Za-z0-9][A-Za-z0-9\-_/ ]{0,80})\b",
+    r"\bantibod(?:y|ies) (?:to|against|for|specific for|specific to|directed against|targeting) ([A-Za-z0-9][A-Za-z0-9\-_/ ]{0,100})\b",
+    r"\b([A-Za-z0-9][A-Za-z0-9\-_/]{1,30})[- ]specific antibod(?:y|ies)\b",
+    r"\b([A-Za-z0-9][A-Za-z0-9\-_/]{1,30}) antibody\b",
+    r"\btargeting ([A-Za-z0-9][A-Za-z0-9\-_/ ]{0,100})\b",
+    r"\bbinds? ([A-Za-z0-9][A-Za-z0-9\-_/ ]{0,100})\b",
+]
+
+def map_abbr(title_lower: str):
+    for pat, abbr in ABBR_MAP.items():
+        if re.search(pat, title_lower):
+            return abbr
+    return None
+
+def normalize_target(raw: str):
+    if raw is None:
+        return None
+    s = raw.strip()
+    s = re.split(r"[;:,\(\)\[\]\.]", s)[0].strip()
+    s = re.sub(r"^(the|a|an)\s+", "", s, flags=re.I).strip()
+
+    toks = s.split()
+    kept = []
+    for t in toks:
+        if t.lower() in STOP_AFTER:
+            break
+        kept.append(t)
+    s = " ".join(kept).strip()
+    s = re.sub(r"\s+", " ", s)
+    s = re.sub(r"^(human|mouse|murine|rat|rabbit|bovine)\s+", "", s, flags=re.I).strip()
+
+    if not s:
+        return None
+
+    # If multiword starts with an acronym, keep acronym
+    if len(s.split()) > 1:
+        first = s.split()[0]
+        if re.fullmatch(r"[A-Z0-9\-]{2,}", first):
+            s = first
+
+    if len(s) > 60:
+        s = " ".join(s.split()[:4])
+    return s
+
+def extract_target(title: str):
+    if not isinstance(title, str) or not title.strip():
+        return "None"
+    tl = title.lower()
+
+    ab = map_abbr(tl)
+    if ab:
+        return ab
+
+    for pat in CANDIDATE_PATTERNS:
+        m = re.search(pat, title, flags=re.I)
+        if m:
+            cand = normalize_target(m.group(1))
+            if cand:
+                return cand
+
+    m = re.search(r"\banti[- ]?([A-Z0-9\-]{2,20})\b", title)
+    if m:
+        return m.group(1)
+
+    return "None"
+
+df["target_mention"] = df["Title"].apply(extract_target)
+
+print("Preview:\n", df[["ID","Title","target_mention"]].head(20))
+print("\nTop target_mention counts:\n", df["target_mention"].value_counts().head(20))
+
+print("\nPLAN (update):")
+for i, p in enumerate(PLAN, 1):
+    chk = "[✓]" if i <= 2 else "[ ]"
+    print(f"{i}. {chk} {p}")
+
+# ----- STEP 3: INTERMEDIATE FILES -----
+print("\n[Step 3/4] Save intermediate files")
+intermediate_with_titles = tmpdir / "plabdab_annotate_2_with_titles_and_targets.csv"
+intermediate_two_col = tmpdir / "plabdab_annotate_2_ID_target_mention.csv"
+df[["ID","Title","target_mention"]].to_csv(intermediate_with_titles, index=False)
+df[["ID","target_mention"]].to_csv(intermediate_two_col, index=False)
+print("Saved:", intermediate_with_titles)
+print("Saved:", intermediate_two_col)
+
+print("\nPLAN (update):")
+for i, p in enumerate(PLAN, 1):
+    chk = "[✓]" if i <= 3 else "[ ]"
+    print(f"{i}. {chk} {p}")
+
+# ----- STEP 4: FINAL OUTPUT -----
+print("\n[Step 4/4] Save final output + sanity check")
+df[["ID","target_mention"]].to_csv(out, index=False)
+out_df = pd.read_csv(out)
+if list(out_df.columns) != ["ID", "target_mention"]:
+    raise ValueError(f"Bad columns in output: {out_df.columns.tolist()}")
+if len(out_df) != len(df):
+    raise ValueError("Row count mismatch in output")
+print("Saved final:", out)
+print("Output head:\n", out_df.head())
+
+print("\nPLAN (final):")
+for i, p in enumerate(PLAN, 1):
+    print(f"{i}. [✓] {p}")
+
+print("=== DONE ===")
+</execute>
+<observation>NameError("name 'map_abbr' is not defined")</observation>
+<execute>
+import re, pandas as pd
+from pathlib import Path
+
+print("PLAN:")
+plan = [
+    "Load input CSV (ID, Title).",
+    "Extract antigen targets with a single self-contained function (no external NameErrors).",
+    "Save intermediate files to tmp directory.",
+    "Save final output CSV to required path and validate."
+]
+for i,p in enumerate(plan,1):
+    print(f"{i}. [ ] {p}")
+
+# Paths
+inp = Path("benchmark/dataset/PLAbDab/plabdab_annotate_2_input.csv")
+out = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/plabdab_annotate_2.csv")
+tmpdir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/plabdab_annotate_2")
+tmpdir.mkdir(parents=True, exist_ok=True)
+out.parent.mkdir(parents=True, exist_ok=True)
+
+print("\nStep 1: Load input CSV")
+df = pd.read_csv(inp)
+if not {"ID","Title"}.issubset(df.columns):
+    raise ValueError(f"Missing required columns. Found: {df.columns.tolist()}")
+print("Rows:", len(df))
+print(df.head())
+
+print("\nUPDATED PLAN:")
+for i,p in enumerate(plan,1):
+    print(f"{i}. {'[✓]' if i==1 else '[ ]'} {p}")
+
+print("\nStep 2: Extract targets (self-contained)")
+
+def extract_target(title: str) -> str:
+    # All resources defined inside function => cannot NameError due to missing globals
+    ABBR_MAP = {
+        r"\bprogrammed death[- ]?1\b": "PD-1",
+        r"\bprogrammed death[- ]?ligand[- ]?1\b": "PD-L1",
+        r"\bcytotoxic t[- ]?lymphocyte[- ]?associated protein[- ]?4\b": "CTLA-4",
+        r"\bvascular endothelial growth factor(?:[- ]?a)?\b": "VEGF",
+        r"\bepidermal growth factor receptor\b": "EGFR",
+        r"\bhuman epidermal growth factor receptor 2\b": "HER2",
+        r"\bcluster of differentiation 20\b": "CD20",
+        r"\bcluster of differentiation 3\b": "CD3",
+        r"\bcluster of differentiation 19\b": "CD19",
+        r"\btumou?r necrosis factor(?:[- ]?alpha)?\b": "TNF",
+        r"\binterleukin[- ]?6\b": "IL-6",
+        r"\binterleukin[- ]?1 beta\b": "IL-1β",
+        r"\binterleukin[- ]?17a\b": "IL-17A",
+        r"\bc[- ]?reactive protein\b": "CRP",
+        r"\bsevere acute respiratory syndrome coronavirus 2\b": "SARS-CoV-2",
+        r"\breceptor binding domain\b": "RBD",
+        r"\bspike (?:glyco)?protein\b": "Spike",
+        r"\bhuman immunodeficiency virus type 1\b": "HIV-1",
+    }
+    STOP_AFTER = set([
+        "antibody","antibodies","mab","monoclonal","polyclonal","igg","fragment","fab","scfv","nanobody",
+        "single","domain","variable","vhh","antigen","antigens","epitope","epitopes","binding","binds"
+    ])
+    CANDIDATE_PATTERNS = [
+        r"\banti[- ]([A-Za-z0-9][A-Za-z0-9\-_/ ]{0,80})\b",
+        r"\bantibod(?:y|ies) (?:to|against|for|specific for|specific to|directed against|targeting) ([A-Za-z0-9][A-Za-z0-9\-_/ ]{0,100})\b",
+        r"\b([A-Za-z0-9][A-Za-z0-9\-_/]{1,30})[- ]specific antibod(?:y|ies)\b",
+        r"\b([A-Za-z0-9][A-Za-z0-9\-_/]{1,30}) antibody\b",
+        r"\btargeting ([A-Za-z0-9][A-Za-z0-9\-_/ ]{0,100})\b",
+        r"\bbinds? ([A-Za-z0-9][A-Za-z0-9\-_/ ]{0,100})\b",
+    ]
+
+    def normalize_target(raw: str):
+        if raw is None:
+            return None
+        s = raw.strip()
+        s = re.split(r"[;:,\(\)\[\]\.]", s)[0].strip()
+        s = re.sub(r"^(the|a|an)\s+", "", s, flags=re.I).strip()
+        toks = s.split()
+        kept=[]
+        for t in toks:
+            if t.lower() in STOP_AFTER:
+                break
+            kept.append(t)
+        s = " ".join(kept).strip()
+        s = re.sub(r"\s+", " ", s)
+        s = re.sub(r"^(human|mouse|murine|rat|rabbit|bovine)\s+", "", s, flags=re.I).strip()
+        if not s:
+            return None
+        if len(s.split()) > 1:
+            first = s.split()[0]
+            if re.fullmatch(r"[A-Z0-9\-]{2,}", first):
+                s = first
+        if len(s) > 60:
+            s = " ".join(s.split()[:4])
+        return s
+
+    if not isinstance(title, str) or not title.strip():
+        return "None"
+    tl = title.lower()
+
+    # 1) curated long-form -> abbreviation
+    for pat, abbr in ABBR_MAP.items():
+        if re.search(pat, tl):
+            return abbr
+
+    # 2) pattern-based capture
+    for pat in CANDIDATE_PATTERNS:
+        m = re.search(pat, title, flags=re.I)
+        if m:
+            cand = normalize_target(m.group(1))
+            if cand:
+                return cand
+
+    # 3) fallback uppercase token after anti-
+    m = re.search(r"\banti[- ]?([A-Z0-9\-]{2,20})\b", title)
+    if m:
+        return m.group(1)
+
+    return "None"
+
+df["target_mention"] = df["Title"].apply(extract_target)
+print(df[["ID","Title","target_mention"]].head(25))
+print("\nTop target_mention counts:")
+print(df["target_mention"].value_counts().head(20))
+
+print("\nUPDATED PLAN:")
+for i,p in enumerate(plan,1):
+    print(f"{i}. {'[✓]' if i<=2 else '[ ]'} {p}")
+
+print("\nStep 3: Save intermediate files")
+(tmpdir / "plabdab_annotate_2_with_titles_and_targets.csv").write_text(
+    df[["ID","Title","target_mention"]].to_csv(index=False)
+)
+(tmpdir / "plabdab_annotate_2_ID_target_mention.csv").write_text(
+    df[["ID","target_mention"]].to_csv(index=False)
+)
+print("Saved intermediates to:", tmpdir)
+
+print("\nUPDATED PLAN:")
+for i,p in enumerate(plan,1):
+    print(f"{i}. {'[✓]' if i<=3 else '[ ]'} {p}")
+
+print("\nStep 4: Save final output + sanity check")
+df[["ID","target_mention"]].to_csv(out, index=False)
+out_df = pd.read_csv(out)
+if list(out_df.columns) != ["ID","target_mention"]:
+    raise ValueError("Output columns are not exactly ['ID','target_mention']")
+if len(out_df) != len(df):
+    raise ValueError("Output row count mismatch")
+print("Saved final:", out)
+print(out_df.head())
+
+print("\nUPDATED PLAN:")
+for i,p in enumerate(plan,1):
+    print(f"{i}. [✓] {p}")
+</execute>
+<observation>NameError("name 're' is not defined")</observation>
+<execute>
+import pandas as pd
+from pathlib import Path
+
+print("PLAN:")
+plan = [
+    "Load input CSV (ID, Title).",
+    "Extract antigen targets with a fully self-contained function (imports inside; no NameErrors).",
+    "Save intermediate files to tmp directory.",
+    "Save final output CSV to required path and validate."
+]
+for i,p in enumerate(plan,1):
+    print(f"{i}. [ ] {p}")
+
+# Paths
+inp = Path("benchmark/dataset/PLAbDab/plabdab_annotate_2_input.csv")
+out = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/plabdab_annotate_2.csv")
+tmpdir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/plabdab_annotate_2")
+tmpdir.mkdir(parents=True, exist_ok=True)
+out.parent.mkdir(parents=True, exist_ok=True)
+
+print("\nStep 1: Load input CSV")
+df = pd.read_csv(inp)
+if not {"ID","Title"}.issubset(df.columns):
+    raise ValueError(f"Missing required columns. Found: {df.columns.tolist()}")
+print("Rows:", len(df))
+print(df.head())
+
+print("\nUPDATED PLAN:")
+for i,p in enumerate(plan,1):
+    print(f"{i}. {'[✓]' if i==1 else '[ ]'} {p}")
+
+print("\nStep 2: Extract targets (self-contained; imports inside function)")
+
+def extract_target(title: str) -> str:
+    import re  # ensure available even if outer scope is reset
+
+    ABBR_MAP = {
+        r"\bprogrammed death[- ]?1\b": "PD-1",
+        r"\bprogrammed death[- ]?ligand[- ]?1\b": "PD-L1",
+        r"\bcytotoxic t[- ]?lymphocyte[- ]?associated protein[- ]?4\b": "CTLA-4",
+        r"\bvascular endothelial growth factor(?:[- ]?a)?\b": "VEGF",
+        r"\bepidermal growth factor receptor\b": "EGFR",
+        r"\bhuman epidermal growth factor receptor 2\b": "HER2",
+        r"\bcluster of differentiation 20\b": "CD20",
+        r"\bcluster of differentiation 3\b": "CD3",
+        r"\bcluster of differentiation 19\b": "CD19",
+        r"\btumou?r necrosis factor(?:[- ]?alpha)?\b": "TNF",
+        r"\binterleukin[- ]?6\b": "IL-6",
+        r"\binterleukin[- ]?1 beta\b": "IL-1β",
+        r"\binterleukin[- ]?17a\b": "IL-17A",
+        r"\bc[- ]?reactive protein\b": "CRP",
+        r"\bsevere acute respiratory syndrome coronavirus 2\b": "SARS-CoV-2",
+        r"\breceptor binding domain\b": "RBD",
+        r"\bspike (?:glyco)?protein\b": "Spike",
+        r"\bhuman immunodeficiency virus type 1\b": "HIV-1",
+    }
+    STOP_AFTER = set([
+        "antibody","antibodies","mab","monoclonal","polyclonal","igg","fragment","fab","scfv","nanobody",
+        "single","domain","variable","vhh","antigen","antigens","epitope","epitopes","binding","binds"
+    ])
+    CANDIDATE_PATTERNS = [
+        r"\banti[- ]([A-Za-z0-9][A-Za-z0-9\-_/ ]{0,80})\b",
+        r"\bantibod(?:y|ies) (?:to|against|for|specific for|specific to|directed against|targeting) ([A-Za-z0-9][A-Za-z0-9\-_/ ]{0,100})\b",
+        r"\b([A-Za-z0-9][A-Za-z0-9\-_/]{1,30})[- ]specific antibod(?:y|ies)\b",
+        r"\b([A-Za-z0-9][A-Za-z0-9\-_/]{1,30}) antibody\b",
+        r"\btargeting ([A-Za-z0-9][A-Za-z0-9\-_/ ]{0,100})\b",
+        r"\bbinds? ([A-Za-z0-9][A-Za-z0-9\-_/ ]{0,100})\b",
+    ]
+
+    def normalize_target(raw: str):
+        if raw is None:
+            return None
+        s = raw.strip()
+        s = re.split(r"[;:,\(\)\[\]\.]", s)[0].strip()
+        s = re.sub(r"^(the|a|an)\s+", "", s, flags=re.I).strip()
+        toks = s.split()
+        kept=[]
+        for t in toks:
+            if t.lower() in STOP_AFTER:
+                break
+            kept.append(t)
+        s = " ".join(kept).strip()
+        s = re.sub(r"\s+", " ", s)
+        s = re.sub(r"^(human|mouse|murine|rat|rabbit|bovine)\s+", "", s, flags=re.I).strip()
+        if not s:
+            return None
+        if len(s.split()) > 1:
+            first = s.split()[0]
+            if re.fullmatch(r"[A-Z0-9\-]{2,}", first):
+                s = first
+        if len(s) > 60:
+            s = " ".join(s.split()[:4])
+        return s
+
+    if not isinstance(title, str) or not title.strip():
+        return "None"
+    tl = title.lower()
+
+    for pat, abbr in ABBR_MAP.items():
+        if re.search(pat, tl):
+            return abbr
+
+    for pat in CANDIDATE_PATTERNS:
+        m = re.search(pat, title, flags=re.I)
+        if m:
+            cand = normalize_target(m.group(1))
+            if cand:
+                return cand
+
+    m = re.search(r"\banti[- ]?([A-Z0-9\-]{2,20})\b", title)
+    if m:
+        return m.group(1)
+
+    return "None"
+
+df["target_mention"] = df["Title"].apply(extract_target)
+print(df[["ID","Title","target_mention"]].head(25))
+print("\nTop target_mention counts:")
+print(df["target_mention"].value_counts().head(20))
+
+print("\nUPDATED PLAN:")
+for i,p in enumerate(plan,1):
+    print(f"{i}. {'[✓]' if i<=2 else '[ ]'} {p}")
+
+print("\nStep 3: Save intermediate files")
+inter1 = tmpdir / "plabdab_annotate_2_with_titles_and_targets.csv"
+inter2 = tmpdir / "plabdab_annotate_2_ID_target_mention.csv"
+df[["ID","Title","target_mention"]].to_csv(inter1, index=False)
+df[["ID","target_mention"]].to_csv(inter2, index=False)
+print("Saved:", inter1)
+print("Saved:", inter2)
+
+print("\nUPDATED PLAN:")
+for i,p in enumerate(plan,1):
+    print(f"{i}. {'[✓]' if i<=3 else '[ ]'} {p}")
+
+print("\nStep 4: Save final output + sanity check")
+df[["ID","target_mention"]].to_csv(out, index=False)
+out_df = pd.read_csv(out)
+if list(out_df.columns) != ["ID","target_mention"]:
+    raise ValueError("Output columns are not exactly ['ID','target_mention']")
+if len(out_df) != len(df):
+    raise ValueError("Output row count mismatch")
+print("Saved final:", out)
+print(out_df.head())
+
+print("\nUPDATED PLAN:")
+for i,p in enumerate(plan,1):
+    print(f"{i}. [✓] {p}")
+</execute>
+<observation>PLAN:
+1. [ ] Load input CSV (ID, Title).
+2. [ ] Extract antigen targets with a fully self-contained function (imports inside; no NameErrors).
+3. [ ] Save intermediate files to tmp directory.
+4. [ ] Save final output CSV to required path and validate.
+
+Step 1: Load input CSV
+Rows: 5
+           ID                                              Title
+0    AAE57650  Anti-IgE antibodies and method of improving po...
+1  AF236816_1  Screening and characterization of human phage ...
+2    AAF85943  Construction and expression of single-chain Fv...
+3    AAL29678  Generation of high-affinity fully human anti-i...
+4  AF161589_1  Screening and identification of a humanized si...
+
+UPDATED PLAN:
+1. [✓] Load input CSV (ID, Title).
+2. [ ] Extract antigen targets with a fully self-contained function (imports inside; no NameErrors).
+3. [ ] Save intermediate files to tmp directory.
+4. [ ] Save final output CSV to required path and validate.
+
+Step 2: Extract targets (self-contained; imports inside function)
+           ID  ...                              target_mention
+0    AAE57650  ...                                         IgE
+1  AF236816_1  ...                   hepatitis B virus surface
+2    AAF85943  ...                                        VEGF
+3    AAL29678  ...                               interleukin-8
+4  AF161589_1  ...  hepatitis C virus non-structural 3 protein
+
+[5 rows x 3 columns]
+
+Top target_mention counts:
+target_mention
+IgE                                           1
+hepatitis B virus surface                     1
+VEGF                                          1
+interleukin-8                                 1
+hepatitis C virus non-structural 3 protein    1
+Name: count, dtype: int64
+
+UPDATED PLAN:
+1. [✓] Load input CSV (ID, Title).
+2. [✓] Extract antigen targets with a fully self-contained function (imports inside; no NameErrors).
+3. [ ] Save intermediate files to tmp directory.
+4. [ ] Save final output CSV to required path and validate.
+
+Step 3: Save intermediate files
+Saved: /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/plabdab_annotate_2/plabdab_annotate_2_with_titles_and_targets.csv
+Saved: /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/plabdab_annotate_2/plabdab_annotate_2_ID_target_mention.csv
+
+UPDATED PLAN:
+1. [✓] Load input CSV (ID, Title).
+2. [✓] Extract antigen targets with a fully self-contained function (imports inside; no NameErrors).
+3. [✓] Save intermediate files to tmp directory.
+4. [ ] Save final output CSV to required path and validate.
+
+Step 4: Save final output + sanity check
+Saved final: /root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/plabdab_annotate_2.csv
+           ID                              target_mention
+0    AAE57650                                         IgE
+1  AF236816_1                   hepatitis B virus surface
+2    AAF85943                                        VEGF
+3    AAL29678                               interleukin-8
+4  AF161589_1  hepatitis C virus non-structural 3 protein
+
+UPDATED PLAN:
+1. [✓] Load input CSV (ID, Title).
+2. [✓] Extract antigen targets with a fully self-contained function (imports inside; no NameErrors).
+3. [✓] Save intermediate files to tmp directory.
+4. [✓] Save final output CSV to required path and validate.
+</observation>
+<solution>
+1. [✓] Load input CSV (ID, Title).
+2. [✓] Extract antigen targets with a fully self-contained function (imports inside; no NameErrors).
+3. [✓] Save intermediate files to tmp directory.
+4. [✓] Save final output CSV to required path and validate.
+
+Output written to:
+- /root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/plabdab_annotate_2.csv
+
+Intermediate files written to:
+- /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/plabdab_annotate_2/plabdab_annotate_2_with_titles_and_targets.csv
+- /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/plabdab_annotate_2/plabdab_annotate_2_ID_target_mention.csv
+</solution>

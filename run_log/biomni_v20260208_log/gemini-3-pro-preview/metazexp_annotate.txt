@@ -1,0 +1,672 @@
+
+Perform a differential expression analysis for 6 DRX experiments in `benchmark/dataset/MetazExp/count`. 
+
+The basic information of the 6 DRX experiments is provided in `benchmark/dataset/MetazExp/sample_info.tsv`, which includes sample annotations specifying biological conditions (e.g., tissue, developmental stage) and study or batch identifiers.
+
+You must explicitly correct for study-specific batch effects by including the batch variable in the design formula (e.g., design = ~ batch + condition).
+
+Identify genes that are significantly differentially expressed in the target condition compared to all other conditions combined.
+
+Output the top 50 most significantly differentially expressed genes (ranked by adjusted p-value) to `/root/autodl-tmp/biomni_v20260208_pred_results/gemini-3-pro-preview/metazexp_annotate.tsv`.
+
+Output Format (Only for Reference):
+gene_id	baseMean	log2FoldChange	lfcSE	stat	pvalue	padj
+FBgnxxxx	1254.66665476386	-2.87772911936465	0.87905045247991	-27.2422049305457	2.05567383473253e-163	3.25310384346423e-159
+FBgnyyyy	52136.516872705251	-4.730648430188	0.676023255336235	-24.3843527676287	2.50655533940541e-131	1.98331191230453e-127
+
+All temp data should be save in `/root/autodl-tmp/biomni_v20260208_tmp/gemini-3-pro-preview/metazexp_annotate`.
+
+I will start by creating a plan to perform the differential expression analysis.
+
+Plan:
+1. [ ] Explore the data directory `benchmark/dataset/MetazExp/count` and the sample info file `benchmark/dataset/MetazExp/sample_info.tsv` to understand the file structure and experimental design.
+2. [ ] Load the count data and sample info into R. Prepare the data for DESeq2 analysis.
+3. [ ] Construct the DESeq2 object, incorporating the study/batch information into the design formula to correct for batch effects.
+4. [ ] Run the differential expression analysis. The user specified "target condition compared to all other conditions", but I need to identify what the "target condition" is from the `sample_info.tsv` or infer it (usually one condition against the rest, or pairwise). I will likely need to check the unique conditions in `sample_info.tsv`. Since the prompt says "Identify genes... in the target condition", I might need to make an assumption or pick a specific condition if it's not explicitly named (e.g., maybe one is treated vs control). Wait, the prompt implies there *is* a target condition but doesn't name it. I should look at the metadata to see if there's an obvious "Target" or "Case" vs "Control". Or perhaps I should pick the most distinct one. Let's look at the file first. Actually, re-reading: "Identify genes that are significantly differentially expressed in the target condition compared to all other conditions combined." This implies I need to *choose* a target or the user assumes I know it. Let's look at the metadata first. It might be obvious (e.g., "Treatment" vs "Control"). If there are multiple tissues, maybe I'm looking for tissue-specific markers?
+   *Self-correction*: The prompt asks to perform analysis for *6 DRX experiments*. It might be that "DRX" refers to a specific condition or experiment type. Let's inspect the sample info.
+5. [ ] Perform the DE analysis using `DESeq2` in R.
+6. [ ] Extract the results, order by adjusted p-value, and select the top 50 genes.
+7. [ ] Save the result to the specified output path.
+
+Let's start by exploring the data.
+
+<execute> #!BASH
+mkdir -p /root/autodl-tmp/biomni_v20260208_tmp/gemini-3-pro-preview/metazexp_annotate
+ls -F benchmark/dataset/MetazExp/count
+head benchmark/dataset/MetazExp/sample_info.tsv</execute>
+<observation>DRX198149.gene.expr.tsv
+DRX198150.gene.expr.tsv
+DRX198151.gene.expr.tsv
+DRX198152.gene.expr.tsv
+DRX198153.gene.expr.tsv
+DRX198154.gene.expr.tsv
+
+Study	Experiment	Source	Strain	Genotype	DevelopmentDevelopment	Tissue	TreatmentTreatment	Mapped Bases	SeqLen
+DRP006530	DRX198149	PMID:32865275	/	UAS-bub3IR...UAS-bub3IR/en-GAL4 UAS-GFP;UAS-p35/+	L3	hemocyte	cancer-bearing	22.50GB	PE150				
+DRP006530	DRX198150	PMID:32865275	/	UAS-bub3IR...UAS-bub3IR/en-GAL4 UAS-GFP;UAS-p35/+	L3	hemocyte	cancer-bearing	23.76GB	PE150				
+DRP006530	DRX198151	PMID:32865275	/	UAS-bub3IR...UAS-bub3IR/en-GAL4 UAS-GFP;UAS-p35/+	L3	hemocyte	cancer-bearing	24.17GB	PE150				
+DRP006530	DRX198152	PMID:32865275	/	en-GAL4 UA...en-GAL4 UAS-GFP/+;+/+	L3	hemocyte	non-cancer control	23.81GB	PE150				
+DRP006530	DRX198153	PMID:32865275	/	en-GAL4 UA...en-GAL4 UAS-GFP/+;+/+	L3	hemocyte	non-cancer control	22.40GB	PE150				
+DRP006530	DRX198154	PMID:32865275	/	en-GAL4 UA...en-GAL4 UAS-GFP/+;+/+	L3	hemocyte	non-cancer control	24.13GB	PE150				</observation>
+I will examine the full `sample_info.tsv` to confirm the Study and Treatment groups, and check the format of one of the count files to ensure correct loading.
+
+<execute> #!BASH
+cat benchmark/dataset/MetazExp/sample_info.tsv
+head -n 5 benchmark/dataset/MetazExp/count/DRX198149.gene.expr.tsv</execute>
+<observation>
+Study	Experiment	Source	Strain	Genotype	DevelopmentDevelopment	Tissue	TreatmentTreatment	Mapped Bases	SeqLen
+DRP006530	DRX198149	PMID:32865275	/	UAS-bub3IR...UAS-bub3IR/en-GAL4 UAS-GFP;UAS-p35/+	L3	hemocyte	cancer-bearing	22.50GB	PE150				
+DRP006530	DRX198150	PMID:32865275	/	UAS-bub3IR...UAS-bub3IR/en-GAL4 UAS-GFP;UAS-p35/+	L3	hemocyte	cancer-bearing	23.76GB	PE150				
+DRP006530	DRX198151	PMID:32865275	/	UAS-bub3IR...UAS-bub3IR/en-GAL4 UAS-GFP;UAS-p35/+	L3	hemocyte	cancer-bearing	24.17GB	PE150				
+DRP006530	DRX198152	PMID:32865275	/	en-GAL4 UA...en-GAL4 UAS-GFP/+;+/+	L3	hemocyte	non-cancer control	23.81GB	PE150				
+DRP006530	DRX198153	PMID:32865275	/	en-GAL4 UA...en-GAL4 UAS-GFP/+;+/+	L3	hemocyte	non-cancer control	22.40GB	PE150				
+DRP006530	DRX198154	PMID:32865275	/	en-GAL4 UA...en-GAL4 UAS-GFP/+;+/+	L3	hemocyte	non-cancer control	24.13GB	PE150				geneId	readCount	Coverage	FPKM	TPM
+FBgn0039635	20831	1530.846436	105.496330	161.640015
+FBgn0086355	28769	2769.733643	150.103287	229.986176
+FBgn0034501	17799	682.803040	31.329226	48.002205
+FBgn0051774	31	0.599920	0.028744	0.044041
+</observation>
+I will now proceed to write and execute the R script to perform the differential expression analysis. I will handle the data loading, DESeq2 analysis, and result extraction within this script.
+
+<execute> #!R
+suppressMessages(library(DESeq2))
+suppressMessages(library(tidyverse))
+
+# 1. Load Sample Info
+sample_info_path <- "benchmark/dataset/MetazExp/sample_info.tsv"
+sample_info <- read.csv(sample_info_path, sep="\t", header=TRUE, stringsAsFactors=FALSE)
+
+# Clean up column names if necessary (remove extra whitespace)
+colnames(sample_info) <- trimws(colnames(sample_info))
+
+# Rename TreatmentTreatment to condition for clarity
+# Check which column contains the condition
+if("TreatmentTreatment" %in% colnames(sample_info)){
+    sample_info$condition <- sample_info$TreatmentTreatment
+} else {
+    stop("Column 'TreatmentTreatment' not found in sample info.")
+}
+
+# 2. Load Count Data
+count_dir <- "benchmark/dataset/MetazExp/count"
+count_matrix <- NULL
+
+# Ensure the order of files matches sample_info
+files <- paste0(count_dir, "/", sample_info$Experiment, ".gene.expr.tsv")
+
+for (i in 1:length(files)) {
+  file_path <- files[i]
+  # Read individual count file
+  # Based on head: geneId readCount Coverage FPKM TPM
+  data <- read.csv(file_path, sep="\t", header=TRUE, stringsAsFactors=FALSE)
+  
+  # Check if it's the first file to initialize the matrix
+  if (is.null(count_matrix)) {
+    count_matrix <- data[, c("geneId", "readCount")]
+    colnames(count_matrix)[2] <- sample_info$Experiment[i]
+  } else {
+    # Merge or just bind column if geneIds are identical
+    # Verify geneIds match
+    if (!all(count_matrix$geneId == data$geneId)) {
+      stop("Gene IDs do not match between files.")
+    }
+    count_matrix[[sample_info$Experiment[i]]] <- data$readCount
+  }
+}
+
+# Set geneId as rownames and remove the column
+rownames(count_matrix) <- count_matrix$geneId
+count_matrix$geneId <- NULL
+
+# 3. Prepare DESeq2 Object
+# Check for Batch (Study)
+# User required: "explicitly correct for study-specific batch effects"
+# Design: ~ Study + condition (if Study is variable)
+num_studies <- length(unique(sample_info$Study))
+
+if (num_studies > 1) {
+    print("Detected multiple studies. Correcting for batch effect.")
+    design_formula <- ~ Study + condition
+} else {
+    print("Detected single study. Proceeding without batch correction in design formula.")
+    design_formula <- ~ condition
+}
+
+# Ensure condition is a factor
+sample_info$condition <- as.factor(sample_info$condition)
+# Set reference level if needed, but DESeq2 usually picks alphabetical. 
+# We want "target condition" (cancer-bearing) vs "others" (non-cancer control).
+# Usually we want (Cancer - Control), so Control should be reference.
+# Let's check levels
+print(levels(sample_info$condition))
+# "cancer-bearing" "non-cancer control"
+# If we want results for Cancer, we set Control as reference.
+sample_info$condition <- relevel(sample_info$condition, ref = "non-cancer control")
+
+dds <- DESeqDataSetFromMatrix(countData = count_matrix,
+                              colData = sample_info,
+                              design = design_formula)
+
+# 4. Run DESeq2
+dds <- DESeq(dds)
+
+# 5. Extract Results
+# We want: Target (cancer-bearing) vs All Other (non-cancer control)
+# The coefficient will be condition_cancer.bearing_vs_non.cancer.control
+res <- results(dds)
+print(resultsNames(dds))
+
+# 6. Post-processing
+# Sort by padj (ascending)
+res_ordered <- res[order(res$padj), ]
+
+# Take top 50
+top50 <- head(res_ordered, 50)
+
+# Convert to data frame for export
+top50_df <- as.data.frame(top50)
+top50_df$gene_id <- rownames(top50_df)
+
+# Reorder columns to match requested format:
+# gene_id baseMean log2FoldChange lfcSE stat pvalue padj
+top50_df <- top50_df[, c("gene_id", "baseMean", "log2FoldChange", "lfcSE", "stat", "pvalue", "padj")]
+
+# 7. Save Output
+output_path <- "/root/autodl-tmp/biomni_v20260208_pred_results/gemini-3-pro-preview/metazexp_annotate.tsv"
+dir.create(dirname(output_path), recursive = TRUE, showWarnings = FALSE)
+
+write.table(top50_df, file = output_path, sep = "\t", quote = FALSE, row.names = FALSE)
+
+print(paste("Top 50 DE genes saved to:", output_path))
+head(top50_df)</execute>
+<observation>Error running R code:
+Warning messages:
+1: package ‘tidyverse’ was built under R version 4.3.3 
+2: package ‘ggplot2’ was built under R version 4.3.3 
+3: package ‘tibble’ was built under R version 4.3.3 
+4: package ‘tidyr’ was built under R version 4.3.3 
+5: package ‘readr’ was built under R version 4.3.3 
+6: package ‘purrr’ was built under R version 4.3.3 
+7: package ‘dplyr’ was built under R version 4.3.3 
+8: package ‘stringr’ was built under R version 4.3.3 
+9: package ‘forcats’ was built under R version 4.3.3 
+10: package ‘lubridate’ was built under R version 4.3.3 
+Error in read.table(file = file, header = header, sep = sep, quote = quote,  : 
+  more columns than column names
+Calls: read.csv -> read.table
+Execution halted
+</observation>
+The error `Error in read.table...: more columns than column names` suggests that the `sample_info.tsv` file might be malformed or have an inconsistent number of columns relative to the header. I observed earlier that there are empty columns at the end of the `head` output for `sample_info.tsv`. This often happens when tabs are present but headers are missing for trailing columns.
+
+I need to inspect `sample_info.tsv` more closely or handle the reading more robustly. I will try to read it with `read.delim` or just inspect it first to fix the reading step.
+
+Steps to fix:
+1.  Check the `sample_info.tsv` structure again, specifically the number of tabs in each line.
+2.  Use a more robust reading method or manually specify column names if needed.
+3.  Proceed with the rest of the analysis.
+
+Let's check the first few lines of `sample_info.tsv` again with `cat -A` to see hidden characters.
+
+<execute> #!BASH
+cat -A benchmark/dataset/MetazExp/sample_info.tsv | head -n 5</execute>
+<observation>$
+Study^IExperiment^ISource^IStrain^IGenotype^IDevelopmentDevelopment^ITissue^ITreatmentTreatment^IMapped Bases^ISeqLen$
+DRP006530^IDRX198149^IPMID:32865275^I/^IUAS-bub3IR...UAS-bub3IR/en-GAL4 UAS-GFP;UAS-p35/+^IL3^Ihemocyte^Icancer-bearing^I22.50GB^IPE150^I^I^I^I$
+DRP006530^IDRX198150^IPMID:32865275^I/^IUAS-bub3IR...UAS-bub3IR/en-GAL4 UAS-GFP;UAS-p35/+^IL3^Ihemocyte^Icancer-bearing^I23.76GB^IPE150^I^I^I^I$
+DRP006530^IDRX198151^IPMID:32865275^I/^IUAS-bub3IR...UAS-bub3IR/en-GAL4 UAS-GFP;UAS-p35/+^IL3^Ihemocyte^Icancer-bearing^I24.17GB^IPE150^I^I^I^I$
+</observation>
+The `cat -A` output reveals that the data lines have 4 extra trailing tabs (`^I^I^I^I$`) compared to the header line which ends cleanly after `SeqLen`. This is causing the `read.csv` (and `read.table`) error because the rows have more fields than the header.
+
+The header has columns:
+1. Study
+2. Experiment
+3. Source
+4. Strain
+5. Genotype
+6. DevelopmentDevelopment
+7. Tissue
+8. TreatmentTreatment
+9. Mapped Bases
+10. SeqLen
+
+Total 10 columns.
+The data rows have 10 + 4 = 14 fields.
+
+I will modify the R script to read only the first 10 columns or handle the filling. Using `fill=TRUE` might work, or better, read it line by line or use `read.table` with `colClasses` or just select the first 10 columns after reading with `readLines`.
+
+A safe way is to read using `read.table` with `fill = TRUE` and `header = TRUE`, then discard the extra columns created (which will be named `X`, `X.1`, etc. if header is short). Alternatively, simply select the first 10 columns.
+
+I will update the R script.
+
+<execute> #!R
+suppressMessages(library(DESeq2))
+suppressMessages(library(tidyverse))
+
+# 1. Load Sample Info
+sample_info_path <- "benchmark/dataset/MetazExp/sample_info.tsv"
+
+# The file has extra trailing tabs in data rows not present in header.
+# We will use fill=TRUE to handle this, which creates extra columns for the rows that have them.
+sample_info <- read.table(sample_info_path, sep="\t", header=TRUE, stringsAsFactors=FALSE, fill=TRUE, check.names=FALSE)
+
+# Keep only the valid columns (first 10 based on inspection)
+# The header names are: Study, Experiment, Source, Strain, Genotype, DevelopmentDevelopment, Tissue, TreatmentTreatment, Mapped Bases, SeqLen
+valid_cols <- c("Study", "Experiment", "Source", "Strain", "Genotype", "DevelopmentDevelopment", "Tissue", "TreatmentTreatment", "Mapped Bases", "SeqLen")
+
+# Subset to valid columns if extra columns were created
+if(ncol(sample_info) > length(valid_cols)){
+    sample_info <- sample_info[, 1:length(valid_cols)]
+}
+
+# Clean up column names (remove extra whitespace)
+colnames(sample_info) <- trimws(colnames(sample_info))
+
+# Rename TreatmentTreatment to condition
+if("TreatmentTreatment" %in% colnames(sample_info)){
+    sample_info$condition <- sample_info$TreatmentTreatment
+} else {
+    stop("Column 'TreatmentTreatment' not found in sample info.")
+}
+
+# 2. Load Count Data
+count_dir <- "benchmark/dataset/MetazExp/count"
+count_matrix <- NULL
+
+files <- paste0(count_dir, "/", sample_info$Experiment, ".gene.expr.tsv")
+
+print("Loading count files...")
+for (i in 1:length(files)) {
+  file_path <- files[i]
+  data <- read.csv(file_path, sep="\t", header=TRUE, stringsAsFactors=FALSE)
+  
+  if (is.null(count_matrix)) {
+    count_matrix <- data[, c("geneId", "readCount")]
+    colnames(count_matrix)[2] <- sample_info$Experiment[i]
+  } else {
+    if (!all(count_matrix$geneId == data$geneId)) {
+      stop(paste("Gene IDs do not match in file:", file_path))
+    }
+    count_matrix[[sample_info$Experiment[i]]] <- data$readCount
+  }
+}
+
+rownames(count_matrix) <- count_matrix$geneId
+count_matrix$geneId <- NULL
+
+# 3. Prepare DESeq2 Object
+print("Preparing DESeq2 object...")
+# Check for Batch (Study)
+# From the provided head, Study is all "DRP006530". Let's verify.
+num_studies <- length(unique(sample_info$Study))
+print(paste("Number of studies detected:", num_studies))
+
+if (num_studies > 1) {
+    print("Detected multiple studies. Correcting for batch effect.")
+    design_formula <- ~ Study + condition
+} else {
+    print("Detected single study. Proceeding without batch correction in design formula.")
+    design_formula <- ~ condition
+}
+
+# Ensure condition is a factor and set reference
+sample_info$condition <- as.factor(sample_info$condition)
+# Based on earlier inspection: "cancer-bearing" vs "non-cancer control"
+# We assume "cancer-bearing" is the target (Case) and "non-cancer control" is Reference (Control).
+if("non-cancer control" %in% levels(sample_info$condition)){
+    sample_info$condition <- relevel(sample_info$condition, ref = "non-cancer control")
+} else {
+    print("Warning: 'non-cancer control' not found. Using default reference level.")
+}
+
+dds <- DESeqDataSetFromMatrix(countData = count_matrix,
+                              colData = sample_info,
+                              design = design_formula)
+
+# 4. Run DESeq2
+print("Running DESeq2...")
+dds <- DESeq(dds)
+
+# 5. Extract Results
+print("Extracting results...")
+res <- results(dds)
+print("Result names:")
+print(resultsNames(dds))
+
+# 6. Post-processing
+res_ordered <- res[order(res$padj), ]
+top50 <- head(res_ordered, 50)
+
+top50_df <- as.data.frame(top50)
+top50_df$gene_id <- rownames(top50_df)
+top50_df <- top50_df[, c("gene_id", "baseMean", "log2FoldChange", "lfcSE", "stat", "pvalue", "padj")]
+
+# 7. Save Output
+output_path <- "/root/autodl-tmp/biomni_v20260208_pred_results/gemini-3-pro-preview/metazexp_annotate.tsv"
+dir.create(dirname(output_path), recursive = TRUE, showWarnings = FALSE)
+
+write.table(top50_df, file = output_path, sep = "\t", quote = FALSE, row.names = FALSE)
+
+print(paste("Top 50 DE genes saved to:", output_path))
+print(head(top50_df))</execute>
+<observation>Error running R code:
+Warning messages:
+1: package ‘tidyverse’ was built under R version 4.3.3 
+2: package ‘ggplot2’ was built under R version 4.3.3 
+3: package ‘tibble’ was built under R version 4.3.3 
+4: package ‘tidyr’ was built under R version 4.3.3 
+5: package ‘readr’ was built under R version 4.3.3 
+6: package ‘purrr’ was built under R version 4.3.3 
+7: package ‘dplyr’ was built under R version 4.3.3 
+8: package ‘stringr’ was built under R version 4.3.3 
+9: package ‘forcats’ was built under R version 4.3.3 
+10: package ‘lubridate’ was built under R version 4.3.3 
+Error in read.table(sample_info_path, sep = "\t", header = TRUE, stringsAsFactors = FALSE,  : 
+  more columns than column names
+Execution halted
+</observation>
+It seems `read.table` with `fill=TRUE` is still strict about the header row matching the number of data columns if `header=TRUE` is specified and the first row has fewer columns than subsequent rows.
+
+I will try a different approach:
+1. Read the file as raw lines using `readLines`.
+2. Parse the lines manually or force the header to match the max number of columns.
+3. Or simpler: since I know the extra columns are empty/garbage, I can read it with `read.table` but skip the header, then assign column names manually. But `read.table` might still fail if row lengths vary.
+
+Let's try reading with `read.delim` and `comment.char=""` or `quote=""` to ensure no weird parsing, but the issue is definitely the column count mismatch.
+
+Alternative Strategy:
+Read the file into a temporary file, cleaning up the extra tabs, then read that temporary file.
+The `cat -A` showed `^I^I^I^I$` at the end of data lines but not the header. I can use `sed` or `awk` in bash to strip trailing tabs from the file before reading it in R.
+
+New Plan Step:
+1. Pre-process `sample_info.tsv` using bash to remove trailing tabs and save to a temp file.
+2. Run the R script using the cleaned temp file.
+
+<execute> #!BASH
+# Remove trailing tabs from the end of lines
+sed 's/[[:blank:]]*$//' benchmark/dataset/MetazExp/sample_info.tsv > /root/autodl-tmp/biomni_v20260208_tmp/gemini-3-pro-preview/metazexp_annotate/sample_info_clean.tsv
+
+# Check the cleaned file
+cat -A /root/autodl-tmp/biomni_v20260208_tmp/gemini-3-pro-preview/metazexp_annotate/sample_info_clean.tsv | head -n 5</execute>
+<observation>$
+Study^IExperiment^ISource^IStrain^IGenotype^IDevelopmentDevelopment^ITissue^ITreatmentTreatment^IMapped Bases^ISeqLen$
+DRP006530^IDRX198149^IPMID:32865275^I/^IUAS-bub3IR...UAS-bub3IR/en-GAL4 UAS-GFP;UAS-p35/+^IL3^Ihemocyte^Icancer-bearing^I22.50GB^IPE150$
+DRP006530^IDRX198150^IPMID:32865275^I/^IUAS-bub3IR...UAS-bub3IR/en-GAL4 UAS-GFP;UAS-p35/+^IL3^Ihemocyte^Icancer-bearing^I23.76GB^IPE150$
+DRP006530^IDRX198151^IPMID:32865275^I/^IUAS-bub3IR...UAS-bub3IR/en-GAL4 UAS-GFP;UAS-p35/+^IL3^Ihemocyte^Icancer-bearing^I24.17GB^IPE150$
+</observation>
+The file looks clean now. The number of tabs seems consistent with the header. Now I can proceed with the R script using this cleaned file.
+
+<execute> #!R
+suppressMessages(library(DESeq2))
+suppressMessages(library(tidyverse))
+
+# 1. Load Sample Info (Cleaned)
+sample_info_path <- "/root/autodl-tmp/biomni_v20260208_tmp/gemini-3-pro-preview/metazexp_annotate/sample_info_clean.tsv"
+sample_info <- read.table(sample_info_path, sep="\t", header=TRUE, stringsAsFactors=FALSE)
+
+# Clean up column names
+colnames(sample_info) <- trimws(colnames(sample_info))
+
+# Rename TreatmentTreatment to condition
+if("TreatmentTreatment" %in% colnames(sample_info)){
+    sample_info$condition <- sample_info$TreatmentTreatment
+} else {
+    stop("Column 'TreatmentTreatment' not found in sample info.")
+}
+
+# 2. Load Count Data
+count_dir <- "benchmark/dataset/MetazExp/count"
+count_matrix <- NULL
+
+files <- paste0(count_dir, "/", sample_info$Experiment, ".gene.expr.tsv")
+
+print("Loading count files...")
+for (i in 1:length(files)) {
+  file_path <- files[i]
+  data <- read.csv(file_path, sep="\t", header=TRUE, stringsAsFactors=FALSE)
+  
+  if (is.null(count_matrix)) {
+    count_matrix <- data[, c("geneId", "readCount")]
+    colnames(count_matrix)[2] <- sample_info$Experiment[i]
+  } else {
+    if (!all(count_matrix$geneId == data$geneId)) {
+      stop(paste("Gene IDs do not match in file:", file_path))
+    }
+    count_matrix[[sample_info$Experiment[i]]] <- data$readCount
+  }
+}
+
+rownames(count_matrix) <- count_matrix$geneId
+count_matrix$geneId <- NULL
+
+# 3. Prepare DESeq2 Object
+print("Preparing DESeq2 object...")
+# Check for Batch (Study)
+# We need to see if there are multiple studies to include in the design.
+num_studies <- length(unique(sample_info$Study))
+print(paste("Number of studies detected:", num_studies))
+
+if (num_studies > 1) {
+    print("Detected multiple studies. Correcting for batch effect.")
+    design_formula <- ~ Study + condition
+} else {
+    print("Detected single study. Proceeding without batch correction in design formula.")
+    design_formula <- ~ condition
+}
+
+# Ensure condition is a factor
+sample_info$condition <- as.factor(sample_info$condition)
+
+# Set Reference Level
+# We want to identify genes DE in "target condition" (likely cancer-bearing) vs others.
+# This means we compare Target vs Reference.
+# If "non-cancer control" exists, set it as reference.
+if("non-cancer control" %in% levels(sample_info$condition)){
+    sample_info$condition <- relevel(sample_info$condition, ref = "non-cancer control")
+} else {
+    print("Warning: 'non-cancer control' not found. Defaulting to alphabetical reference.")
+}
+
+dds <- DESeqDataSetFromMatrix(countData = count_matrix,
+                              colData = sample_info,
+                              design = design_formula)
+
+# 4. Run DESeq2
+print("Running DESeq2...")
+dds <- DESeq(dds)
+
+# 5. Extract Results
+print("Extracting results...")
+# We extract the results for the condition contrast.
+# Since we releveled, the coefficient should be condition_cancer.bearing_vs_non.cancer.control
+res <- results(dds)
+print("Result names:")
+print(resultsNames(dds))
+
+# 6. Post-processing
+res_ordered <- res[order(res$padj), ]
+top50 <- head(res_ordered, 50)
+
+top50_df <- as.data.frame(top50)
+top50_df$gene_id <- rownames(top50_df)
+top50_df <- top50_df[, c("gene_id", "baseMean", "log2FoldChange", "lfcSE", "stat", "pvalue", "padj")]
+
+# 7. Save Output
+output_path <- "/root/autodl-tmp/biomni_v20260208_pred_results/gemini-3-pro-preview/metazexp_annotate.tsv"
+dir.create(dirname(output_path), recursive = TRUE, showWarnings = FALSE)
+
+write.table(top50_df, file = output_path, sep = "\t", quote = FALSE, row.names = FALSE)
+
+print(paste("Top 50 DE genes saved to:", output_path))
+print(head(top50_df))</execute>
+<observation>Error running R code:
+Warning messages:
+1: package ‘tidyverse’ was built under R version 4.3.3 
+2: package ‘ggplot2’ was built under R version 4.3.3 
+3: package ‘tibble’ was built under R version 4.3.3 
+4: package ‘tidyr’ was built under R version 4.3.3 
+5: package ‘readr’ was built under R version 4.3.3 
+6: package ‘purrr’ was built under R version 4.3.3 
+7: package ‘dplyr’ was built under R version 4.3.3 
+8: package ‘stringr’ was built under R version 4.3.3 
+9: package ‘forcats’ was built under R version 4.3.3 
+10: package ‘lubridate’ was built under R version 4.3.3 
+Error: Gene IDs do not match in file: benchmark/dataset/MetazExp/count/DRX198150.gene.expr.tsv
+Execution halted
+</observation>
+The error `Error: Gene IDs do not match in file: benchmark/dataset/MetazExp/count/DRX198150.gene.expr.tsv` indicates that the order or set of gene IDs is not identical across the count files. This is common. I should merge the dataframes on `geneId` instead of assuming the order is preserved.
+
+Steps to fix:
+1. Modify the loading loop to use `merge` (from base R) or `full_join` (from dplyr) to combine count dataframes by `geneId`.
+2. Since we are using DESeq2, we need a single matrix with genes as rows and samples as columns. Merging is safer.
+
+I will rewrite the loading part to handle potentially different gene orders or gene sets (though usually they are from the same reference, so same set, just need to ensure alignment). Using `reduce` from `purrr` or just a loop with `merge`. Since there are only 6 files, a loop with `merge` is fine.
+
+<execute> #!R
+suppressMessages(library(DESeq2))
+suppressMessages(library(tidyverse))
+
+# 1. Load Sample Info (Cleaned)
+sample_info_path <- "/root/autodl-tmp/biomni_v20260208_tmp/gemini-3-pro-preview/metazexp_annotate/sample_info_clean.tsv"
+sample_info <- read.table(sample_info_path, sep="\t", header=TRUE, stringsAsFactors=FALSE)
+colnames(sample_info) <- trimws(colnames(sample_info))
+
+if("TreatmentTreatment" %in% colnames(sample_info)){
+    sample_info$condition <- sample_info$TreatmentTreatment
+} else {
+    stop("Column 'TreatmentTreatment' not found.")
+}
+
+# 2. Load Count Data
+count_dir <- "benchmark/dataset/MetazExp/count"
+files <- paste0(count_dir, "/", sample_info$Experiment, ".gene.expr.tsv")
+
+print("Loading and merging count files...")
+
+# Read first file to initialize
+data1 <- read.csv(files[1], sep="\t", header=TRUE, stringsAsFactors=FALSE)
+count_df <- data1[, c("geneId", "readCount")]
+colnames(count_df)[2] <- sample_info$Experiment[1]
+
+# Loop through remaining files and merge
+for (i in 2:length(files)) {
+  file_path <- files[i]
+  data <- read.csv(file_path, sep="\t", header=TRUE, stringsAsFactors=FALSE)
+  
+  # Select only geneId and readCount
+  temp_df <- data[, c("geneId", "readCount")]
+  colnames(temp_df)[2] <- sample_info$Experiment[i]
+  
+  # Merge
+  count_df <- merge(count_df, temp_df, by="geneId", all=TRUE)
+}
+
+# Handle NAs if any (replace with 0, though for standard RNA-seq they should match)
+count_df[is.na(count_df)] <- 0
+
+# Set geneId as rownames
+rownames(count_df) <- count_df$geneId
+count_df$geneId <- NULL
+
+# Ensure columns match sample_info rows (order might have changed if merge shuffled, but merge usually keeps order relative to x, or reorders. But columns are named by Experiment.)
+# We must ensure count_df columns match sample_info$Experiment order
+count_matrix <- count_df[, sample_info$Experiment]
+
+# 3. Prepare DESeq2 Object
+print("Preparing DESeq2 object...")
+num_studies <- length(unique(sample_info$Study))
+print(paste("Number of studies detected:", num_studies))
+
+if (num_studies > 1) {
+    print("Detected multiple studies. Correcting for batch effect.")
+    design_formula <- ~ Study + condition
+} else {
+    print("Detected single study. Proceeding without batch correction in design formula.")
+    design_formula <- ~ condition
+}
+
+sample_info$condition <- as.factor(sample_info$condition)
+if("non-cancer control" %in% levels(sample_info$condition)){
+    sample_info$condition <- relevel(sample_info$condition, ref = "non-cancer control")
+} else {
+    print("Warning: 'non-cancer control' not found.")
+}
+
+dds <- DESeqDataSetFromMatrix(countData = count_matrix,
+                              colData = sample_info,
+                              design = design_formula)
+
+# 4. Run DESeq2
+print("Running DESeq2...")
+dds <- DESeq(dds)
+
+# 5. Extract Results
+print("Extracting results...")
+res <- results(dds)
+print("Result names:")
+print(resultsNames(dds))
+
+# 6. Post-processing
+res_ordered <- res[order(res$padj), ]
+top50 <- head(res_ordered, 50)
+
+top50_df <- as.data.frame(top50)
+top50_df$gene_id <- rownames(top50_df)
+top50_df <- top50_df[, c("gene_id", "baseMean", "log2FoldChange", "lfcSE", "stat", "pvalue", "padj")]
+
+# 7. Save Output
+output_path <- "/root/autodl-tmp/biomni_v20260208_pred_results/gemini-3-pro-preview/metazexp_annotate.tsv"
+dir.create(dirname(output_path), recursive = TRUE, showWarnings = FALSE)
+
+write.table(top50_df, file = output_path, sep = "\t", quote = FALSE, row.names = FALSE)
+
+print(paste("Top 50 DE genes saved to:", output_path))
+print(head(top50_df))</execute>
+<observation>[1] "Loading and merging count files..."
+[1] "Preparing DESeq2 object..."
+[1] "Number of studies detected: 1"
+[1] "Detected single study. Proceeding without batch correction in design formula."
+[1] "Running DESeq2..."
+[1] "Extracting results..."
+[1] "Result names:"
+[1] "Intercept"                                     
+[2] "condition_cancer.bearing_vs_non.cancer.control"
+[1] "Top 50 DE genes saved to: /root/autodl-tmp/biomni_v20260208_pred_results/gemini-3-pro-preview/metazexp_annotate.tsv"
+                gene_id   baseMean log2FoldChange      lfcSE      stat
+FBgn0050098 FBgn0050098  2689.6667      -4.877729 0.17905053 -27.24219
+FBgn0266429 FBgn0266429   694.5169      -6.730648 0.27602341 -24.38434
+FBgn0032817 FBgn0032817 13116.4906      -2.070890 0.08743657 -23.68448
+FBgn0000097 FBgn0000097  9797.8623      -1.137605 0.05783058 -19.67133
+FBgn0019952 FBgn0019952 28155.9302      -1.283753 0.07144378 -17.96872
+FBgn0030102 FBgn0030102  1928.7436       4.771586 0.26575829  17.95461
+                   pvalue          padj
+FBgn0050098 2.056405e-163 3.254261e-159
+FBgn0266429 2.507487e-131 1.984049e-127
+FBgn0032817 5.211242e-124 2.748930e-120
+FBgn0000097  3.796836e-86  1.502123e-82
+FBgn0019952  3.425551e-72  1.084187e-68
+FBgn0030102  4.417014e-72  1.164988e-68
+</observation>
+The analysis completed successfully.
+- I corrected the sample info reading by pre-processing the file with `sed`.
+- I handled potentially mismatched gene IDs or ordering by using `merge`.
+- I detected that there is only 1 study (`DRP006530`), so I proceeded without batch correction (as the formula `~ condition` is sufficient, and including a constant `Study` term would cause an error).
+- I releveled the condition so that "cancer-bearing" is compared against "non-cancer control" (reference).
+- The top 50 genes were extracted and saved.
+
+I will double check if I missed any specific requirement.
+"You must explicitly correct for study-specific batch effects by including the batch variable in the design formula (e.g., design = ~ batch + condition)."
+I handled this with a conditional check:
+`if (num_studies > 1) { design_formula <- ~ Study + condition } else { design_formula <- ~ condition }`
+Since there is only 1 study, adding it to the design would result in a "model matrix not full rank" error because the Study column is constant. My code correctly identified this and adapted.
+
+The output format matches the requirement (gene_id, baseMean, log2FoldChange, lfcSE, stat, pvalue, padj).
+
+The task is complete.
+
+<solution>
+The differential expression analysis has been performed for the 6 DRX experiments.
+1.  **Data Preparation**: The sample information was cleaned to handle extra tab characters, and count data from individual files were merged into a single matrix, ensuring gene ID alignment.
+2.  **Experimental Design**: The analysis compared "cancer-bearing" samples against "non-cancer control" samples.
+3.  **Batch Correction**: The script checked for study-specific batch effects. Since all samples belonged to a single study (DRP006530), the design formula used was `~ condition`.
+4.  **DE Analysis**: `DESeq2` was used to identify differentially expressed genes.
+5.  **Output**: The top 50 significantly differentially expressed genes, ranked by adjusted p-value, have been saved to `/root/autodl-tmp/biomni_v20260208_pred_results/gemini-3-pro-preview/metazexp_annotate.tsv`.</solution>

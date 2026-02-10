@@ -1,0 +1,1747 @@
+# Core Task
+Search for the latest published literature related to cyanobacteria to capture the most recent research dynamics in the field. Identify the 5 most recent papers published before 2026-01-01 and extract their Title, Journal, DOI
+
+# Output Requirements & File Path
+- Output format: A CSV file with the following columns (exactly matching the ground truth CSV headers).
+  - `Title`: The title of the paper.
+  - `Journal`: The journal name.
+  - `DOI`: The Digital Object Identifier.
+- Save Path: Save the result to: `/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/cyanoomicsdb_retrieval_2.csv`
+
+# Output Example (For Reference Only)
+Title,Journal,DOI
+Recent Advances in Cyanobacteria,Journal of Phycology,10.1234/jp.2025.001
+Cyanobacteria Ecology,Nature Microbiology,10.5678/nm.2025.002
+
+# Intermediate Results
+All intermediate files generated should be saved in the directly `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb_retrieval_2`
+
+<execute>#!/usr/bin/env python3
+import os, textwrap, json, re, pandas as pd, datetime as dt, pathlib
+from pathlib import Path
+
+print("Research log: cyanobacteria recent literature retrieval (pre-2026-01-01)")
+
+# Paths
+out_csv = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/cyanoomicsdb_retrieval_2.csv")
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb_retrieval_2")
+tmp_dir.mkdir(parents=True, exist_ok=True)
+out_csv.parent.mkdir(parents=True, exist_ok=True)
+
+plan = [
+    "Define query and retrieval method (NCBI E-utilities via Biopython Entrez) to find most recent cyanobacteria papers before 2026-01-01.",
+    "Fetch candidate PubMed records (titles, journal, pub dates, DOI) and filter to items with DOI and publication date < 2026-01-01.",
+    "Sort by publication date descending; select top 5 most recent; validate fields.",
+    "Write required CSV to the specified output path; save intermediate JSON/CSV to tmp directory."
+]
+def show_plan(status):
+    for i,(s,st) in enumerate(zip(plan,status), start=1):
+        box = " " if st=="todo" else ("✓" if st=="done" else "✗")
+        print(f"{i}. [{box}] {s}" + ("" if st!="fail" else " (failed)"))
+status=["todo"]*len(plan)
+print("\nPlan checklist:")
+show_plan(status)
+
+# Step 1: set query
+from Bio import Entrez
+Entrez.email = "biodatalab@example.com"
+query = '(cyanobacteria[Title/Abstract] OR cyanobacterial[Title/Abstract]) AND ("2024/01/01"[Date - Publication] : "2025/12/31"[Date - Publication])'
+# We'll search 2024-2025 window to get most recent before 2026-01-01; if insufficient, broaden later.
+params = dict(db="pubmed", term=query, sort="pub date", retmax=200)
+step1_info = {"query": query, "params": params}
+(tmp_dir/"step1_query.json").write_text(json.dumps(step1_info, indent=2))
+print("\nStep 1 complete: saved query parameters to", tmp_dir/"step1_query.json")
+status[0]="done"
+print("\nUpdated plan:")
+show_plan(status)
+
+# Step 2: search and fetch
+handle = Entrez.esearch(**params)
+search_res = Entrez.read(handle)
+handle.close()
+ids = search_res.get("IdList", [])
+print(f"\nFound {len(ids)} PubMed IDs in 2024-2025 window.")
+(tmp_dir/"step2_esearch.json").write_text(json.dumps(search_res, indent=2))
+
+# Fetch details in batches
+def fetch_details(id_list):
+    h = Entrez.efetch(db="pubmed", id=",".join(id_list), rettype="xml", retmode="xml")
+    data = Entrez.read(h)
+    h.close()
+    return data
+
+records=[]
+batch=50
+for i in range(0, len(ids), batch):
+    sub=ids[i:i+batch]
+    data = fetch_details(sub)
+    # data is a list-like of PubmedArticle
+    for art in data["PubmedArticle"]:
+        med = art["MedlineCitation"]
+        article = med.get("Article", {})
+        title = str(article.get("ArticleTitle","")).replace("\n"," ").strip()
+        journal = ""
+        try:
+            journal = str(article.get("Journal",{}).get("Title","")).strip()
+        except Exception:
+            journal = ""
+        # publication date (best effort)
+        pub_date = None
+        # Try ArticleDate
+        if "ArticleDate" in article and len(article["ArticleDate"])>0:
+            ad=article["ArticleDate"][0]
+            y=int(ad["Year"]); m=int(ad["Month"]); d=int(ad["Day"])
+            pub_date = dt.date(y,m,d)
+        else:
+            # Try JournalIssue PubDate
+            try:
+                pdx = article.get("Journal",{}).get("JournalIssue",{}).get("PubDate",{})
+                y = int(pdx.get("Year",0)) if "Year" in pdx else None
+                if y:
+                    m = pdx.get("Month","1")
+                    # month may be string like 'Jan' or '12'
+                    month_map = {m:idx for idx,m in enumerate(["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"], start=1)}
+                    if isinstance(m,str) and m.isdigit():
+                        mm=int(m)
+                    else:
+                        mm=month_map.get(str(m)[:3],1)
+                    d = int(pdx.get("Day",1)) if "Day" in pdx and str(pdx.get("Day","1")).isdigit() else 1
+                    pub_date = dt.date(y,mm,d)
+            except Exception:
+                pub_date = None
+        # DOI extraction from ArticleIdList
+        doi=""
+        try:
+            ail = art.get("PubmedData",{}).get("ArticleIdList",[])
+            for iden in ail:
+                if iden.attributes.get("IdType","")=="doi":
+                    doi=str(iden).strip()
+                    break
+        except Exception:
+            doi=""
+        pmid = str(med.get("PMID",""))
+        records.append({"PMID": pmid, "Title": title, "Journal": journal, "DOI": doi, "PubDate": str(pub_date) if pub_date else ""})
+
+df=pd.DataFrame(records)
+(tmp_dir/"step2_raw_records.csv").write_text(df.to_csv(index=False))
+print("Saved raw records to", tmp_dir/"step2_raw_records.csv")
+
+# Filter: valid DOI and pubdate before 2026-01-01
+cutoff = dt.date(2026,1,1)
+def parse_date(s):
+    try:
+        return dt.date.fromisoformat(s)
+    except Exception:
+        return None
+df["PubDateParsed"]=df["PubDate"].apply(parse_date)
+filt = df[(df["DOI"].astype(str).str.len()>0) & (df["PubDateParsed"].notna()) & (df["PubDateParsed"]<cutoff)].copy()
+print(f"After filtering for DOI and PubDate < 2026-01-01: {len(filt)} records.")
+(tmp_dir/"step2_filtered_records.csv").write_text(filt.to_csv(index=False))
+
+# If insufficient, broaden search to all years up to end of 2025
+if len(filt) < 5:
+    print("Insufficient records in 2024-2025 window, broadening search to 2020-2025.")
+    query2 = '(cyanobacteria[Title/Abstract] OR cyanobacterial[Title/Abstract]) AND ("2020/01/01"[Date - Publication] : "2025/12/31"[Date - Publication])'
+    params2 = dict(db="pubmed", term=query2, sort="pub date", retmax=500)
+    (tmp_dir/"step2b_query.json").write_text(json.dumps({"query":query2,"params":params2}, indent=2))
+    h=Entrez.esearch(**params2)
+    sr=Entrez.read(h); h.close()
+    ids2=sr.get("IdList",[])
+    (tmp_dir/"step2b_esearch.json").write_text(json.dumps(sr, indent=2))
+    print("Found", len(ids2), "IDs in 2020-2025 window.")
+    records=[]
+    for i in range(0, len(ids2), batch):
+        data=fetch_details(ids2[i:i+batch])
+        for art in data["PubmedArticle"]:
+            med=art["MedlineCitation"]; article=med.get("Article",{})
+            title=str(article.get("ArticleTitle","")).replace("\n"," ").strip()
+            journal=str(article.get("Journal",{}).get("Title","")).strip()
+            pub_date=None
+            if "ArticleDate" in article and len(article["ArticleDate"])>0:
+                ad=article["ArticleDate"][0]
+                pub_date=dt.date(int(ad["Year"]), int(ad["Month"]), int(ad["Day"]))
+            else:
+                try:
+                    pdx = article.get("Journal",{}).get("JournalIssue",{}).get("PubDate",{})
+                    y=int(pdx.get("Year",0)) if "Year" in pdx else None
+                    if y:
+                        m=pdx.get("Month","1")
+                        month_map={m:idx for idx,m in enumerate(["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"], start=1)}
+                        mm=int(m) if isinstance(m,str) and m.isdigit() else month_map.get(str(m)[:3],1)
+                        d=int(pdx.get("Day",1)) if "Day" in pdx and str(pdx.get("Day","1")).isdigit() else 1
+                        pub_date=dt.date(y,mm,d)
+                except Exception:
+                    pub_date=None
+            doi=""
+            try:
+                for iden in art.get("PubmedData",{}).get("ArticleIdList",[]):
+                    if iden.attributes.get("IdType","")=="doi":
+                        doi=str(iden).strip(); break
+            except Exception:
+                doi=""
+            pmid=str(med.get("PMID",""))
+            records.append({"PMID":pmid,"Title":title,"Journal":journal,"DOI":doi,"PubDate":str(pub_date) if pub_date else ""})
+    df=pd.DataFrame(records)
+    df["PubDateParsed"]=df["PubDate"].apply(parse_date)
+    filt=df[(df["DOI"].astype(str).str.len()>0) & (df["PubDateParsed"].notna()) & (df["PubDateParsed"]<cutoff)].copy()
+    (tmp_dir/"step2b_filtered_records.csv").write_text(filt.to_csv(index=False))
+    print("After broadened filtering:", len(filt))
+
+status[1]="done"
+print("\nUpdated plan:")
+show_plan(status)
+
+# Step 3: sort and pick top 5
+top = filt.sort_values(["PubDateParsed"], ascending=False).drop_duplicates(subset=["DOI"]).head(5).copy()
+print("\nTop 5 candidate papers (most recent):")
+print(top[["PubDate","Title","Journal","DOI","PMID"]].to_string(index=False))
+(tmp_dir/"step3_top5.csv").write_text(top.to_csv(index=False))
+status[2]="done"
+print("\nUpdated plan:")
+show_plan(status)
+
+# Step 4: write final CSV with required headers
+final = top[["Title","Journal","DOI"]].copy()
+final.to_csv(out_csv, index=False)
+print("\nWrote final CSV to:", out_csv)
+(tmp_dir/"step4_final.csv").write_text(final.to_csv(index=False))
+status[3]="done"
+print("\nUpdated plan:")
+show_plan(status)
+
+# Also emit final dataframe for visibility
+print("\nFinal CSV preview:")
+print(final.to_string(index=False))
+</execute>
+<observation>NameError("name 'plan' is not defined")</observation>
+<execute>#!/usr/bin/env python3
+import os, json, re, pandas as pd, datetime as dt
+from pathlib import Path
+
+print("Research log: cyanobacteria recent literature retrieval (pre-2026-01-01)")
+
+# Paths
+out_csv = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/cyanoomicsdb_retrieval_2.csv")
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb_retrieval_2")
+tmp_dir.mkdir(parents=True, exist_ok=True)
+out_csv.parent.mkdir(parents=True, exist_ok=True)
+
+# Plan
+plan = [
+    "Define query and retrieval method (NCBI E-utilities via Biopython Entrez) to find most recent cyanobacteria papers before 2026-01-01.",
+    "Fetch candidate PubMed records (titles, journal, pub dates, DOI) and filter to items with DOI and publication date < 2026-01-01.",
+    "Sort by publication date descending; select top 5 most recent; validate fields.",
+    "Write required CSV to the specified output path; save intermediate JSON/CSV to tmp directory."
+]
+status = ["todo"] * len(plan)
+
+def show_plan():
+    print("\nPlan checklist:")
+    for i, (s, st) in enumerate(zip(plan, status), start=1):
+        box = " " if st == "todo" else ("✓" if st == "done" else "✗")
+        suffix = " (failed)" if st == "fail" else ""
+        print(f"{i}. [{box}] {s}{suffix}")
+
+show_plan()
+
+# Step 1
+from Bio import Entrez
+Entrez.email = "biodatalab@example.com"
+
+query = '(cyanobacteria[Title/Abstract] OR cyanobacterial[Title/Abstract]) AND ("2024/01/01"[Date - Publication] : "2025/12/31"[Date - Publication])'
+params = dict(db="pubmed", term=query, sort="pub date", retmax=200)
+(tmp_dir / "step1_query.json").write_text(json.dumps({"query": query, "params": params}, indent=2))
+status[0] = "done"
+print("\nStep 1 complete: saved query parameters to", tmp_dir / "step1_query.json")
+show_plan()
+
+# Step 2: search + fetch
+handle = Entrez.esearch(**params)
+search_res = Entrez.read(handle)
+handle.close()
+ids = search_res.get("IdList", [])
+(tmp_dir / "step2_esearch.json").write_text(json.dumps(search_res, indent=2))
+print(f"\nFound {len(ids)} PubMed IDs in 2024-2025 window.")
+
+def fetch_details(id_list):
+    h = Entrez.efetch(db="pubmed", id=",".join(id_list), rettype="xml", retmode="xml")
+    data = Entrez.read(h)
+    h.close()
+    return data
+
+def parse_date(s):
+    try:
+        return dt.date.fromisoformat(s)
+    except Exception:
+        return None
+
+records = []
+batch = 50
+for i in range(0, len(ids), batch):
+    data = fetch_details(ids[i:i+batch])
+    for art in data.get("PubmedArticle", []):
+        med = art["MedlineCitation"]
+        article = med.get("Article", {})
+        title = str(article.get("ArticleTitle", "")).replace("\n", " ").strip()
+        journal = str(article.get("Journal", {}).get("Title", "")).strip()
+
+        pub_date = None
+        if "ArticleDate" in article and len(article["ArticleDate"]) > 0:
+            ad = article["ArticleDate"][0]
+            pub_date = dt.date(int(ad["Year"]), int(ad["Month"]), int(ad["Day"]))
+        else:
+            try:
+                pdx = article.get("Journal", {}).get("JournalIssue", {}).get("PubDate", {})
+                y = int(pdx.get("Year", 0)) if "Year" in pdx else None
+                if y:
+                    m = pdx.get("Month", "1")
+                    month_map = {m: idx for idx, m in enumerate(
+                        ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"], start=1
+                    )}
+                    mm = int(m) if isinstance(m, str) and m.isdigit() else month_map.get(str(m)[:3], 1)
+                    d = int(pdx.get("Day", 1)) if "Day" in pdx and str(pdx.get("Day", "1")).isdigit() else 1
+                    pub_date = dt.date(y, mm, d)
+            except Exception:
+                pub_date = None
+
+        doi = ""
+        try:
+            for iden in art.get("PubmedData", {}).get("ArticleIdList", []):
+                if iden.attributes.get("IdType", "") == "doi":
+                    doi = str(iden).strip()
+                    break
+        except Exception:
+            doi = ""
+
+        pmid = str(med.get("PMID", ""))
+        records.append({
+            "PMID": pmid, "Title": title, "Journal": journal,
+            "DOI": doi, "PubDate": str(pub_date) if pub_date else ""
+        })
+
+df = pd.DataFrame(records)
+(tmp_dir / "step2_raw_records.csv").write_text(df.to_csv(index=False))
+
+cutoff = dt.date(2026, 1, 1)
+df["PubDateParsed"] = df["PubDate"].apply(parse_date)
+filt = df[(df["DOI"].astype(str).str.len() > 0) & (df["PubDateParsed"].notna()) & (df["PubDateParsed"] < cutoff)].copy()
+(tmp_dir / "step2_filtered_records.csv").write_text(filt.to_csv(index=False))
+print(f"After filtering for DOI and PubDate < 2026-01-01: {len(filt)} records.")
+
+# Broaden if needed
+if len(filt) < 5:
+    print("Insufficient records in 2024-2025 window, broadening search to 2020-2025.")
+    query2 = '(cyanobacteria[Title/Abstract] OR cyanobacterial[Title/Abstract]) AND ("2020/01/01"[Date - Publication] : "2025/12/31"[Date - Publication])'
+    params2 = dict(db="pubmed", term=query2, sort="pub date", retmax=500)
+    (tmp_dir / "step2b_query.json").write_text(json.dumps({"query": query2, "params": params2}, indent=2))
+    h = Entrez.esearch(**params2)
+    sr = Entrez.read(h); h.close()
+    (tmp_dir / "step2b_esearch.json").write_text(json.dumps(sr, indent=2))
+    ids2 = sr.get("IdList", [])
+    print("Found", len(ids2), "IDs in 2020-2025 window.")
+
+    records = []
+    for i in range(0, len(ids2), batch):
+        data = fetch_details(ids2[i:i+batch])
+        for art in data.get("PubmedArticle", []):
+            med = art["MedlineCitation"]
+            article = med.get("Article", {})
+            title = str(article.get("ArticleTitle", "")).replace("\n", " ").strip()
+            journal = str(article.get("Journal", {}).get("Title", "")).strip()
+
+            pub_date = None
+            if "ArticleDate" in article and len(article["ArticleDate"]) > 0:
+                ad = article["ArticleDate"][0]
+                pub_date = dt.date(int(ad["Year"]), int(ad["Month"]), int(ad["Day"]))
+            else:
+                try:
+                    pdx = article.get("Journal", {}).get("JournalIssue", {}).get("PubDate", {})
+                    y = int(pdx.get("Year", 0)) if "Year" in pdx else None
+                    if y:
+                        m = pdx.get("Month", "1")
+                        month_map = {m: idx for idx, m in enumerate(
+                            ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"], start=1
+                        )}
+                        mm = int(m) if isinstance(m, str) and m.isdigit() else month_map.get(str(m)[:3], 1)
+                        d = int(pdx.get("Day", 1)) if "Day" in pdx and str(pdx.get("Day", "1")).isdigit() else 1
+                        pub_date = dt.date(y, mm, d)
+                except Exception:
+                    pub_date = None
+
+            doi = ""
+            try:
+                for iden in art.get("PubmedData", {}).get("ArticleIdList", []):
+                    if iden.attributes.get("IdType", "") == "doi":
+                        doi = str(iden).strip()
+                        break
+            except Exception:
+                doi = ""
+
+            pmid = str(med.get("PMID", ""))
+            records.append({
+                "PMID": pmid, "Title": title, "Journal": journal,
+                "DOI": doi, "PubDate": str(pub_date) if pub_date else ""
+            })
+
+    df2 = pd.DataFrame(records)
+    df2["PubDateParsed"] = df2["PubDate"].apply(parse_date)
+    filt = df2[(df2["DOI"].astype(str).str.len() > 0) & (df2["PubDateParsed"].notna()) & (df2["PubDateParsed"] < cutoff)].copy()
+    (tmp_dir / "step2b_filtered_records.csv").write_text(filt.to_csv(index=False))
+    print("After broadened filtering:", len(filt))
+
+status[1] = "done"
+show_plan()
+
+# Step 3: sort + top5
+top = filt.sort_values(["PubDateParsed"], ascending=False).drop_duplicates(subset=["DOI"]).head(5).copy()
+(tmp_dir / "step3_top5.csv").write_text(top.to_csv(index=False))
+print("\nTop 5 candidate papers (most recent):")
+print(top[["PubDate", "Title", "Journal", "DOI", "PMID"]].to_string(index=False))
+
+status[2] = "done"
+show_plan()
+
+# Step 4: final CSV
+final = top[["Title", "Journal", "DOI"]].copy()
+final.to_csv(out_csv, index=False)
+(tmp_dir / "step4_final.csv").write_text(final.to_csv(index=False))
+print("\nWrote final CSV to:", out_csv)
+print("\nFinal CSV preview:")
+print(final.to_string(index=False))
+
+status[3] = "done"
+show_plan()
+</execute>
+<observation>NameError("name 'plan' is not defined")</observation>
+<execute>#!/usr/bin/env python3
+import json, pandas as pd, datetime as dt
+from pathlib import Path
+
+print("Research log: cyanobacteria recent literature retrieval (pre-2026-01-01)")
+
+# --- Paths ---
+out_csv = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/cyanoomicsdb_retrieval_2.csv")
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb_retrieval_2")
+tmp_dir.mkdir(parents=True, exist_ok=True)
+out_csv.parent.mkdir(parents=True, exist_ok=True)
+
+# --- Plan checklist (robust: avoid any stale NameError by encapsulating in a dict) ---
+STATE = {}
+STATE["plan"] = [
+    "Define query and retrieval method (NCBI E-utilities via Biopython Entrez) to find most recent cyanobacteria papers before 2026-01-01.",
+    "Fetch candidate PubMed records (titles, journal, pub dates, DOI) and filter to items with DOI and publication date < 2026-01-01.",
+    "Sort by publication date descending; select top 5 most recent; validate fields.",
+    "Write required CSV to the specified output path; save intermediate JSON/CSV to tmp directory."
+]
+STATE["status"] = ["todo"] * 4
+
+def show_plan():
+    print("\nPlan checklist:")
+    for i, (s, st) in enumerate(zip(STATE["plan"], STATE["status"]), start=1):
+        box = " " if st == "todo" else ("✓" if st == "done" else "✗")
+        suffix = " (failed)" if st == "fail" else ""
+        print(f"{i}. [{box}] {s}{suffix}")
+
+show_plan()
+
+# --- Step 1 ---
+from Bio import Entrez
+Entrez.email = "biodatalab@example.com"
+
+query = '(cyanobacteria[Title/Abstract] OR cyanobacterial[Title/Abstract]) AND ("2024/01/01"[Date - Publication] : "2025/12/31"[Date - Publication])'
+params = dict(db="pubmed", term=query, sort="pub date", retmax=200)
+(tmp_dir / "step1_query.json").write_text(json.dumps({"query": query, "params": params}, indent=2))
+
+STATE["status"][0] = "done"
+print("\nStep 1 complete: saved query parameters to", tmp_dir / "step1_query.json")
+show_plan()
+
+# --- Step 2: search + fetch ---
+handle = Entrez.esearch(**params)
+search_res = Entrez.read(handle)
+handle.close()
+ids = search_res.get("IdList", [])
+(tmp_dir / "step2_esearch.json").write_text(json.dumps(search_res, indent=2))
+print(f"\nFound {len(ids)} PubMed IDs in 2024-2025 window.")
+
+def fetch_details(id_list):
+    h = Entrez.efetch(db="pubmed", id=",".join(id_list), rettype="xml", retmode="xml")
+    data = Entrez.read(h)
+    h.close()
+    return data
+
+def parse_date(s):
+    try:
+        return dt.date.fromisoformat(s)
+    except Exception:
+        return None
+
+def month_to_int(m):
+    if m is None:
+        return 1
+    m = str(m)
+    if m.isdigit():
+        return int(m)
+    month_map = {mm: idx for idx, mm in enumerate(
+        ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"], start=1
+    )}
+    return month_map.get(m[:3], 1)
+
+def extract_records(id_list):
+    recs = []
+    batch = 50
+    for i in range(0, len(id_list), batch):
+        data = fetch_details(id_list[i:i+batch])
+        for art in data.get("PubmedArticle", []):
+            med = art["MedlineCitation"]
+            article = med.get("Article", {})
+            title = str(article.get("ArticleTitle", "")).replace("\n", " ").strip()
+            journal = str(article.get("Journal", {}).get("Title", "")).strip()
+
+            pub_date = None
+            if "ArticleDate" in article and len(article["ArticleDate"]) > 0:
+                ad = article["ArticleDate"][0]
+                pub_date = dt.date(int(ad["Year"]), int(ad["Month"]), int(ad["Day"]))
+            else:
+                try:
+                    pdx = article.get("Journal", {}).get("JournalIssue", {}).get("PubDate", {})
+                    if "Year" in pdx:
+                        y = int(pdx.get("Year"))
+                        mm = month_to_int(pdx.get("Month", "1"))
+                        dd = int(pdx.get("Day", 1)) if str(pdx.get("Day", "1")).isdigit() else 1
+                        pub_date = dt.date(y, mm, dd)
+                except Exception:
+                    pub_date = None
+
+            doi = ""
+            try:
+                for iden in art.get("PubmedData", {}).get("ArticleIdList", []):
+                    if iden.attributes.get("IdType", "") == "doi":
+                        doi = str(iden).strip()
+                        break
+            except Exception:
+                doi = ""
+
+            pmid = str(med.get("PMID", ""))
+            recs.append({
+                "PMID": pmid, "Title": title, "Journal": journal,
+                "DOI": doi, "PubDate": str(pub_date) if pub_date else ""
+            })
+    return recs
+
+records = extract_records(ids)
+df = pd.DataFrame(records)
+(tmp_dir / "step2_raw_records.csv").write_text(df.to_csv(index=False))
+
+cutoff = dt.date(2026, 1, 1)
+df["PubDateParsed"] = df["PubDate"].apply(parse_date)
+filt = df[(df["DOI"].astype(str).str.len() > 0) & (df["PubDateParsed"].notna()) & (df["PubDateParsed"] < cutoff)].copy()
+(tmp_dir / "step2_filtered_records.csv").write_text(filt.to_csv(index=False))
+print(f"After filtering for DOI and PubDate < 2026-01-01: {len(filt)} records.")
+
+if len(filt) < 5:
+    print("Insufficient records in 2024-2025 window, broadening search to 2020-2025.")
+    query2 = '(cyanobacteria[Title/Abstract] OR cyanobacterial[Title/Abstract]) AND ("2020/01/01"[Date - Publication] : "2025/12/31"[Date - Publication])'
+    params2 = dict(db="pubmed", term=query2, sort="pub date", retmax=500)
+    (tmp_dir / "step2b_query.json").write_text(json.dumps({"query": query2, "params": params2}, indent=2))
+
+    h = Entrez.esearch(**params2)
+    sr = Entrez.read(h); h.close()
+    ids2 = sr.get("IdList", [])
+    (tmp_dir / "step2b_esearch.json").write_text(json.dumps(sr, indent=2))
+    print("Found", len(ids2), "IDs in 2020-2025 window.")
+
+    df2 = pd.DataFrame(extract_records(ids2))
+    (tmp_dir / "step2b_raw_records.csv").write_text(df2.to_csv(index=False))
+    df2["PubDateParsed"] = df2["PubDate"].apply(parse_date)
+    filt = df2[(df2["DOI"].astype(str).str.len() > 0) & (df2["PubDateParsed"].notna()) & (df2["PubDateParsed"] < cutoff)].copy()
+    (tmp_dir / "step2b_filtered_records.csv").write_text(filt.to_csv(index=False))
+    print("After broadened filtering:", len(filt))
+
+STATE["status"][1] = "done"
+show_plan()
+
+# --- Step 3 ---
+top = filt.sort_values(["PubDateParsed"], ascending=False).drop_duplicates(subset=["DOI"]).head(5).copy()
+(tmp_dir / "step3_top5.csv").write_text(top.to_csv(index=False))
+print("\nTop 5 candidate papers (most recent):")
+cols = ["PubDate", "Title", "Journal", "DOI", "PMID"]
+print(top[cols].to_string(index=False))
+
+STATE["status"][2] = "done"
+show_plan()
+
+# --- Step 4 ---
+final = top[["Title", "Journal", "DOI"]].copy()
+final.to_csv(out_csv, index=False)
+(tmp_dir / "step4_final.csv").write_text(final.to_csv(index=False))
+print("\nWrote final CSV to:", out_csv)
+print("\nFinal CSV preview:")
+print(final.to_string(index=False))
+
+STATE["status"][3] = "done"
+show_plan()
+</execute>
+<observation>NameError("name 'STATE' is not defined")</observation>
+<execute>#!/usr/bin/env python3
+# NOTE: This run is written to be robust in environments that may execute lines non-sequentially.
+# It avoids relying on any prior state by (re)defining all variables before use and not
+# referencing global names from previous cells.
+
+import json, datetime as dt
+from pathlib import Path
+import pandas as pd
+from Bio import Entrez
+
+print("Research log: cyanobacteria recent literature retrieval (pre-2026-01-01)")
+
+# -------------------------
+# Step 0: paths + plan (self-contained)
+# -------------------------
+out_csv = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/cyanoomicsdb_retrieval_2.csv")
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb_retrieval_2")
+tmp_dir.mkdir(parents=True, exist_ok=True)
+out_csv.parent.mkdir(parents=True, exist_ok=True)
+
+plan = [
+    "Define query and retrieval method (NCBI E-utilities via Biopython Entrez) to find most recent cyanobacteria papers before 2026-01-01.",
+    "Fetch candidate PubMed records (titles, journal, pub dates, DOI) and filter to items with DOI and publication date < 2026-01-01.",
+    "Sort by publication date descending; select top 5 most recent; validate fields.",
+    "Write required CSV to the specified output path; save intermediate JSON/CSV to tmp directory."
+]
+status = ["todo"] * 4
+
+def show_plan(plan, status):
+    print("\nPlan checklist:")
+    for i, (s, st) in enumerate(zip(plan, status), start=1):
+        box = " " if st == "todo" else ("✓" if st == "done" else "✗")
+        suffix = " (failed)" if st == "fail" else ""
+        print(f"{i}. [{box}] {s}{suffix}")
+
+show_plan(plan, status)
+
+# -------------------------
+# Helpers
+# -------------------------
+Entrez.email = "biodatalab@example.com"
+
+def parse_date(s):
+    try:
+        return dt.date.fromisoformat(s)
+    except Exception:
+        return None
+
+def month_to_int(m):
+    if m is None:
+        return 1
+    m = str(m)
+    if m.isdigit():
+        return int(m)
+    month_map = {mm: idx for idx, mm in enumerate(
+        ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"], start=1
+    )}
+    return month_map.get(m[:3], 1)
+
+def fetch_details(id_list):
+    h = Entrez.efetch(db="pubmed", id=",".join(id_list), rettype="xml", retmode="xml")
+    data = Entrez.read(h)
+    h.close()
+    return data
+
+def extract_records(id_list):
+    recs = []
+    batch = 50
+    for i in range(0, len(id_list), batch):
+        data = fetch_details(id_list[i:i+batch])
+        for art in data.get("PubmedArticle", []):
+            med = art["MedlineCitation"]
+            article = med.get("Article", {})
+            title = str(article.get("ArticleTitle", "")).replace("\n", " ").strip()
+            journal = str(article.get("Journal", {}).get("Title", "")).strip()
+
+            pub_date = None
+            if "ArticleDate" in article and len(article["ArticleDate"]) > 0:
+                ad = article["ArticleDate"][0]
+                pub_date = dt.date(int(ad["Year"]), int(ad["Month"]), int(ad["Day"]))
+            else:
+                try:
+                    pdx = article.get("Journal", {}).get("JournalIssue", {}).get("PubDate", {})
+                    if "Year" in pdx:
+                        y = int(pdx.get("Year"))
+                        mm = month_to_int(pdx.get("Month", "1"))
+                        dd = int(pdx.get("Day", 1)) if str(pdx.get("Day", "1")).isdigit() else 1
+                        pub_date = dt.date(y, mm, dd)
+                except Exception:
+                    pub_date = None
+
+            doi = ""
+            try:
+                for iden in art.get("PubmedData", {}).get("ArticleIdList", []):
+                    if iden.attributes.get("IdType", "") == "doi":
+                        doi = str(iden).strip()
+                        break
+            except Exception:
+                doi = ""
+
+            pmid = str(med.get("PMID", ""))
+            recs.append({
+                "PMID": pmid, "Title": title, "Journal": journal,
+                "DOI": doi, "PubDate": str(pub_date) if pub_date else ""
+            })
+    return recs
+
+# -------------------------
+# Step 1: define query
+# -------------------------
+query = '(cyanobacteria[Title/Abstract] OR cyanobacterial[Title/Abstract]) AND ("2024/01/01"[Date - Publication] : "2025/12/31"[Date - Publication])'
+params = dict(db="pubmed", term=query, sort="pub date", retmax=200)
+(tmp_dir / "step1_query.json").write_text(json.dumps({"query": query, "params": params}, indent=2))
+
+status[0] = "done"
+print("\nStep 1 complete: saved query parameters to", tmp_dir / "step1_query.json")
+show_plan(plan, status)
+
+# -------------------------
+# Step 2: search + fetch + filter
+# -------------------------
+handle = Entrez.esearch(**params)
+search_res = Entrez.read(handle)
+handle.close()
+ids = search_res.get("IdList", [])
+(tmp_dir / "step2_esearch.json").write_text(json.dumps(search_res, indent=2))
+print(f"\nFound {len(ids)} PubMed IDs in 2024-2025 window.")
+
+df = pd.DataFrame(extract_records(ids))
+(tmp_dir / "step2_raw_records.csv").write_text(df.to_csv(index=False))
+
+cutoff = dt.date(2026, 1, 1)
+df["PubDateParsed"] = df["PubDate"].apply(parse_date)
+filt = df[(df["DOI"].astype(str).str.len() > 0) & (df["PubDateParsed"].notna()) & (df["PubDateParsed"] < cutoff)].copy()
+(tmp_dir / "step2_filtered_records.csv").write_text(filt.to_csv(index=False))
+print(f"After filtering for DOI and PubDate < 2026-01-01: {len(filt)} records.")
+
+if len(filt) < 5:
+    print("Insufficient records in 2024-2025 window, broadening search to 2020-2025.")
+    query2 = '(cyanobacteria[Title/Abstract] OR cyanobacterial[Title/Abstract]) AND ("2020/01/01"[Date - Publication] : "2025/12/31"[Date - Publication])'
+    params2 = dict(db="pubmed", term=query2, sort="pub date", retmax=500)
+    (tmp_dir / "step2b_query.json").write_text(json.dumps({"query": query2, "params": params2}, indent=2))
+
+    h = Entrez.esearch(**params2)
+    sr = Entrez.read(h); h.close()
+    ids2 = sr.get("IdList", [])
+    (tmp_dir / "step2b_esearch.json").write_text(json.dumps(sr, indent=2))
+    print("Found", len(ids2), "IDs in 2020-2025 window.")
+
+    df2 = pd.DataFrame(extract_records(ids2))
+    (tmp_dir / "step2b_raw_records.csv").write_text(df2.to_csv(index=False))
+    df2["PubDateParsed"] = df2["PubDate"].apply(parse_date)
+    filt = df2[(df2["DOI"].astype(str).str.len() > 0) & (df2["PubDateParsed"].notna()) & (df2["PubDateParsed"] < cutoff)].copy()
+    (tmp_dir / "step2b_filtered_records.csv").write_text(filt.to_csv(index=False))
+    print("After broadened filtering:", len(filt))
+
+status[1] = "done"
+show_plan(plan, status)
+
+# -------------------------
+# Step 3: pick top 5 most recent
+# -------------------------
+top = filt.sort_values(["PubDateParsed"], ascending=False).drop_duplicates(subset=["DOI"]).head(5).copy()
+(tmp_dir / "step3_top5.csv").write_text(top.to_csv(index=False))
+
+print("\nTop 5 candidate papers (most recent):")
+print(top[["PubDate", "Title", "Journal", "DOI", "PMID"]].to_string(index=False))
+
+status[2] = "done"
+show_plan(plan, status)
+
+# -------------------------
+# Step 4: output final CSV (required columns)
+# -------------------------
+final = top[["Title", "Journal", "DOI"]].copy()
+final.to_csv(out_csv, index=False)
+(tmp_dir / "step4_final.csv").write_text(final.to_csv(index=False))
+
+print("\nWrote final CSV to:", out_csv)
+print("\nFinal CSV preview:")
+print(final.to_string(index=False))
+
+status[3] = "done"
+show_plan(plan, status)
+</execute>
+<observation>NameError("name 'fetch_details' is not defined")</observation>
+<execute>#!/usr/bin/env python3
+# Single-pass script: no forward references, no reliance on previous state.
+import json, datetime as dt
+from pathlib import Path
+import pandas as pd
+from Bio import Entrez
+
+print("Research log: cyanobacteria recent literature retrieval (pre-2026-01-01)")
+
+# Paths
+out_csv = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/cyanoomicsdb_retrieval_2.csv")
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb_retrieval_2")
+tmp_dir.mkdir(parents=True, exist_ok=True)
+out_csv.parent.mkdir(parents=True, exist_ok=True)
+
+# Plan
+plan = [
+    "Define query and retrieval method (NCBI E-utilities via Biopython Entrez) to find most recent cyanobacteria papers before 2026-01-01.",
+    "Fetch candidate PubMed records (titles, journal, pub dates, DOI) and filter to items with DOI and publication date < 2026-01-01.",
+    "Sort by publication date descending; select top 5 most recent; validate fields.",
+    "Write required CSV to the specified output path; save intermediate JSON/CSV to tmp directory."
+]
+status = ["todo"] * 4
+
+def show_plan():
+    print("\nPlan checklist:")
+    for i, (s, st) in enumerate(zip(plan, status), start=1):
+        box = " " if st == "todo" else ("✓" if st == "done" else "✗")
+        suffix = " (failed)" if st == "fail" else ""
+        print(f"{i}. [{box}] {s}{suffix}")
+
+show_plan()
+
+# Entrez configuration
+Entrez.email = "biodatalab@example.com"
+
+# Helper functions (all defined before use)
+def parse_date(s):
+    try:
+        return dt.date.fromisoformat(s)
+    except Exception:
+        return None
+
+def month_to_int(m):
+    if m is None:
+        return 1
+    m = str(m)
+    if m.isdigit():
+        return int(m)
+    month_map = {mm: idx for idx, mm in enumerate(
+        ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"], start=1
+    )}
+    return month_map.get(m[:3], 1)
+
+def fetch_details(id_list):
+    h = Entrez.efetch(db="pubmed", id=",".join(id_list), rettype="xml", retmode="xml")
+    data = Entrez.read(h)
+    h.close()
+    return data
+
+def extract_records(id_list):
+    recs = []
+    batch = 50
+    for i in range(0, len(id_list), batch):
+        data = fetch_details(id_list[i:i+batch])
+        for art in data.get("PubmedArticle", []):
+            med = art["MedlineCitation"]
+            article = med.get("Article", {})
+            title = str(article.get("ArticleTitle", "")).replace("\n", " ").strip()
+            journal = str(article.get("Journal", {}).get("Title", "")).strip()
+
+            pub_date = None
+            if "ArticleDate" in article and len(article["ArticleDate"]) > 0:
+                ad = article["ArticleDate"][0]
+                pub_date = dt.date(int(ad["Year"]), int(ad["Month"]), int(ad["Day"]))
+            else:
+                pdx = article.get("Journal", {}).get("JournalIssue", {}).get("PubDate", {})
+                if "Year" in pdx:
+                    try:
+                        y = int(pdx.get("Year"))
+                        mm = month_to_int(pdx.get("Month", "1"))
+                        dd = int(pdx.get("Day", 1)) if str(pdx.get("Day", "1")).isdigit() else 1
+                        pub_date = dt.date(y, mm, dd)
+                    except Exception:
+                        pub_date = None
+
+            doi = ""
+            for iden in art.get("PubmedData", {}).get("ArticleIdList", []):
+                try:
+                    if iden.attributes.get("IdType", "") == "doi":
+                        doi = str(iden).strip()
+                        break
+                except Exception:
+                    continue
+
+            pmid = str(med.get("PMID", ""))
+            recs.append({
+                "PMID": pmid,
+                "Title": title,
+                "Journal": journal,
+                "DOI": doi,
+                "PubDate": str(pub_date) if pub_date else ""
+            })
+    return recs
+
+# Step 1: query
+query = '(cyanobacteria[Title/Abstract] OR cyanobacterial[Title/Abstract]) AND ("2024/01/01"[Date - Publication] : "2025/12/31"[Date - Publication])'
+params = dict(db="pubmed", term=query, sort="pub date", retmax=200)
+(tmp_dir / "step1_query.json").write_text(json.dumps({"query": query, "params": params}, indent=2))
+status[0] = "done"
+print("\nStep 1 complete: saved query parameters to", tmp_dir / "step1_query.json")
+show_plan()
+
+# Step 2: search and filter
+handle = Entrez.esearch(**params)
+search_res = Entrez.read(handle)
+handle.close()
+ids = search_res.get("IdList", [])
+(tmp_dir / "step2_esearch.json").write_text(json.dumps(search_res, indent=2))
+print(f"\nFound {len(ids)} PubMed IDs in 2024-2025 window.")
+
+df = pd.DataFrame(extract_records(ids))
+(tmp_dir / "step2_raw_records.csv").write_text(df.to_csv(index=False))
+
+cutoff = dt.date(2026, 1, 1)
+df["PubDateParsed"] = df["PubDate"].apply(parse_date)
+filt = df[(df["DOI"].astype(str).str.len() > 0) & (df["PubDateParsed"].notna()) & (df["PubDateParsed"] < cutoff)].copy()
+(tmp_dir / "step2_filtered_records.csv").write_text(filt.to_csv(index=False))
+print(f"After filtering for DOI and PubDate < 2026-01-01: {len(filt)} records.")
+
+if len(filt) < 5:
+    print("Insufficient records in 2024-2025 window, broadening search to 2020-2025.")
+    query2 = '(cyanobacteria[Title/Abstract] OR cyanobacterial[Title/Abstract]) AND ("2020/01/01"[Date - Publication] : "2025/12/31"[Date - Publication])'
+    params2 = dict(db="pubmed", term=query2, sort="pub date", retmax=500)
+    (tmp_dir / "step2b_query.json").write_text(json.dumps({"query": query2, "params": params2}, indent=2))
+
+    h = Entrez.esearch(**params2)
+    sr = Entrez.read(h); h.close()
+    ids2 = sr.get("IdList", [])
+    (tmp_dir / "step2b_esearch.json").write_text(json.dumps(sr, indent=2))
+    print("Found", len(ids2), "IDs in 2020-2025 window.")
+
+    df2 = pd.DataFrame(extract_records(ids2))
+    (tmp_dir / "step2b_raw_records.csv").write_text(df2.to_csv(index=False))
+    df2["PubDateParsed"] = df2["PubDate"].apply(parse_date)
+    filt = df2[(df2["DOI"].astype(str).str.len() > 0) & (df2["PubDateParsed"].notna()) & (df2["PubDateParsed"] < cutoff)].copy()
+    (tmp_dir / "step2b_filtered_records.csv").write_text(filt.to_csv(index=False))
+    print("After broadened filtering:", len(filt))
+
+status[1] = "done"
+show_plan()
+
+# Step 3: top 5
+top = filt.sort_values(["PubDateParsed"], ascending=False).drop_duplicates(subset=["DOI"]).head(5).copy()
+(tmp_dir / "step3_top5.csv").write_text(top.to_csv(index=False))
+print("\nTop 5 candidate papers (most recent):")
+print(top[["PubDate", "Title", "Journal", "DOI", "PMID"]].to_string(index=False))
+status[2] = "done"
+show_plan()
+
+# Step 4: final CSV
+final = top[["Title", "Journal", "DOI"]].copy()
+final.to_csv(out_csv, index=False)
+(tmp_dir / "step4_final.csv").write_text(final.to_csv(index=False))
+print("\nWrote final CSV to:", out_csv)
+print("\nFinal CSV preview:")
+print(final.to_string(index=False))
+status[3] = "done"
+show_plan()
+</execute>
+<observation>NameError("name 'plan' is not defined")</observation>
+<execute>#!/usr/bin/env python3
+# Robust approach: do not use any plan/status variables (the environment appears to execute
+# code in a way that loses earlier definitions). We will just produce the required CSV and
+# save intermediates.
+
+import json, datetime as dt
+from pathlib import Path
+import pandas as pd
+from Bio import Entrez
+
+print("Research log: cyanobacteria recent literature retrieval (pre-2026-01-01)")
+
+out_csv = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/cyanoomicsdb_retrieval_2.csv")
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb_retrieval_2")
+tmp_dir.mkdir(parents=True, exist_ok=True)
+out_csv.parent.mkdir(parents=True, exist_ok=True)
+
+Entrez.email = "biodatalab@example.com"
+cutoff = dt.date(2026, 1, 1)
+
+def parse_date(s):
+    try:
+        return dt.date.fromisoformat(s)
+    except Exception:
+        return None
+
+def month_to_int(m):
+    if m is None:
+        return 1
+    m = str(m)
+    if m.isdigit():
+        return int(m)
+    month_map = {mm: idx for idx, mm in enumerate(
+        ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"], start=1
+    )}
+    return month_map.get(m[:3], 1)
+
+def fetch_details(id_list):
+    h = Entrez.efetch(db="pubmed", id=",".join(id_list), rettype="xml", retmode="xml")
+    data = Entrez.read(h)
+    h.close()
+    return data
+
+def extract_records(id_list):
+    recs = []
+    batch = 50
+    for i in range(0, len(id_list), batch):
+        data = fetch_details(id_list[i:i+batch])
+        for art in data.get("PubmedArticle", []):
+            med = art["MedlineCitation"]
+            article = med.get("Article", {})
+            title = str(article.get("ArticleTitle", "")).replace("\n", " ").strip()
+            journal = str(article.get("Journal", {}).get("Title", "")).strip()
+
+            pub_date = None
+            if "ArticleDate" in article and len(article["ArticleDate"]) > 0:
+                ad = article["ArticleDate"][0]
+                try:
+                    pub_date = dt.date(int(ad["Year"]), int(ad["Month"]), int(ad["Day"]))
+                except Exception:
+                    pub_date = None
+            else:
+                pdx = article.get("Journal", {}).get("JournalIssue", {}).get("PubDate", {})
+                if "Year" in pdx:
+                    try:
+                        y = int(pdx.get("Year"))
+                        mm = month_to_int(pdx.get("Month", "1"))
+                        dd = int(pdx.get("Day", 1)) if str(pdx.get("Day", "1")).isdigit() else 1
+                        pub_date = dt.date(y, mm, dd)
+                    except Exception:
+                        pub_date = None
+
+            doi = ""
+            for iden in art.get("PubmedData", {}).get("ArticleIdList", []):
+                try:
+                    if iden.attributes.get("IdType", "") == "doi":
+                        doi = str(iden).strip()
+                        break
+                except Exception:
+                    continue
+
+            pmid = str(med.get("PMID", ""))
+            recs.append({
+                "PMID": pmid,
+                "Title": title,
+                "Journal": journal,
+                "DOI": doi,
+                "PubDate": str(pub_date) if pub_date else ""
+            })
+    return recs
+
+def run_query(term, retmax):
+    params = dict(db="pubmed", term=term, sort="pub date", retmax=retmax)
+    h = Entrez.esearch(**params)
+    sr = Entrez.read(h)
+    h.close()
+    return params, sr, sr.get("IdList", [])
+
+# Query windows: try 2025 then 2024-2025 then 2020-2025 until we have >=5 DOI+date results
+queries = [
+    ('(cyanobacteria[Title/Abstract] OR cyanobacterial[Title/Abstract]) AND ("2025/01/01"[Date - Publication] : "2025/12/31"[Date - Publication])', 300, "q1_2025"),
+    ('(cyanobacteria[Title/Abstract] OR cyanobacterial[Title/Abstract]) AND ("2024/01/01"[Date - Publication] : "2025/12/31"[Date - Publication])', 500, "q2_2024_2025"),
+    ('(cyanobacteria[Title/Abstract] OR cyanobacterial[Title/Abstract]) AND ("2020/01/01"[Date - Publication] : "2025/12/31"[Date - Publication])', 800, "q3_2020_2025"),
+]
+
+best_filt = pd.DataFrame()
+for term, retmax, tag in queries:
+    params, sr, ids = run_query(term, retmax)
+    (tmp_dir / f"{tag}_esearch_params.json").write_text(json.dumps({"query": term, "params": params}, indent=2))
+    (tmp_dir / f"{tag}_esearch_result.json").write_text(json.dumps(sr, indent=2))
+    print(f"Query {tag}: {len(ids)} PMIDs")
+    if not ids:
+        continue
+    df = pd.DataFrame(extract_records(ids))
+    (tmp_dir / f"{tag}_raw_records.csv").write_text(df.to_csv(index=False))
+    df["PubDateParsed"] = df["PubDate"].apply(parse_date)
+    filt = df[(df["DOI"].astype(str).str.len() > 0) & (df["PubDateParsed"].notna()) & (df["PubDateParsed"] < cutoff)].copy()
+    (tmp_dir / f"{tag}_filtered_records.csv").write_text(filt.to_csv(index=False))
+    print(f"Query {tag}: {len(filt)} records with DOI+PubDate < 2026-01-01")
+    best_filt = filt
+    if len(filt) >= 5:
+        break
+
+# Select top 5 most recent
+top = best_filt.sort_values(["PubDateParsed"], ascending=False).drop_duplicates(subset=["DOI"]).head(5).copy()
+(tmp_dir / "top5_debug.csv").write_text(top.to_csv(index=False))
+
+final = top[["Title", "Journal", "DOI"]].copy()
+final.to_csv(out_csv, index=False)
+
+print("\nWrote final CSV:", out_csv)
+print("\nFinal rows:")
+print(final.to_string(index=False))
+</execute>
+<observation>NameError("name 'Entrez' is not defined")</observation>
+<execute>#!/usr/bin/env python3
+# Fallback implementation WITHOUT Biopython/Entrez (environment seems to drop/skip imports).
+# Use NCBI E-utilities via urllib to retrieve PubMed XML, then parse for Title/Journal/DOI.
+
+import json, datetime as dt
+from pathlib import Path
+import pandas as pd
+import urllib.parse, urllib.request
+import xml.etree.ElementTree as ET
+import time
+
+print("Research log: cyanobacteria recent literature retrieval (pre-2026-01-01) via E-utilities (urllib)")
+
+out_csv = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/cyanoomicsdb_retrieval_2.csv")
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb_retrieval_2")
+tmp_dir.mkdir(parents=True, exist_ok=True)
+out_csv.parent.mkdir(parents=True, exist_ok=True)
+
+CUTOFF = dt.date(2026, 1, 1)
+TOOL = "biodatalab"
+EMAIL = "biodatalab@example.com"
+
+def http_get(url, params):
+    qs = urllib.parse.urlencode(params)
+    full = url + "?" + qs
+    req = urllib.request.Request(full, headers={"User-Agent": f"{TOOL} ({EMAIL})"})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        return resp.read()
+
+def esearch(term, retmax=200):
+    url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+    params = {
+        "db": "pubmed",
+        "term": term,
+        "sort": "pub date",
+        "retmax": str(retmax),
+        "retmode": "json",
+        "tool": TOOL,
+        "email": EMAIL
+    }
+    raw = http_get(url, params)
+    js = json.loads(raw.decode("utf-8"))
+    ids = js.get("esearchresult", {}).get("idlist", [])
+    return params, js, ids
+
+def efetch_xml(id_list):
+    url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+    params = {
+        "db": "pubmed",
+        "id": ",".join(id_list),
+        "retmode": "xml",
+        "tool": TOOL,
+        "email": EMAIL
+    }
+    raw = http_get(url, params)
+    return raw
+
+def month_to_int(m):
+    if m is None:
+        return 1
+    m = str(m)
+    if m.isdigit():
+        return int(m)
+    month_map = {mm: idx for idx, mm in enumerate(
+        ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"], start=1
+    )}
+    return month_map.get(m[:3], 1)
+
+def parse_pub_date(article_el):
+    # Prefer ArticleDate (Electronic or Print)
+    for ad in article_el.findall(".//ArticleDate"):
+        y = ad.findtext("Year")
+        mo = ad.findtext("Month")
+        d = ad.findtext("Day")
+        if y and mo and d:
+            try:
+                return dt.date(int(y), int(mo), int(d))
+            except Exception:
+                pass
+    # Fallback: JournalIssue/PubDate
+    pd_el = article_el.find(".//Journal/JournalIssue/PubDate")
+    if pd_el is not None:
+        y = pd_el.findtext("Year")
+        mo = pd_el.findtext("Month") or "1"
+        d = pd_el.findtext("Day") or "1"
+        if y:
+            try:
+                return dt.date(int(y), month_to_int(mo), int(d) if str(d).isdigit() else 1)
+            except Exception:
+                return None
+    return None
+
+def extract_records_from_xml(xml_bytes):
+    root = ET.fromstring(xml_bytes)
+    recs = []
+    for pubmed_article in root.findall(".//PubmedArticle"):
+        pmid = pubmed_article.findtext(".//MedlineCitation/PMID") or ""
+        article_el = pubmed_article.find(".//MedlineCitation/Article")
+        if article_el is None:
+            continue
+        title = (article_el.findtext("ArticleTitle") or "").strip()
+        journal = (article_el.findtext(".//Journal/Title") or "").strip()
+
+        pub_date = parse_pub_date(article_el)
+
+        doi = ""
+        for aid in pubmed_article.findall(".//PubmedData/ArticleIdList/ArticleId"):
+            if aid.attrib.get("IdType", "").lower() == "doi":
+                doi = (aid.text or "").strip()
+                break
+
+        recs.append({
+            "PMID": pmid,
+            "Title": title.replace("\n", " "),
+            "Journal": journal,
+            "DOI": doi,
+            "PubDate": str(pub_date) if pub_date else ""
+        })
+    return recs
+
+def filter_and_top5(df):
+    df["PubDateParsed"] = pd.to_datetime(df["PubDate"], errors="coerce").dt.date
+    filt = df[(df["DOI"].astype(str).str.len() > 0) & (df["PubDateParsed"].notna()) & (df["PubDateParsed"] < CUTOFF)].copy()
+    top = filt.sort_values(["PubDateParsed"], ascending=False).drop_duplicates(subset=["DOI"]).head(5).copy()
+    return filt, top
+
+queries = [
+    ('(cyanobacteria[Title/Abstract] OR cyanobacterial[Title/Abstract]) AND ("2025/01/01"[Date - Publication] : "2025/12/31"[Date - Publication])', 300, "q1_2025"),
+    ('(cyanobacteria[Title/Abstract] OR cyanobacterial[Title/Abstract]) AND ("2024/01/01"[Date - Publication] : "2025/12/31"[Date - Publication])', 500, "q2_2024_2025"),
+    ('(cyanobacteria[Title/Abstract] OR cyanobacterial[Title/Abstract]) AND ("2020/01/01"[Date - Publication] : "2025/12/31"[Date - Publication])', 800, "q3_2020_2025"),
+]
+
+best_top = pd.DataFrame()
+best_filt = pd.DataFrame()
+
+for term, retmax, tag in queries:
+    params, js, ids = esearch(term, retmax=retmax)
+    (tmp_dir / f"{tag}_esearch_params.json").write_text(json.dumps({"query": term, "params": params}, indent=2))
+    (tmp_dir / f"{tag}_esearch_result.json").write_text(json.dumps(js, indent=2))
+    print(f"{tag}: {len(ids)} PMIDs")
+
+    recs = []
+    batch = 100
+    for i in range(0, len(ids), batch):
+        sub = ids[i:i+batch]
+        xml_bytes = efetch_xml(sub)
+        if i == 0:
+            (tmp_dir / f"{tag}_efetch_first_batch.xml").write_bytes(xml_bytes)
+        recs.extend(extract_records_from_xml(xml_bytes))
+        time.sleep(0.34)  # be polite
+
+    df = pd.DataFrame(recs)
+    (tmp_dir / f"{tag}_raw_records.csv").write_text(df.to_csv(index=False))
+
+    filt, top = filter_and_top5(df)
+    (tmp_dir / f"{tag}_filtered_records.csv").write_text(filt.to_csv(index=False))
+    (tmp_dir / f"{tag}_top5.csv").write_text(top.to_csv(index=False))
+
+    print(f"{tag}: {len(filt)} records with DOI+PubDate < 2026-01-01; top5 size={len(top)}")
+    best_filt, best_top = filt, top
+    if len(best_top) >= 5:
+        break
+
+final = best_top[["Title", "Journal", "DOI"]].copy()
+final.to_csv(out_csv, index=False)
+
+print("\nWrote final CSV:", out_csv)
+print("\nFinal CSV preview:")
+print(final.to_string(index=False))
+</execute>
+<observation>NameError("name 'TOOL' is not defined")</observation>
+<execute>#!/usr/bin/env python3
+# Minimal, single-expression style: avoid any cross-line global variable dependency.
+# All constants are inlined inside functions.
+
+import json, datetime as dt, time
+from pathlib import Path
+import pandas as pd
+import urllib.parse, urllib.request
+import xml.etree.ElementTree as ET
+
+print("Research log: cyanobacteria recent literature retrieval (pre-2026-01-01) via E-utilities (urllib)")
+
+out_csv = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/cyanoomicsdb_retrieval_2.csv")
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb_retrieval_2")
+tmp_dir.mkdir(parents=True, exist_ok=True)
+out_csv.parent.mkdir(parents=True, exist_ok=True)
+
+def http_get(url, params):
+    qs = urllib.parse.urlencode(params)
+    full = url + "?" + qs
+    # inline TOOL/EMAIL to avoid NameError if globals are lost
+    req = urllib.request.Request(full, headers={"User-Agent": "biodatalab (biodatalab@example.com)"})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        return resp.read()
+
+def esearch(term, retmax=200):
+    url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+    params = {
+        "db": "pubmed",
+        "term": term,
+        "sort": "pub date",
+        "retmax": str(retmax),
+        "retmode": "json",
+        "tool": "biodatalab",
+        "email": "biodatalab@example.com"
+    }
+    raw = http_get(url, params)
+    js = json.loads(raw.decode("utf-8"))
+    ids = js.get("esearchresult", {}).get("idlist", [])
+    return params, js, ids
+
+def efetch_xml(id_list):
+    url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+    params = {
+        "db": "pubmed",
+        "id": ",".join(id_list),
+        "retmode": "xml",
+        "tool": "biodatalab",
+        "email": "biodatalab@example.com"
+    }
+    return http_get(url, params)
+
+def month_to_int(m):
+    if m is None:
+        return 1
+    m = str(m)
+    if m.isdigit():
+        return int(m)
+    month_map = {mm: idx for idx, mm in enumerate(
+        ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"], start=1
+    )}
+    return month_map.get(m[:3], 1)
+
+def parse_pub_date(article_el):
+    for ad in article_el.findall(".//ArticleDate"):
+        y = ad.findtext("Year"); mo = ad.findtext("Month"); d = ad.findtext("Day")
+        if y and mo and d:
+            try:
+                return dt.date(int(y), int(mo), int(d))
+            except Exception:
+                pass
+    pd_el = article_el.find(".//Journal/JournalIssue/PubDate")
+    if pd_el is not None:
+        y = pd_el.findtext("Year")
+        mo = pd_el.findtext("Month") or "1"
+        d = pd_el.findtext("Day") or "1"
+        if y:
+            try:
+                return dt.date(int(y), month_to_int(mo), int(d) if str(d).isdigit() else 1)
+            except Exception:
+                return None
+    return None
+
+def extract_records_from_xml(xml_bytes):
+    root = ET.fromstring(xml_bytes)
+    recs = []
+    for pubmed_article in root.findall(".//PubmedArticle"):
+        pmid = pubmed_article.findtext(".//MedlineCitation/PMID") or ""
+        article_el = pubmed_article.find(".//MedlineCitation/Article")
+        if article_el is None:
+            continue
+        title = (article_el.findtext("ArticleTitle") or "").strip().replace("\n", " ")
+        journal = (article_el.findtext(".//Journal/Title") or "").strip()
+        pub_date = parse_pub_date(article_el)
+        doi = ""
+        for aid in pubmed_article.findall(".//PubmedData/ArticleIdList/ArticleId"):
+            if aid.attrib.get("IdType", "").lower() == "doi":
+                doi = (aid.text or "").strip()
+                break
+        recs.append({"PMID": pmid, "Title": title, "Journal": journal, "DOI": doi, "PubDate": str(pub_date) if pub_date else ""})
+    return recs
+
+def filter_and_top5(df):
+    cutoff = dt.date(2026, 1, 1)
+    df["PubDateParsed"] = pd.to_datetime(df["PubDate"], errors="coerce").dt.date
+    filt = df[(df["DOI"].astype(str).str.len() > 0) & (df["PubDateParsed"].notna()) & (df["PubDateParsed"] < cutoff)].copy()
+    top = filt.sort_values(["PubDateParsed"], ascending=False).drop_duplicates(subset=["DOI"]).head(5).copy()
+    return filt, top
+
+queries = [
+    ('(cyanobacteria[Title/Abstract] OR cyanobacterial[Title/Abstract]) AND ("2025/01/01"[Date - Publication] : "2025/12/31"[Date - Publication])', 300, "q1_2025"),
+    ('(cyanobacteria[Title/Abstract] OR cyanobacterial[Title/Abstract]) AND ("2024/01/01"[Date - Publication] : "2025/12/31"[Date - Publication])', 500, "q2_2024_2025"),
+    ('(cyanobacteria[Title/Abstract] OR cyanobacterial[Title/Abstract]) AND ("2020/01/01"[Date - Publication] : "2025/12/31"[Date - Publication])', 800, "q3_2020_2025"),
+]
+
+best_top = pd.DataFrame()
+best_filt = pd.DataFrame()
+
+for term, retmax, tag in queries:
+    params, js, ids = esearch(term, retmax=retmax)
+    (tmp_dir / f"{tag}_esearch_params.json").write_text(json.dumps({"query": term, "params": params}, indent=2))
+    (tmp_dir / f"{tag}_esearch_result.json").write_text(json.dumps(js, indent=2))
+    print(f"{tag}: {len(ids)} PMIDs")
+
+    recs = []
+    batch = 100
+    for i in range(0, len(ids), batch):
+        sub = ids[i:i+batch]
+        xml_bytes = efetch_xml(sub)
+        if i == 0:
+            (tmp_dir / f"{tag}_efetch_first_batch.xml").write_bytes(xml_bytes)
+        recs.extend(extract_records_from_xml(xml_bytes))
+        time.sleep(0.34)
+
+    df = pd.DataFrame(recs)
+    (tmp_dir / f"{tag}_raw_records.csv").write_text(df.to_csv(index=False))
+
+    filt, top = filter_and_top5(df)
+    (tmp_dir / f"{tag}_filtered_records.csv").write_text(filt.to_csv(index=False))
+    (tmp_dir / f"{tag}_top5.csv").write_text(top.to_csv(index=False))
+
+    print(f"{tag}: {len(filt)} with DOI+PubDate<2026-01-01; top5={len(top)}")
+    best_filt, best_top = filt, top
+    if len(best_top) >= 5:
+        break
+
+final = best_top[["Title", "Journal", "DOI"]].copy()
+final.to_csv(out_csv, index=False)
+
+print("\nWrote final CSV:", out_csv)
+print("\nFinal CSV preview:")
+print(final.to_string(index=False))
+</execute>
+<observation>NameError("name 'http_get' is not defined")</observation>
+<execute>#!/usr/bin/env python3
+# Ultra-robust: no user-defined functions at all (environment seems to lose definitions).
+# Implement everything inline.
+
+import json, datetime as dt, time
+from pathlib import Path
+import pandas as pd
+import urllib.parse, urllib.request
+import xml.etree.ElementTree as ET
+
+print("Research log: cyanobacteria recent literature retrieval (pre-2026-01-01) via E-utilities (no custom functions)")
+
+out_csv = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/cyanoomicsdb_retrieval_2.csv")
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb_retrieval_2")
+tmp_dir.mkdir(parents=True, exist_ok=True)
+out_csv.parent.mkdir(parents=True, exist_ok=True)
+
+cutoff = dt.date(2026, 1, 1)
+
+queries = [
+    ('(cyanobacteria[Title/Abstract] OR cyanobacterial[Title/Abstract]) AND ("2025/01/01"[Date - Publication] : "2025/12/31"[Date - Publication])', 300, "q1_2025"),
+    ('(cyanobacteria[Title/Abstract] OR cyanobacterial[Title/Abstract]) AND ("2024/01/01"[Date - Publication] : "2025/12/31"[Date - Publication])', 500, "q2_2024_2025"),
+    ('(cyanobacteria[Title/Abstract] OR cyanobacterial[Title/Abstract]) AND ("2020/01/01"[Date - Publication] : "2025/12/31"[Date - Publication])', 800, "q3_2020_2025"),
+]
+
+best_top = pd.DataFrame()
+
+for term, retmax, tag in queries:
+    # --- esearch ---
+    esearch_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+    esearch_params = {
+        "db": "pubmed",
+        "term": term,
+        "sort": "pub date",
+        "retmax": str(retmax),
+        "retmode": "json",
+        "tool": "biodatalab",
+        "email": "biodatalab@example.com"
+    }
+    (tmp_dir / f"{tag}_esearch_params.json").write_text(json.dumps({"query": term, "params": esearch_params}, indent=2))
+    full = esearch_url + "?" + urllib.parse.urlencode(esearch_params)
+    req = urllib.request.Request(full, headers={"User-Agent": "biodatalab (biodatalab@example.com)"})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        esearch_raw = resp.read()
+    esearch_js = json.loads(esearch_raw.decode("utf-8"))
+    (tmp_dir / f"{tag}_esearch_result.json").write_text(json.dumps(esearch_js, indent=2))
+    ids = esearch_js.get("esearchresult", {}).get("idlist", [])
+    print(f"{tag}: esearch returned {len(ids)} PMIDs")
+    if not ids:
+        continue
+
+    # --- efetch batches + parse ---
+    recs = []
+    batch = 100
+    for bi in range(0, len(ids), batch):
+        sub = ids[bi:bi+batch]
+        efetch_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+        efetch_params = {
+            "db": "pubmed",
+            "id": ",".join(sub),
+            "retmode": "xml",
+            "tool": "biodatalab",
+            "email": "biodatalab@example.com"
+        }
+        ef_full = efetch_url + "?" + urllib.parse.urlencode(efetch_params)
+        ef_req = urllib.request.Request(ef_full, headers={"User-Agent": "biodatalab (biodatalab@example.com)"})
+        with urllib.request.urlopen(ef_req, timeout=60) as resp:
+            xml_bytes = resp.read()
+        if bi == 0:
+            (tmp_dir / f"{tag}_efetch_first_batch.xml").write_bytes(xml_bytes)
+
+        root = ET.fromstring(xml_bytes)
+        for pubmed_article in root.findall(".//PubmedArticle"):
+            pmid = pubmed_article.findtext(".//MedlineCitation/PMID") or ""
+            article_el = pubmed_article.find(".//MedlineCitation/Article")
+            if article_el is None:
+                continue
+            title = (article_el.findtext("ArticleTitle") or "").strip().replace("\n", " ")
+            journal = (article_el.findtext(".//Journal/Title") or "").strip()
+
+            # PubDate
+            pub_date = None
+            # ArticleDate
+            for ad in article_el.findall(".//ArticleDate"):
+                y = ad.findtext("Year"); mo = ad.findtext("Month"); d = ad.findtext("Day")
+                if y and mo and d:
+                    try:
+                        pub_date = dt.date(int(y), int(mo), int(d))
+                        break
+                    except Exception:
+                        pass
+            # Journal PubDate
+            if pub_date is None:
+                pd_el = article_el.find(".//Journal/JournalIssue/PubDate")
+                if pd_el is not None:
+                    y = pd_el.findtext("Year")
+                    mo = pd_el.findtext("Month") or "1"
+                    d = pd_el.findtext("Day") or "1"
+                    if y:
+                        try:
+                            mo_s = str(mo)
+                            if mo_s.isdigit():
+                                mm = int(mo_s)
+                            else:
+                                months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+                                mm = (months.index(mo_s[:3]) + 1) if mo_s[:3] in months else 1
+                            dd = int(d) if str(d).isdigit() else 1
+                            pub_date = dt.date(int(y), mm, dd)
+                        except Exception:
+                            pub_date = None
+
+            doi = ""
+            for aid in pubmed_article.findall(".//PubmedData/ArticleIdList/ArticleId"):
+                if aid.attrib.get("IdType", "").lower() == "doi":
+                    doi = (aid.text or "").strip()
+                    break
+
+            recs.append({"PMID": pmid, "Title": title, "Journal": journal, "DOI": doi, "PubDate": str(pub_date) if pub_date else ""})
+
+        time.sleep(0.34)
+
+    df = pd.DataFrame(recs)
+    (tmp_dir / f"{tag}_raw_records.csv").write_text(df.to_csv(index=False))
+
+    df["PubDateParsed"] = pd.to_datetime(df["PubDate"], errors="coerce").dt.date
+    filt = df[(df["DOI"].astype(str).str.len() > 0) & (df["PubDateParsed"].notna()) & (df["PubDateParsed"] < cutoff)].copy()
+    (tmp_dir / f"{tag}_filtered_records.csv").write_text(filt.to_csv(index=False))
+    top = filt.sort_values(["PubDateParsed"], ascending=False).drop_duplicates(subset=["DOI"]).head(5).copy()
+    (tmp_dir / f"{tag}_top5.csv").write_text(top.to_csv(index=False))
+
+    print(f"{tag}: filtered={len(filt)}; top5={len(top)}")
+    best_top = top
+    if len(best_top) >= 5:
+        break
+
+final = best_top[["Title", "Journal", "DOI"]].copy()
+final.to_csv(out_csv, index=False)
+
+print("\nWrote final CSV:", out_csv)
+print("\nFinal CSV preview:")
+print(final.to_string(index=False))
+</execute>
+<observation>ERROR: Code execution timed out after 150 seconds. Please try with simpler inputs or break your task into smaller steps.</observation>
+<execute>#!/usr/bin/env python3
+import json, urllib.parse, urllib.request
+from pathlib import Path
+
+print("Step 1/3: PubMed esearch only (no efetch yet)")
+
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb_retrieval_2")
+tmp_dir.mkdir(parents=True, exist_ok=True)
+
+queries = [
+    ('(cyanobacteria[Title/Abstract] OR cyanobacterial[Title/Abstract]) AND ("2025/01/01"[Date - Publication] : "2025/12/31"[Date - Publication])', 50, "q1_2025"),
+    ('(cyanobacteria[Title/Abstract] OR cyanobacterial[Title/Abstract]) AND ("2024/01/01"[Date - Publication] : "2025/12/31"[Date - Publication])', 50, "q2_2024_2025"),
+    ('cyanobacteria[Title/Abstract] OR cyanobacterial[Title/Abstract]', 50, "q3_alltime"),
+]
+
+results = []
+for term, retmax, tag in queries:
+    esearch_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+    esearch_params = {
+        "db": "pubmed",
+        "term": term,
+        "sort": "pub date",
+        "retmax": str(retmax),
+        "retmode": "json",
+        "tool": "biodatalab",
+        "email": "biodatalab@example.com"
+    }
+    (tmp_dir / f"{tag}_esearch_params.json").write_text(json.dumps({"query": term, "params": esearch_params}, indent=2))
+    full = esearch_url + "?" + urllib.parse.urlencode(esearch_params)
+    req = urllib.request.Request(full, headers={"User-Agent": "biodatalab (biodatalab@example.com)"})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        raw = resp.read()
+    js = json.loads(raw.decode("utf-8"))
+    (tmp_dir / f"{tag}_esearch_result.json").write_text(json.dumps(js, indent=2))
+    ids = js.get("esearchresult", {}).get("idlist", [])
+    results.append((tag, len(ids), ids[:10]))
+
+print("ESEARCH summary (tag, n_ids, first10):")
+for r in results:
+    print(r)
+
+# Save a combined summary
+(tmp_dir / "step1_esearch_summary.json").write_text(json.dumps(
+    [{"tag":t,"n_ids":n,"first10":f10} for (t,n,f10) in results],
+    indent=2
+))
+print("Saved:", tmp_dir / "step1_esearch_summary.json")
+</execute>
+<observation>Step 1/3: PubMed esearch only (no efetch yet)
+ESEARCH summary (tag, n_ids, first10):
+('q1_2025', 50, ['41438701', '41308608', '41628991', '41568253', '41456588', '41456576', '41455140', '41422606', '41420955', '41390308'])
+('q2_2024_2025', 50, ['41438701', '41308608', '41628991', '41568253', '41456588', '41456576', '41455140', '41422606', '41420955', '41390308'])
+('q3_alltime', 50, ['41438701', '41506113', '41506496', '41308608', '41547210', '41647440', '41628991', '41568253', '41534661', '41524024'])
+Saved: /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb_retrieval_2/step1_esearch_summary.json
+</observation>
+<execute>#!/usr/bin/env python3
+import urllib.parse, urllib.request, xml.etree.ElementTree as ET
+from pathlib import Path
+import pandas as pd
+
+print("Step 2/3: efetch details for 50 PMIDs (q1_2025), extract Title/Journal/DOI, then pick top-5 by PubDate")
+
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb_retrieval_2")
+tmp_dir.mkdir(parents=True, exist_ok=True)
+
+# PMIDs from observation (q1_2025 first 50; we only got first10 in output, so read full list from saved json)
+import json
+summary = json.loads((tmp_dir/"q1_2025_esearch_result.json").read_text())
+pmids = summary["esearchresult"]["idlist"]
+print("PMIDs loaded:", len(pmids))
+
+# Single efetch call (up to 200 IDs is fine; we have 50)
+efetch_url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+efetch_params = {
+    "db": "pubmed",
+    "id": ",".join(pmids),
+    "retmode": "xml",
+    "tool": "biodatalab",
+    "email": "biodatalab@example.com"
+}
+full = efetch_url + "?" + urllib.parse.urlencode(efetch_params)
+req = urllib.request.Request(full, headers={"User-Agent": "biodatalab (biodatalab@example.com)"})
+with urllib.request.urlopen(req, timeout=90) as resp:
+    xml_bytes = resp.read()
+
+(tmp_dir/"step2_efetch_50_pmids.xml").write_bytes(xml_bytes)
+print("Saved efetch XML:", tmp_dir/"step2_efetch_50_pmids.xml")
+
+root = ET.fromstring(xml_bytes)
+
+months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+def month_to_int(m):
+    if m is None: return 1
+    m=str(m)
+    if m.isdigit(): return int(m)
+    return (months.index(m[:3])+1) if m[:3] in months else 1
+
+rows=[]
+for pa in root.findall(".//PubmedArticle"):
+    pmid = pa.findtext(".//MedlineCitation/PMID") or ""
+    article = pa.find(".//MedlineCitation/Article")
+    if article is None:
+        continue
+    title = (article.findtext("ArticleTitle") or "").strip().replace("\n"," ")
+    journal = (article.findtext(".//Journal/Title") or "").strip()
+
+    # PubDate: prefer ArticleDate, else JournalIssue PubDate
+    pub_date = None
+    ad = article.find(".//ArticleDate")
+    if ad is not None:
+        y=ad.findtext("Year"); m=ad.findtext("Month"); d=ad.findtext("Day")
+        if y and m and d:
+            try:
+                pub_date = f"{int(y):04d}-{int(m):02d}-{int(d):02d}"
+            except Exception:
+                pub_date = None
+    if pub_date is None:
+        pd_el = article.find(".//Journal/JournalIssue/PubDate")
+        if pd_el is not None:
+            y=pd_el.findtext("Year"); m=pd_el.findtext("Month") or "1"; d=pd_el.findtext("Day") or "1"
+            if y:
+                try:
+                    pub_date = f"{int(y):04d}-{month_to_int(m):02d}-{int(d) if str(d).isdigit() else 1:02d}"
+                except Exception:
+                    pub_date = None
+
+    doi=""
+    for aid in pa.findall(".//PubmedData/ArticleIdList/ArticleId"):
+        if aid.attrib.get("IdType","").lower()=="doi":
+            doi=(aid.text or "").strip()
+            break
+
+    rows.append({"PMID":pmid,"Title":title,"Journal":journal,"DOI":doi,"PubDate":pub_date or ""})
+
+df=pd.DataFrame(rows)
+(tmp_dir/"step2_extracted_50.csv").write_text(df.to_csv(index=False))
+print("Extracted records:", len(df), "Saved:", tmp_dir/"step2_extracted_50.csv")
+
+df["PubDateParsed"] = pd.to_datetime(df["PubDate"], errors="coerce")
+filt = df[(df["DOI"].astype(str).str.len()>0) & (df["PubDateParsed"].notna())].copy()
+# ensure pre-2026-01-01
+filt = filt[filt["PubDateParsed"] < pd.Timestamp("2026-01-01")]
+top = filt.sort_values("PubDateParsed", ascending=False).drop_duplicates(subset=["DOI"]).head(5)
+
+print("\nTop-5 (debug):")
+print(top[["PubDate","Title","Journal","DOI","PMID"]].to_string(index=False))
+
+(tmp_dir/"step2_top5_debug.csv").write_text(top.to_csv(index=False))
+print("Saved:", tmp_dir/"step2_top5_debug.csv")
+</execute>
+<observation>Step 2/3: efetch details for 50 PMIDs (q1_2025), extract Title/Journal/DOI, then pick top-5 by PubDate
+PMIDs loaded: 50
+Saved efetch XML: /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb_retrieval_2/step2_efetch_50_pmids.xml
+Extracted records: 50 Saved: /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb_retrieval_2/step2_extracted_50.csv
+
+Top-5 (debug):
+   PubDate                                                                                                                                                                           Title                                        Journal                             DOI     PMID
+2025-12-30                                Biodeterioration of built heritage in the context of climate change and atmospheric pollution: Toward transdisciplinary conservation strategies.           The Science of the total environment 10.1016/j.scitotenv.2025.181313 41475142
+2025-12-29                                                                                                                                                                 Cyanobacterium- Biotechnology reports (Amsterdam, Netherlands)      10.1016/j.btre.2025.e00943 41568253
+2025-12-29 Coupled organic matter degradation and dynamic extracellular polysaccharide turnover by an alkaline microalgae-cyanobacteria consortium treating maize lime cooking wastewater.            Journal of environmental management   10.1016/j.jenvman.2025.128402 41468617
+2025-12-27                                             Toxicological evaluation of entricitabine and tenofovir disoproxyl fumarate, isolated and mixture, in cyanobacteria and microalgae.           The Science of the total environment 10.1016/j.scitotenv.2025.181152 41456520
+2025-12-26       Remedial effects of extracellular polymeric substances (EPS) from Arthrospira platensis against Di-n-butyl phthalate (DBP) toxicity on gilthead seabream (Sparus aurata).                 Research in veterinary science      10.1016/j.rvsc.2025.106041 41456576
+Saved: /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb_retrieval_2/step2_top5_debug.csv
+</observation>
+<execute>#!/usr/bin/env python3
+import pandas as pd
+from pathlib import Path
+
+print("Step 3/3: write final CSV with required headers (Title, Journal, DOI)")
+
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb_retrieval_2")
+out_csv = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/cyanoomicsdb_retrieval_2.csv")
+out_csv.parent.mkdir(parents=True, exist_ok=True)
+
+top_path = tmp_dir / "step2_top5_debug.csv"
+df = pd.read_csv(top_path)
+
+final = df[["Title","Journal","DOI"]].copy()
+final.to_csv(out_csv, index=False)
+
+print("Saved final CSV to:", out_csv)
+print("\nFinal CSV preview:")
+print(final.to_string(index=False))
+</execute>
+<observation>Step 3/3: write final CSV with required headers (Title, Journal, DOI)
+Saved final CSV to: /root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/cyanoomicsdb_retrieval_2.csv
+
+Final CSV preview:
+                                                                                                                                                                          Title                                        Journal                             DOI
+                               Biodeterioration of built heritage in the context of climate change and atmospheric pollution: Toward transdisciplinary conservation strategies.           The Science of the total environment 10.1016/j.scitotenv.2025.181313
+                                                                                                                                                                Cyanobacterium- Biotechnology reports (Amsterdam, Netherlands)      10.1016/j.btre.2025.e00943
+Coupled organic matter degradation and dynamic extracellular polysaccharide turnover by an alkaline microalgae-cyanobacteria consortium treating maize lime cooking wastewater.            Journal of environmental management   10.1016/j.jenvman.2025.128402
+                                            Toxicological evaluation of entricitabine and tenofovir disoproxyl fumarate, isolated and mixture, in cyanobacteria and microalgae.           The Science of the total environment 10.1016/j.scitotenv.2025.181152
+      Remedial effects of extracellular polymeric substances (EPS) from Arthrospira platensis against Di-n-butyl phthalate (DBP) toxicity on gilthead seabream (Sparus aurata).                 Research in veterinary science      10.1016/j.rvsc.2025.106041
+</observation>
+<solution>
+The CSV file has been created and saved to:
+
+`/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/cyanoomicsdb_retrieval_2.csv`
+
+It contains the required columns: Title, Journal, DOI (5 most recent PubMed-indexed papers returned by the cyanobacteria query, published before 2026-01-01).
+</solution>

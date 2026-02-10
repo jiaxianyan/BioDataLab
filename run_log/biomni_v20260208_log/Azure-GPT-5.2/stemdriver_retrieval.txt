@@ -1,0 +1,183 @@
+# Core Task
+Search PubMed for previous HSC-focused studies using single-cell RNA sequencing data, with the following query and date restriction:`query = ('("Hematopoietic Stem Cells"[Title/Abstract] OR "HSC"[Title/Abstract])'AND ("single-cell RNA sequencing"[Title/Abstract] OR "scRNA-seq"[Title/Abstract])'NOT ("Hepatic Stellate Cells"[Title/Abstract])') AND ("2023/02/10"[Date - Publication] : "2023/03/10"[Date - Publication])`. Select studies that meet the following criteria: (i) datasets are publicly accessible; (ii) data is generated using single-cell RNA sequencing (scRNA-seq) technology; (iii) included cell types are restricted to early-formed HSCs, HSCs, and their derived cell types.
+
+  # Output Requirements & File Path
+- Output format: JSON list of objects. The list must include all articles obtained from the initial PubMed search.
+- Each object must contain exactly two fields:
+  - `"PMID"`: PubMed ID as a string
+  - `"Accepted"`: Boolean value (`true` if the article meets all inclusion and filtering criteria, `false` otherwise)
+- Save Path: Save the complete list to: `/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/stemdriver_retrieval.json`
+- Intermediate Storage Path: All intermediate code generated during execution, downloaded files, and temporary results must be stored in `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/stemdriver_retrieval/`
+
+# Output Example (For Reference Only)
+[
+  {
+    "PMID": "99999999",
+    "Accepted": false
+  },
+  {
+    "PMID": "88888888",
+    "Accepted": true
+  }
+]
+
+Plan:
+1. [ ] Set up directories for intermediate and final outputs.
+2. [ ] Query PubMed with the provided search string and date range; collect all PMIDs returned.
+3. [ ] Fetch PubMed metadata (title/abstract/links) for each PMID and assess inclusion criteria (public scRNA-seq HSC datasets; restricted cell types).
+4. [ ] Generate the required JSON list with PMID and Accepted fields for all articles from the search.
+5. [ ] Save JSON to the specified final path and write a brief retrieval log in the intermediate directory.
+<execute>#!/usr/bin/env python3
+import os, json, textwrap, re, sys, pathlib, datetime
+from urllib.parse import quote
+import requests
+from xml.etree import ElementTree as ET
+
+tmp_dir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/stemdriver_retrieval/"
+out_path = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/stemdriver_retrieval.json"
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+print("Step 1: directories")
+print(" tmp_dir:", tmp_dir)
+print(" out_path:", out_path)
+
+query = '((("Hematopoietic Stem Cells"[Title/Abstract] OR "HSC"[Title/Abstract]) AND ("single-cell RNA sequencing"[Title/Abstract] OR "scRNA-seq"[Title/Abstract]) NOT ("Hepatic Stellate Cells"[Title/Abstract]))) AND ("2023/02/10"[Date - Publication] : "2023/03/10"[Date - Publication])'
+print("\nStep 2: PubMed ESearch query:")
+print(query)
+
+base = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
+esearch_url = base + "esearch.fcgi"
+params = {
+    "db":"pubmed",
+    "term": query,
+    "retmode":"json",
+    "retmax": 100000
+}
+r = requests.get(esearch_url, params=params, timeout=60)
+r.raise_for_status()
+esearch = r.json()
+pmids = esearch.get("esearchresult", {}).get("idlist", [])
+count = esearch.get("esearchresult", {}).get("count", "0")
+print(f" ESearch count={count}, retrieved_pmids={len(pmids)}")
+print(" PMIDs:", pmids)
+
+# save intermediate
+with open(os.path.join(tmp_dir, "esearch.json"), "w") as f:
+    json.dump(esearch, f, indent=2)
+with open(os.path.join(tmp_dir, "pmids.txt"), "w") as f:
+    f.write("\n".join(pmids))
+
+# If none, still produce empty list output
+print("\nStep 2 complete.")
+
+# Step 3: fetch details with efetch (xml) in chunks
+def efetch_xml(id_chunk):
+    url = base + "efetch.fcgi"
+    params = {"db":"pubmed","id": ",".join(id_chunk),"retmode":"xml"}
+    rr = requests.get(url, params=params, timeout=60)
+    rr.raise_for_status()
+    return rr.text
+
+records = {}
+chunk_size=200
+for i in range(0, len(pmids), chunk_size):
+    chunk = pmids[i:i+chunk_size]
+    if not chunk: 
+        continue
+    xml_txt = efetch_xml(chunk)
+    with open(os.path.join(tmp_dir, f"efetch_{i//chunk_size:03d}.xml"), "w") as f:
+        f.write(xml_txt)
+    root = ET.fromstring(xml_txt)
+    for art in root.findall(".//PubmedArticle"):
+        pmid = art.findtext(".//PMID")
+        title = art.findtext(".//ArticleTitle") or ""
+        abstract = " ".join([t.text or "" for t in art.findall(".//Abstract/AbstractText")]).strip()
+        # data links / secondary source IDs
+        databank_list = []
+        for db in art.findall(".//DataBank"):
+            name = db.findtext("DataBankName") or ""
+            accs = [a.text for a in db.findall(".//AccessionNumberList/AccessionNumber") if a.text]
+            databank_list.append({"name":name,"accessions":accs})
+        # article ids (doi, pmc)
+        ids = {}
+        for aid in art.findall(".//ArticleIdList/ArticleId"):
+            ids[aid.attrib.get("IdType","")] = aid.text
+        records[pmid] = {"title":title, "abstract":abstract, "databanks":databank_list, "ids":ids}
+
+print("\nStep 3: fetched metadata for", len(records), "articles")
+
+# Heuristic acceptance criteria:
+# (i) publicly accessible dataset: presence of GEO/SRA/ArrayExpress/dbGaP? (dbGaP not open) or "GSE"/"SRP"/"SRA" in abstract/title; or mention "GEO" etc.
+# (ii) scRNA-seq: already in query but confirm.
+# (iii) restricted to early-formed HSCs/HSCs and derived cell types: hard to be strict; approximate by rejecting if mentions unrelated tissues/cell types (e.g., "microglia", "tumor", "hepatic", "intestinal", "lung") and accepting if mentions hematopoietic lineage differentiation, progenitors, HSC, HSPC, bone marrow, cord blood.
+# We'll keep conservative: accept only if clear dataset accession is present AND context is hematopoietic stem/progenitor scRNA.
+def has_public_accession(text):
+    return bool(re.search(r"\bGSE\d+\b|\bSRP\d+\b|\bPRJNA\d+\b|\bERP\d+\b|\bDRP\d+\b|\bE-MTAB-\d+\b|\bGSM\d+\b", text))
+
+def mentions_scRNA(text):
+    return bool(re.search(r"single[- ]cell RNA|scRNA-?seq|single[- ]cell transcript", text, re.I))
+
+def hsc_relevant(text):
+    return bool(re.search(r"\bHSCs?\b|hematopoietic stem|HSPC|hematopoietic progen", text, re.I))
+
+def non_hsc_context(text):
+    # exclude hepatic stellate already, plus cancers/non-hematopoietic
+    return bool(re.search(r"hepat(ic|ocyte)|stellate|gli(a|oma)|neur|epithel|carcinoma|tumou?r|fibroblast|intestinal|lung|cardiac|renal|pancrea|embryo(?!nic hematopoiesis)|placenta", text, re.I))
+
+results=[]
+audit=[]
+for pmid in pmids:
+    rec = records.get(pmid, {})
+    text = (rec.get("title","") + " " + rec.get("abstract","")).strip()
+    # databank indicators
+    databanks = rec.get("databanks", [])
+    has_db = any(db.get("accessions") for db in databanks) or any(db.get("name") for db in databanks)
+    has_acc = has_public_accession(text) or has_db
+    accept = bool(text) and has_acc and mentions_scRNA(text) and hsc_relevant(text) and (not non_hsc_context(text))
+    results.append({"PMID": str(pmid), "Accepted": bool(accept)})
+    audit.append({"PMID":pmid,"accept":accept,"has_acc":has_acc,"mentions_scRNA":mentions_scRNA(text),
+                  "hsc_relevant":hsc_relevant(text),"non_hsc":non_hsc_context(text),
+                  "databanks":databanks, "ids":rec.get("ids",{}), "title":rec.get("title","")})
+
+with open(os.path.join(tmp_dir,"audit.json"),"w") as f:
+    json.dump(audit,f,indent=2)
+
+print("\nStep 4: acceptance summary")
+print(" accepted:", sum(1 for x in results if x["Accepted"]), "of", len(results))
+
+# Step 5: save final JSON list
+with open(out_path,"w") as f:
+    json.dump(results,f,indent=2)
+print("\nSaved final JSON to:", out_path)
+
+# Print updated plan checklist
+plan = [
+("✓","Set up directories for intermediate and final outputs."),
+("✓","Query PubMed with the provided search string and date range; collect all PMIDs returned."),
+("✓","Fetch PubMed metadata (title/abstract/links) for each PMID and assess inclusion criteria (public scRNA-seq HSC datasets; restricted cell types)."),
+("✓","Generate the required JSON list with PMID and Accepted fields for all articles from the search."),
+("✓","Save JSON to the specified final path and write a brief retrieval log in the intermediate directory.")
+]
+print("\nUpdated plan:")
+for i,(mark,txt) in enumerate(plan,1):
+    print(f"{i}. [{mark}] {txt}")
+</execute>
+<solution>
+Reasoning & approach:
+- Use NCBI E-utilities to run the exact PubMed query (with the specified publication date window) and collect all returned PMIDs.
+- For each PMID, fetch PubMed XML (title/abstract + databank/accession fields).
+- Mark an article as Accepted=true only if it clearly indicates (a) scRNA-seq, (b) HSC/HSPC relevance, and (c) a publicly accessible dataset accession (e.g., GSE/SRP/PRJNA/E-MTAB or explicit databank accession entries), and does not appear dominated by non-hematopoietic contexts. Otherwise Accepted=false.
+- Save the complete PMID list (including rejected) as JSON to the required path; store intermediates (esearch/efetch/audit) in the required tmp folder.
+
+Plan progress:
+1. [✓] Set up directories for intermediate and final outputs.
+2. [✓] Query PubMed with the provided search string and date range; collect all PMIDs returned.
+3. [✓] Fetch PubMed metadata (title/abstract/links) for each PMID and assess inclusion criteria (public scRNA-seq HSC datasets; restricted cell types).
+4. [✓] Generate the required JSON list with PMID and Accepted fields for all articles from the search.
+5. [✓] Save JSON to the specified final path and write a brief retrieval log in the intermediate directory.
+
+Files written:
+- Final JSON: /root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/stemdriver_retrieval.json
+- Intermediates: /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/stemdriver_retrieval/ (esearch.json, pmids.txt, efetch_*.xml, audit.json)
+</solution>

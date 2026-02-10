@@ -1,0 +1,978 @@
+Extract metadata for each sample in GEO dataset GSE153428 and GSE154769. 
+Identify age, gender, clinical phenotypes, drug from the GEO series and sample information.
+
+Saving the finai results to ``.
+# Output Requirements & File Path
+- Output format: A single JSON list (array) of objects. Use "N/A" for missing values. Each object must contain the following keys:
+  - `"sample"`: The GEO sample accession (e.g., "GSM101684").
+  - `"age"`: The patient's age as a numeric value (Years or Months).
+  - `"gender"`: The patient's sex (e.g., "male", "female").
+  - `"clinical phenotypes"`: The observable characteristics.
+  - `"drug"`: The drug used to treat the patient.
+- Save Path: Save the complete list to: `/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/covid_19_extract.json`
+
+# Output Example (For Reference Only)
+[
+  {
+    "sample": "GSM101684",
+    "age": "24 Years",
+    "gender": "male",
+    "clinical phenotypes": "COVID-19 recovered",
+    "drug": "IFNB"
+  },
+  {
+    "sample": "GSM101685",
+    "age": "48 Months",
+    "gender": "female",
+    "staclinical phenotypesge": "COVID-19 recovered",
+    "drug": "IFNB"
+  },
+  {
+    "sample": "GSM101685",
+    "age": "48 Months",
+    "gender": "female",
+    "staclinical phenotypesge": "COVID-19 recovered",
+    "drug": "N/A"
+  }
+]
+
+# Intermediate Results
+All intermediate files generated should be saved in the directly `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/covid_19_extract`
+
+Task reasoning: need GEO metadata for two GSEs; will use GEOquery in R or parse SOFT. I’ll use R GEOquery to get GSE and GSM metadata, extract characteristics fields, then normalize age/sex/phenotype/drug, save intermediates and final JSON.
+Plan:
+1. [ ] Create output and intermediate directories; download/parse GSE153428 and GSE154769 SOFT/GEO metadata.
+2. [ ] Extract per-sample fields (age, gender, phenotypes, drug) from GSM metadata (characteristics_ch1, source_name, title, description, treatment).
+3. [ ] Normalize values (age units, sex labels) and build unified JSON list with required keys and "N/A" defaults.
+4. [ ] Save intermediate parsed tables and final JSON to specified path; validate JSON structure.
+<execute>#!BASH
+set -euo pipefail
+
+echo "== Step 1: setup directories =="
+OUT_DIR="/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2"
+TMP_DIR="/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/covid_19_extract"
+mkdir -p "$OUT_DIR" "$TMP_DIR"
+ls -la "$TMP_DIR"
+echo "Directories ready."
+
+echo "== Step 1: download/parse GEO metadata with R (GEOquery) =="
+cat > "$TMP_DIR/extract_geo_metadata.R" <<'RSCRIPT'
+suppressPackageStartupMessages({
+  library(GEOquery)
+  library(jsonlite)
+  library(dplyr)
+  library(stringr)
+  library(tibble)
+})
+
+tmp_dir <- Sys.getenv("TMP_DIR")
+if (tmp_dir == "") tmp_dir <- "."
+
+gse_ids <- c("GSE153428", "GSE154769")
+
+extract_from_gsm <- function(gsm) {
+  meta <- Meta(gsm)
+  # candidate fields
+  ch1 <- meta$characteristics_ch1
+  if (is.null(ch1)) ch1 <- character(0)
+  ch1_lower <- tolower(ch1)
+
+  get_kv <- function(keys) {
+    # find "key: value" in characteristics
+    for (k in keys) {
+      idx <- which(str_detect(ch1_lower, paste0("^", k, "\\s*:")))
+      if (length(idx) > 0) {
+        val <- str_replace(ch1[idx[1]], paste0("(?i)^", k, "\\s*:\\s*"), "")
+        val <- str_trim(val)
+        if (val != "") return(val)
+      }
+    }
+    return(NA_character_)
+  }
+
+  # age: look for explicit age keys, else search any line containing 'age'
+  age_val <- get_kv(c("age", "age\\(years\\)", "age\\(months\\)", "age\\s*\\(y\\)", "age\\s*\\(m\\)"))
+  if (is.na(age_val)) {
+    idx <- which(str_detect(ch1_lower, "age"))
+    if (length(idx) > 0) {
+      # take first line, attempt to strip label
+      age_val <- str_trim(str_replace(ch1[idx[1]], "(?i).*age\\s*[:=]\\s*", ""))
+      if (age_val == ch1[idx[1]]) {
+        # maybe like "age 45"
+        age_val <- str_trim(str_replace(ch1[idx[1]], "(?i).*age\\s*", ""))
+      }
+    }
+  }
+
+  sex_val <- get_kv(c("sex", "gender"))
+  if (is.na(sex_val)) {
+    # sometimes in meta$sex
+    if (!is.null(meta$sex)) sex_val <- meta$sex
+  }
+  if (!is.na(sex_val)) {
+    s <- tolower(sex_val)
+    if (s %in% c("m","male")) sex_val <- "male"
+    else if (s %in% c("f","female")) sex_val <- "female"
+    else sex_val <- sex_val
+  }
+
+  drug_val <- get_kv(c("drug", "treatment", "treat", "medication", "therapy"))
+  # also check fields in meta
+  if (is.na(drug_val)) {
+    cand <- c(meta$protocol_ch1, meta$growth_protocol_ch1, meta$treatment_protocol_ch1)
+    cand <- cand[!is.null(cand)]
+    if (length(cand) > 0) {
+      txt <- tolower(paste(cand, collapse=" | "))
+      # heuristic: extract common drug keywords if present
+      # keep as NA unless explicit in characteristics
+      drug_val <- NA_character_
+    }
+  }
+
+  # clinical phenotype: try disease/status keys; else use source_name/title/characteristics joined
+  pheno_val <- get_kv(c("disease", "disease status", "status", "phenotype", "clinical", "diagnosis", "group"))
+  if (is.na(pheno_val)) {
+    # look for covid/severity in characteristics
+    # remove obvious non-phenotype keys (age/sex/drug)
+    ph <- ch1[!str_detect(ch1_lower, "^(age|sex|gender|drug|treatment|therapy|medication)\\s*:")]
+    ph <- str_trim(ph)
+    ph <- ph[ph != ""]
+    if (length(ph) > 0) pheno_val <- paste(ph, collapse="; ")
+  }
+  if (is.na(pheno_val)) {
+    pieces <- c(meta$source_name_ch1, meta$title, meta$description)
+    pieces <- pieces[!is.null(pieces)]
+    pieces <- pieces[pieces != ""]
+    if (length(pieces) > 0) pheno_val <- paste(unique(pieces), collapse="; ")
+  }
+
+  # normalize age: if numeric only, add Years unknown? keep as given; requirement numeric value (Years or Months)
+  age_out <- "N/A"
+  if (!is.na(age_val) && age_val != "") {
+    av <- str_trim(age_val)
+    # standardize units
+    if (str_detect(tolower(av), "month")) {
+      num <- str_extract(av, "[0-9]+\\.?[0-9]*")
+      if (!is.na(num)) age_out <- paste0(num, " Months") else age_out <- av
+    } else if (str_detect(tolower(av), "year|yr|y\\b")) {
+      num <- str_extract(av, "[0-9]+\\.?[0-9]*")
+      if (!is.na(num)) age_out <- paste0(num, " Years") else age_out <- av
+    } else {
+      # if just number, assume Years (common)
+      num <- str_extract(av, "^[0-9]+\\.?[0-9]*$")
+      if (!is.na(num)) age_out <- paste0(num, " Years")
+      else {
+        num2 <- str_extract(av, "[0-9]+\\.?[0-9]*")
+        if (!is.na(num2)) age_out <- paste0(num2, " Years") else age_out <- av
+      }
+    }
+  }
+
+  drug_out <- ifelse(is.na(drug_val) || drug_val=="", "N/A", drug_val)
+  sex_out <- ifelse(is.na(sex_val) || sex_val=="", "N/A", sex_val)
+  pheno_out <- ifelse(is.na(pheno_val) || pheno_val=="", "N/A", pheno_val)
+
+  tibble(
+    sample = meta$geo_accession,
+    age = age_out,
+    gender = sex_out,
+    `clinical phenotypes` = pheno_out,
+    drug = drug_out
+  )
+}
+
+all_rows <- list()
+
+for (gse_id in gse_ids) {
+  message("Processing ", gse_id)
+  gse <- getGEO(gse_id, GSEMatrix = TRUE, getGPL = FALSE)
+  # gse may be list of ExpressionSet(s)
+  if (is.list(gse) && length(gse) > 1) eset <- gse[[1]] else eset <- gse
+  gsm_ids <- sampleNames(eset)
+  # fetch GSM objects (metadata rich)
+  gsms <- getGEO(gsm_ids)
+  rows <- bind_rows(lapply(gsms, extract_from_gsm))
+  rows$gse <- gse_id
+  write.csv(rows, file=file.path(tmp_dir, paste0(gse_id, "_sample_metadata.csv")), row.names=FALSE)
+  all_rows[[gse_id]] <- rows
+}
+
+final <- bind_rows(all_rows) %>%
+  select(sample, age, gender, `clinical phenotypes`, drug)
+
+# Save JSON array of objects
+json_out <- toJSON(final, pretty=TRUE, auto_unbox=TRUE)
+writeLines(json_out, con=file.path(tmp_dir, "combined_metadata.json"))
+RSCRIPT
+
+TMP_DIR="$TMP_DIR" Rscript "$TMP_DIR/extract_geo_metadata.R"
+
+echo "Step 1 outputs:"
+ls -ლა "$TMP_DIR" | sed -n '1,120p'
+</execute>
+<observation>Error running Bash script (exit code 1):
+Error in library(GEOquery) : there is no package called ‘GEOquery’
+Calls: suppressPackageStartupMessages -> withCallingHandlers -> library
+Execution halted
+</observation>
+Task reasoning: GEOquery isn’t available, so I’ll switch to downloading GEO SOFT family files (or XML) via HTTPS and parse them in Python to extract GSM-level metadata. Then I’ll normalize age/sex/phenotype/drug and write the required JSON.  
+
+Plan:
+1. [ ] Create output & intermediate directories; download SOFT family files for GSE153428 and GSE154769 into tmp.
+2. [ ] Parse SOFT to extract per-GSM fields (characteristics/source/title/description/treatment) and derive age, gender, clinical phenotypes, drug.
+3. [ ] Normalize values and compile unified JSON list with required keys; fill missing with "N/A".
+4. [ ] Save intermediate parsed tables and final JSON to the required path; validate JSON.
+
+Updated plan after failure:
+1. [✗] Use GEOquery in R to fetch metadata (failed because GEOquery is not installed in this environment).
+2. [ ] Create output & intermediate directories; download SOFT family files for GSE153428 and GSE154769 into tmp.
+3. [ ] Parse SOFT to extract per-GSM fields and derive age/gender/phenotypes/drug.
+4. [ ] Normalize + export final JSON to required path; save intermediates.
+
+<execute>#!BASH
+set -euo pipefail
+
+echo "== Step 2: setup directories =="
+OUT_JSON="/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/covid_19_extract.json"
+TMP_DIR="/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/covid_19_extract"
+mkdir -p "$(dirname "$OUT_JSON")" "$TMP_DIR"
+echo "TMP_DIR=$TMP_DIR"
+echo "OUT_JSON=$OUT_JSON"
+
+echo "== Step 2: download GEO SOFT family files (GSE) =="
+# Prefer NCBI GEO "soft" endpoint. Use gzip if available.
+download_soft () {
+  local gse="$1"
+  local out_gz="$TMP_DIR/${gse}_family.soft.gz"
+  local out_soft="$TMP_DIR/${gse}_family.soft"
+  local url_gz="https://ftp.ncbi.nlm.nih.gov/geo/series/${gse:0:6}nnn/${gse}/soft/${gse}_family.soft.gz"
+  local url_soft="https://ftp.ncbi.nlm.nih.gov/geo/series/${gse:0:6}nnn/${gse}/soft/${gse}_family.soft"
+
+  echo "-- Downloading $gse"
+  if curl -fsSL "$url_gz" -o "$out_gz"; then
+    echo "Downloaded: $out_gz"
+    gzip -dc "$out_gz" > "$out_soft"
+    echo "Decompressed to: $out_soft"
+  else
+    echo "GZ download failed, trying plain SOFT..."
+    curl -fsSL "$url_soft" -o "$out_soft"
+    echo "Downloaded: $out_soft"
+  fi
+  echo "Size: $(wc -c < "$out_soft") bytes"
+}
+
+download_soft "GSE153428"
+download_soft "GSE154769"
+
+echo "== Step 3: parse SOFT in Python and extract metadata =="
+python - <<'PY'
+import os, re, json, csv
+from pathlib import Path
+
+TMP_DIR = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/covid_19_extract")
+OUT_JSON = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/covid_19_extract.json")
+
+gse_files = {
+    "GSE153428": TMP_DIR/"GSE153428_family.soft",
+    "GSE154769": TMP_DIR/"GSE154769_family.soft",
+}
+
+def norm_sex(s):
+    if not s: return "N/A"
+    t = s.strip().lower()
+    if t in {"m","male"}: return "male"
+    if t in {"f","female"}: return "female"
+    return s.strip()
+
+def norm_age(raw):
+    if not raw: return "N/A"
+    s = raw.strip()
+    low = s.lower()
+    num = re.findall(r"\d+(?:\.\d+)?", s)
+    num = num[0] if num else None
+    if "month" in low:
+        return f"{num} Months" if num else s
+    if "year" in low or re.search(r"\byr\b", low) or re.search(r"\by\b", low):
+        return f"{num} Years" if num else s
+    # if just a number, assume years
+    if re.fullmatch(r"\d+(?:\.\d+)?", s):
+        return f"{s} Years"
+    # if contains a number but no unit, assume years
+    if num:
+        return f"{num} Years"
+    return s
+
+def pick_kv(characteristics, keys):
+    # characteristics are strings like "age: 45"
+    for line in characteristics:
+        l = line.strip()
+        ll = l.lower()
+        for k in keys:
+            if re.match(rf"^{k}\s*:", ll):
+                return re.sub(rf"(?i)^{k}\s*:\s*", "", l).strip()
+    return None
+
+def derive_fields(meta):
+    ch = meta.get("characteristics", [])
+    # age
+    age_raw = pick_kv(ch, ["age", "age\\(years\\)", "age\\(months\\)", "age\\s*\\(y\\)", "age\\s*\\(m\\)"])
+    if not age_raw:
+        for line in ch:
+            if "age" in line.lower():
+                # try common patterns
+                m = re.search(r"(?i)age\s*[:=]\s*(.+)$", line)
+                age_raw = (m.group(1).strip() if m else None) or age_raw
+                if age_raw: break
+    age = norm_age(age_raw)
+
+    # gender/sex
+    sex_raw = pick_kv(ch, ["sex", "gender"]) or meta.get("sex")
+    gender = norm_sex(sex_raw) if sex_raw else "N/A"
+
+    # drug/treatment
+    drug_raw = pick_kv(ch, ["drug", "treatment", "therapy", "medication"])
+    drug = drug_raw.strip() if drug_raw else "N/A"
+
+    # clinical phenotype
+    pheno_raw = pick_kv(ch, ["disease", "disease status", "status", "diagnosis", "phenotype", "group"])
+    if not pheno_raw:
+        # join remaining characteristics excluding obvious keys
+        keep = []
+        for line in ch:
+            if re.match(r"(?i)^\s*(age|sex|gender|drug|treatment|therapy|medication)\s*:", line):
+                continue
+            keep.append(line.strip())
+        pheno_raw = "; ".join([k for k in keep if k]) if keep else None
+    if not pheno_raw:
+        # fall back to title/source/description
+        parts = [meta.get("title"), meta.get("source_name"), meta.get("description")]
+        parts = [p.strip() for p in parts if p and p.strip()]
+        pheno_raw = "; ".join(dict.fromkeys(parts)) if parts else None
+    clinical = pheno_raw if pheno_raw else "N/A"
+
+    return {
+        "age": age,
+        "gender": gender,
+        "clinical phenotypes": clinical,
+        "drug": drug
+    }
+
+def parse_soft(path):
+    # Minimal SOFT parser to GSM sections
+    samples = []
+    current = None
+    in_gsm = False
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if line.startswith("^SAMPLE = "):
+                # flush previous
+                if current:
+                    samples.append(current)
+                gsm = line.split("=",1)[1].strip()
+                current = {"sample": gsm, "characteristics": []}
+                in_gsm = True
+                continue
+            if in_gsm and line.startswith("^"):
+                # another section begins; if not sample, end gsm capture
+                if not line.startswith("^SAMPLE"):
+                    in_gsm = False
+                continue
+            if not current:
+                continue
+            if line.startswith("!Sample_title = "):
+                current["title"] = line.split("=",1)[1].strip()
+            elif line.startswith("!Sample_source_name_ch1 = "):
+                current["source_name"] = line.split("=",1)[1].strip()
+            elif line.startswith("!Sample_description = "):
+                current.setdefault("description_list", []).append(line.split("=",1)[1].strip())
+            elif line.startswith("!Sample_characteristics_ch1 = "):
+                current["characteristics"].append(line.split("=",1)[1].strip())
+            elif line.startswith("!Sample_sex = "):
+                current["sex"] = line.split("=",1)[1].strip()
+            elif line.startswith("!Sample_treatment_protocol_ch1 = "):
+                current.setdefault("treatment_protocol", []).append(line.split("=",1)[1].strip())
+
+    if current:
+        samples.append(current)
+
+    # finalize description
+    for s in samples:
+        if "description_list" in s:
+            s["description"] = "; ".join([x for x in s["description_list"] if x])
+        else:
+            s["description"] = None
+    return samples
+
+all_out = []
+intermediate_rows = []
+
+for gse, fpath in gse_files.items():
+    if not fpath.exists():
+        raise FileNotFoundError(f"Missing SOFT file: {fpath}")
+    samples = parse_soft(fpath)
+    for s in samples:
+        derived = derive_fields(s)
+        obj = {
+            "sample": s["sample"],
+            "age": derived["age"],
+            "gender": derived["gender"],
+            "clinical phenotypes": derived["clinical phenotypes"],
+            "drug": derived["drug"],
+        }
+        all_out.append(obj)
+        intermediate_rows.append({
+            "gse": gse,
+            "sample": s["sample"],
+            "title": s.get("title",""),
+            "source_name": s.get("source_name",""),
+            "description": s.get("description",""),
+            "characteristics": " | ".join(s.get("characteristics",[])),
+            "age": obj["age"],
+            "gender": obj["gender"],
+            "clinical_phenotypes": obj["clinical phenotypes"],
+            "drug": obj["drug"],
+        })
+
+# Save intermediate TSV/CSV
+csv_path = TMP_DIR/"parsed_samples_metadata.csv"
+with open(csv_path, "w", newline="", encoding="utf-8") as w:
+    writer = csv.DictWriter(w, fieldnames=list(intermediate_rows[0].keys()))
+    writer.writeheader()
+    writer.writerows(intermediate_rows)
+
+# Save final JSON
+OUT_JSON.parent.mkdir(parents=True, exist_ok=True)
+with open(OUT_JSON, "w", encoding="utf-8") as w:
+    json.dump(all_out, w, indent=2, ensure_ascii=False)
+
+print("Parsed samples total:", len(all_out))
+print("Intermediate CSV:", str(csv_path))
+print("Final JSON:", str(OUT_JSON))
+# basic validation
+assert isinstance(all_out, list) and all(isinstance(x, dict) for x in all_out)
+req = {"sample","age","gender","clinical phenotypes","drug"}
+assert all(req.issubset(x.keys()) for x in all_out)
+print("Validation: OK")
+PY
+
+echo "== Files in TMP_DIR (head) =="
+ls -la "$TMP_DIR" | sed -n '1,120p'
+
+echo "== Preview final JSON (first 40 lines) =="
+sed -n '1,40p' "$OUT_JSON"
+</execute>
+<observation>ERROR: Code execution timed out after 150 seconds. Please try with simpler inputs or break your task into smaller steps.</observation>
+Task reasoning: the timeout likely happened during SOFT downloads (large) or full-file parsing in one go. I’ll split: (1) download with progress + retry and verify sizes, (2) parse in a streaming way but only GSM blocks, and (3) write outputs.  
+
+Plan:
+1. [ ] Create output & intermediate directories; download SOFT family files for GSE153428 and GSE154769 into tmp with retries and size checks.
+2. [ ] Parse SOFT files in Python (streaming GSM blocks) to extract raw fields; save intermediate CSV.
+3. [ ] Derive/normalize age, gender, clinical phenotypes, drug; write final JSON to required path.
+4. [ ] Validate JSON and report counts.
+
+Updated plan after failure:
+1. [✗] One-shot download+parse in a single run (failed due to execution timeout).
+2. [ ] Create output & intermediate directories; download SOFT files with retries and size checks.
+3. [ ] Parse SOFT streaming; save intermediate CSV.
+4. [ ] Normalize + write final JSON; validate.
+
+<execute>#!BASH
+set -euo pipefail
+
+echo "== Step 2: setup directories =="
+OUT_JSON="/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/covid_19_extract.json"
+TMP_DIR="/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/covid_19_extract"
+mkdir -p "$(dirname "$OUT_JSON")" "$TMP_DIR"
+echo "TMP_DIR=$TMP_DIR"
+echo "OUT_JSON=$OUT_JSON"
+
+echo "== Step 2: download SOFT files with retries (separate) =="
+download_soft () {
+  local gse="$1"
+  local out_gz="$TMP_DIR/${gse}_family.soft.gz"
+  local out_soft="$TMP_DIR/${gse}_family.soft"
+  local url_gz="https://ftp.ncbi.nlm.nih.gov/geo/series/${gse:0:6}nnn/${gse}/soft/${gse}_family.soft.gz"
+
+  echo "-- Downloading $gse from $url_gz"
+  # retry a few times; keep it quiet to reduce overhead
+  curl -fL --retry 5 --retry-delay 2 --connect-timeout 20 --max-time 120 -o "$out_gz" "$url_gz"
+  echo "Downloaded: $out_gz ($(wc -c < "$out_gz") bytes)"
+  echo "Decompressing..."
+  gzip -dc "$out_gz" > "$out_soft"
+  echo "Decompressed: $out_soft ($(wc -c < "$out_soft") bytes)"
+}
+
+# Download one by one to avoid long single job
+download_soft "GSE153428"
+download_soft "GSE154769"
+
+echo "== Step 2 completed =="
+ls -lah "$TMP_DIR" | sed -n '1,120p'
+
+echo "Updated plan:"
+cat <<'PLAN'
+1. [✗] One-shot download+parse in a single run (failed due to execution timeout).
+2. [✓] Create output & intermediate directories; download SOFT files with retries and size checks.
+3. [ ] Parse SOFT streaming; save intermediate CSV.
+4. [ ] Normalize + write final JSON; validate.
+PLAN
+</execute>
+<observation>ERROR: Code execution timed out after 150 seconds. Please try with simpler inputs or break your task into smaller steps.</observation>
+Task reasoning: downloads are timing out within the 150s cap. I’ll avoid large SOFT downloads by querying per-sample GEO metadata via NCBI E-utilities: (1) get GSM IDs from each GSE using esearch/esummary, then (2) fetch GSM records in batches using efetch (XML) and parse characteristics. This is much lighter and should fit time.  
+
+Plan:
+1. [ ] Create output & intermediate directories.
+2. [ ] Use NCBI E-utilities to retrieve GSM accessions for GSE153428 and GSE154769; save intermediate lists.
+3. [ ] Fetch GSM XML metadata in batches; parse age, gender, clinical phenotypes, drug; save intermediate CSV.
+4. [ ] Normalize + write final JSON to required path; validate.
+
+Updated plan after failure:
+1. [✗] Download SOFT family files from FTP (failed due to execution timeout).
+2. [ ] Create output & intermediate directories.
+3. [ ] Retrieve GSM accessions via E-utilities.
+4. [ ] Fetch GSM XML in batches, parse/normalize, and write final JSON; validate.
+
+<execute>#!BASH
+set -euo pipefail
+
+echo "== Step 1: setup directories =="
+OUT_JSON="/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/covid_19_extract.json"
+TMP_DIR="/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/covid_19_extract"
+mkdir -p "$(dirname "$OUT_JSON")" "$TMP_DIR"
+echo "TMP_DIR=$TMP_DIR"
+echo "OUT_JSON=$OUT_JSON"
+
+echo "== Step 2: get GSM accessions for each GSE via NCBI E-utilities =="
+python - <<'PY'
+import os, time, json, re
+from pathlib import Path
+import urllib.parse, urllib.request
+import xml.etree.ElementTree as ET
+
+TMP_DIR = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/covid_19_extract")
+gse_ids = ["GSE153428","GSE154769"]
+
+def http_get(url, timeout=30):
+    req = urllib.request.Request(url, headers={"User-Agent":"biodatalab-metadata-extractor/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+def esearch_gds(term):
+    # GEO DataSets (gds) includes GSE
+    params = {
+        "db":"gds",
+        "term":term,
+        "retmode":"xml",
+        "retmax":"20"
+    }
+    url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?" + urllib.parse.urlencode(params)
+    xml = http_get(url)
+    root = ET.fromstring(xml)
+    ids = [e.text for e in root.findall(".//IdList/Id")]
+    return ids
+
+def elink_gds_to_gsm(gds_id):
+    params = {
+        "dbfrom":"gds",
+        "db":"geo",
+        "id":gds_id,
+        "linkname":"gds_geo",
+        "retmode":"xml",
+    }
+    url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/elink.fcgi?" + urllib.parse.urlencode(params)
+    xml = http_get(url)
+    root = ET.fromstring(xml)
+    geo_ids = [e.text for e in root.findall(".//LinkSetDb/Link/Id")]
+    return geo_ids
+
+def esummary_geo(ids):
+    params = {
+        "db":"geo",
+        "id":",".join(ids),
+        "retmode":"xml"
+    }
+    url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi?" + urllib.parse.urlencode(params)
+    xml = http_get(url)
+    root = ET.fromstring(xml)
+    docs = []
+    for doc in root.findall(".//DocSum"):
+        d = {"Id": doc.findtext("Id")}
+        for item in doc.findall("Item"):
+            if item.get("Name") in ("Accession","GSE","GSM","title","summary","GPL"):
+                d[item.get("Name")] = item.text
+        # also grab all items into dict for debugging
+        docs.append(d)
+    return docs
+
+def gsm_ids_for_gse(gse):
+    # Find GSE in gds, then link to geo, then filter accessions starting with GSM
+    gds_ids = esearch_gds(gse + "[GEO Accession]")
+    if not gds_ids:
+        # fallback: plain term
+        gds_ids = esearch_gds(gse)
+    geo_ids = []
+    for gid in gds_ids[:3]:
+        geo_ids.extend(elink_gds_to_gsm(gid))
+        time.sleep(0.34)
+    geo_ids = list(dict.fromkeys(geo_ids))
+    # summarize in chunks to find GSM accessions
+    gsm = []
+    for i in range(0, len(geo_ids), 200):
+        chunk = geo_ids[i:i+200]
+        docs = esummary_geo(chunk)
+        for d in docs:
+            acc = d.get("Accession","")
+            if acc.startswith("GSM"):
+                gsm.append(acc)
+        time.sleep(0.34)
+    gsm = sorted(set(gsm))
+    return gsm
+
+out = {}
+for gse in gse_ids:
+    print("Fetching GSM list for", gse)
+    gsm = gsm_ids_for_gse(gse)
+    print(gse, "GSM count:", len(gsm))
+    out[gse] = gsm
+    (TMP_DIR/f"{gse}_gsm_list.json").write_text(json.dumps(gsm, indent=2))
+print("Saved GSM lists to", str(TMP_DIR))
+PY
+
+echo "== GSM list files =="
+ls -la "$TMP_DIR" | grep gsm_list || true
+
+echo "Updated plan:"
+cat <<'PLAN'
+1. [✗] Download SOFT family files from FTP (failed due to execution timeout).
+2. [✓] Create output & intermediate directories.
+3. [✓] Retrieve GSM accessions via E-utilities.
+4. [ ] Fetch GSM XML in batches, parse/normalize, and write final JSON; validate.
+PLAN
+</execute>
+<observation>== Step 1: setup directories ==
+TMP_DIR=/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/covid_19_extract
+OUT_JSON=/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/covid_19_extract.json
+== Step 2: get GSM accessions for each GSE via NCBI E-utilities ==
+Fetching GSM list for GSE153428
+GSE153428 GSM count: 0
+Fetching GSM list for GSE154769
+GSE154769 GSM count: 0
+Saved GSM lists to /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/covid_19_extract
+== GSM list files ==
+-rw-r--r--  1 root root       2 Feb  8 21:42 GSE153428_gsm_list.json
+-rw-r--r--  1 root root       2 Feb  8 21:42 GSE154769_gsm_list.json
+Updated plan:
+1. [✗] Download SOFT family files from FTP (failed due to execution timeout).
+2. [✓] Create output & intermediate directories.
+3. [✓] Retrieve GSM accessions via E-utilities.
+4. [ ] Fetch GSM XML in batches, parse/normalize, and write final JSON; validate.
+</observation>
+Task reasoning: E-utilities approach via gds→geo didn’t return GSMs (likely wrong linkname/db). I’ll instead query GEO directly via NCBI Datasets CLI if present, or use GEO web “GSE soft view” HTML to extract GSM accessions (much smaller than SOFT) and then fetch per-GSM MINiML XML via GEO’s lightweight endpoint.  
+
+Plan:
+1. [ ] Check available tools/endpoints; choose fastest GSM discovery method (datasets-cli, GEO HTML, or esearch in geo db).
+2. [ ] Retrieve GSM accessions for GSE153428 and GSE154769; save intermediate lists.
+3. [ ] Fetch GSM MINiML XML (or text) in batches; parse age, gender, clinical phenotypes, drug; save intermediate CSV.
+4. [ ] Normalize + write final JSON to required path; validate.
+
+Updated plan after issue:
+1. [✗] Retrieve GSM accessions via E-utilities gds→geo link (returned 0 GSM; approach/linking incorrect for these accessions).
+2. [ ] Re-attempt GSM discovery using GEO web HTML (GSE page) and/or direct GEO “acc” queries.
+3. [ ] Fetch GSM MINiML and parse fields.
+4. [ ] Write final JSON and validate.
+
+<execute>#!BASH
+set -euo pipefail
+
+echo "== Step 1: check for ncbi-datasets-cli =="
+command -v datasets >/dev/null 2>&1 && echo "datasets CLI found: $(command -v datasets)" || echo "datasets CLI NOT found"
+
+echo "== Step 2: try discover GSMs from GEO web (SOFT view HTML, small) =="
+TMP_DIR="/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/covid_19_extract"
+mkdir -p "$TMP_DIR"
+
+python - <<'PY'
+import re, json, urllib.request
+from pathlib import Path
+
+TMP_DIR = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/covid_19_extract")
+
+def fetch(url, timeout=30):
+    req = urllib.request.Request(url, headers={"User-Agent":"biodatalab-metadata-extractor/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read().decode("utf-8", errors="replace")
+
+def gsm_from_gse_html(gse):
+    # GEO "acc" page includes links to GSMxxxx
+    url = f"https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={gse}&targ=self&form=text&view=quick"
+    txt = fetch(url, timeout=40)
+    gsms = sorted(set(re.findall(r"(GSM\d+)", txt)))
+    return gsms, url, txt[:5000]
+
+for gse in ["GSE153428","GSE154769"]:
+    gsms, url, head = gsm_from_gse_html(gse)
+    print(gse, "URL:", url)
+    print(gse, "GSM count:", len(gsms))
+    (TMP_DIR/f"{gse}_gsm_list.json").write_text(json.dumps(gsms, indent=2))
+    (TMP_DIR/f"{gse}_gse_quickview_head.txt").write_text(head)
+PY
+
+echo "== GSM list sizes =="
+wc -c "$TMP_DIR"/GSE*_gsm_list.json
+
+echo "Updated plan:"
+cat <<'PLAN'
+1. [✗] Retrieve GSM accessions via E-utilities gds→geo link (returned 0 GSM; approach/linking incorrect for these accessions).
+2. [✓] Re-attempt GSM discovery using GEO web HTML quickview.
+3. [ ] Fetch GSM MINiML and parse fields.
+4. [ ] Write final JSON and validate.
+PLAN
+</execute>
+<observation>== Step 1: check for ncbi-datasets-cli ==
+datasets CLI found: /root/miniconda3/envs/biomni_e1/bin/datasets
+== Step 2: try discover GSMs from GEO web (SOFT view HTML, small) ==
+GSE153428 URL: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE153428&targ=self&form=text&view=quick
+GSE153428 GSM count: 12
+GSE154769 URL: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE154769&targ=self&form=text&view=quick
+GSE154769 GSM count: 6
+== GSM list sizes ==
+194 /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/covid_19_extract/GSE153428_gsm_list.json
+ 98 /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/covid_19_extract/GSE154769_gsm_list.json
+292 total
+Updated plan:
+1. [✗] Retrieve GSM accessions via E-utilities gds→geo link (returned 0 GSM; approach/linking incorrect for these accessions).
+2. [✓] Re-attempt GSM discovery using GEO web HTML quickview.
+3. [ ] Fetch GSM MINiML and parse fields.
+4. [ ] Write final JSON and validate.
+</observation>
+<execute>#!BASH
+set -euo pipefail
+
+TMP_DIR="/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/covid_19_extract"
+OUT_JSON="/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/covid_19_extract.json"
+mkdir -p "$(dirname "$OUT_JSON")" "$TMP_DIR"
+
+echo "== Step 3: fetch GSM quickview (text) and parse fields in Python =="
+
+python - <<'PY'
+import json, re, time, urllib.request
+from pathlib import Path
+
+TMP_DIR = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/covid_19_extract")
+OUT_JSON = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/covid_19_extract.json")
+
+gse_to_gsms = {}
+for gse in ["GSE153428","GSE154769"]:
+    gse_to_gsms[gse] = json.loads((TMP_DIR/f"{gse}_gsm_list.json").read_text())
+
+def fetch_text(url, timeout=40):
+    req = urllib.request.Request(url, headers={"User-Agent":"biodatalab-metadata-extractor/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read().decode("utf-8", errors="replace")
+
+def parse_gsm_quickview(gsm_text):
+    # SOFT-like key lines: !Sample_characteristics_ch1 = key: value
+    meta = {"characteristics": []}
+    for line in gsm_text.splitlines():
+        if line.startswith("!Sample_title = "):
+            meta["title"] = line.split("=",1)[1].strip()
+        elif line.startswith("!Sample_source_name_ch1 = "):
+            meta["source_name"] = line.split("=",1)[1].strip()
+        elif line.startswith("!Sample_description = "):
+            meta.setdefault("description_list", []).append(line.split("=",1)[1].strip())
+        elif line.startswith("!Sample_characteristics_ch1 = "):
+            meta["characteristics"].append(line.split("=",1)[1].strip())
+        elif line.startswith("!Sample_treatment_protocol_ch1 = "):
+            meta.setdefault("treatment_protocol", []).append(line.split("=",1)[1].strip())
+        elif line.startswith("!Sample_data_processing = "):
+            meta.setdefault("data_processing", []).append(line.split("=",1)[1].strip())
+    if "description_list" in meta:
+        meta["description"] = "; ".join([x for x in meta["description_list"] if x])
+    else:
+        meta["description"] = ""
+    return meta
+
+def pick_kv(characteristics, keys):
+    for line in characteristics:
+        ll = line.strip().lower()
+        for k in keys:
+            if re.match(rf"^{k}\s*:", ll):
+                return re.sub(rf"(?i)^{k}\s*:\s*", "", line).strip()
+    return None
+
+def norm_sex(s):
+    if not s or not s.strip(): return "N/A"
+    t = s.strip().lower()
+    if t in {"m","male"}: return "male"
+    if t in {"f","female"}: return "female"
+    return s.strip()
+
+def norm_age(raw):
+    if not raw or not raw.strip(): return "N/A"
+    s = raw.strip()
+    low = s.lower()
+    num = re.findall(r"\d+(?:\.\d+)?", s)
+    num = num[0] if num else None
+    if "month" in low:
+        return f"{num} Months" if num else s
+    if "year" in low or re.search(r"\byr\b", low) or re.search(r"\by\b", low):
+        return f"{num} Years" if num else s
+    if re.fullmatch(r"\d+(?:\.\d+)?", s):
+        return f"{s} Years"
+    if num:
+        return f"{num} Years"
+    return s
+
+def derive_required(meta):
+    ch = meta.get("characteristics", [])
+    age_raw = pick_kv(ch, ["age","age\\(years\\)","age\\(months\\)","age\\s*\\(y\\)","age\\s*\\(m\\)"])
+    if not age_raw:
+        for line in ch:
+            if "age" in line.lower():
+                m = re.search(r"(?i)age\s*[:=]\s*(.+)$", line)
+                if m:
+                    age_raw = m.group(1).strip()
+                    break
+    age = norm_age(age_raw)
+
+    sex_raw = pick_kv(ch, ["sex","gender"])
+    gender = norm_sex(sex_raw)
+
+    drug_raw = pick_kv(ch, ["drug","treatment","therapy","medication"])
+    # sometimes embedded in treatment protocol
+    if not drug_raw:
+        tp = " ".join(meta.get("treatment_protocol", []))
+        m = re.search(r"(?i)\b(drug|treated with|treatment)\b[:\s-]*([A-Za-z0-9][A-Za-z0-9 \-/+()]+)", tp)
+        if m:
+            drug_raw = m.group(2).strip()
+    drug = drug_raw if drug_raw and drug_raw.strip() else "N/A"
+
+    pheno_raw = pick_kv(ch, ["disease","disease status","status","diagnosis","phenotype","group","clinical"])
+    if not pheno_raw:
+        keep=[]
+        for line in ch:
+            if re.match(r"(?i)^\s*(age|sex|gender|drug|treatment|therapy|medication)\s*:", line): 
+                continue
+            keep.append(line.strip())
+        pheno_raw = "; ".join([k for k in keep if k]) if keep else None
+    if not pheno_raw:
+        parts = [meta.get("source_name",""), meta.get("title",""), meta.get("description","")]
+        parts = [p.strip() for p in parts if p and p.strip()]
+        pheno_raw = "; ".join(dict.fromkeys(parts)) if parts else None
+    clinical = pheno_raw if pheno_raw and pheno_raw.strip() else "N/A"
+
+    gender = gender if gender!="N/A" else "N/A"
+    return age, gender, clinical, drug
+
+all_objs = []
+intermediate = []
+
+def gsm_quickview_url(gsm):
+    return f"https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={gsm}&targ=self&form=text&view=quick"
+
+for gse, gsms in gse_to_gsms.items():
+    for gsm in gsms:
+        url = gsm_quickview_url(gsm)
+        txt = fetch_text(url)
+        (TMP_DIR/f"{gsm}_quickview.txt").write_text(txt[:200000])  # cap saved size
+        meta = parse_gsm_quickview(txt)
+        age, gender, clinical, drug = derive_required(meta)
+        obj = {
+            "sample": gsm,
+            "age": age,
+            "gender": gender,
+            "clinical phenotypes": clinical,
+            "drug": drug
+        }
+        all_objs.append(obj)
+        intermediate.append({
+            "gse": gse,
+            "sample": gsm,
+            "age": age,
+            "gender": gender,
+            "clinical_phenotypes": clinical,
+            "drug": drug,
+            "characteristics": " | ".join(meta.get("characteristics", [])),
+            "title": meta.get("title",""),
+            "source_name": meta.get("source_name",""),
+        })
+        time.sleep(0.2)
+
+# write intermediate CSV
+import csv
+csv_path = TMP_DIR/"parsed_samples_metadata.csv"
+with open(csv_path, "w", newline="", encoding="utf-8") as w:
+    writer = csv.DictWriter(w, fieldnames=list(intermediate[0].keys()))
+    writer.writeheader()
+    writer.writerows(intermediate)
+
+OUT_JSON.parent.mkdir(parents=True, exist_ok=True)
+OUT_JSON.write_text(json.dumps(all_objs, indent=2, ensure_ascii=False))
+
+print("Samples written:", len(all_objs))
+print("Intermediate CSV:", csv_path)
+print("Final JSON:", OUT_JSON)
+PY
+
+echo "== Validate output file exists and show summary =="
+python - <<'PY'
+import json
+p="/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/covid_19_extract.json"
+data=json.load(open(p))
+print("Total objects:", len(data))
+print("First object:", data[0] if data else None)
+# count missing
+miss = {k:0 for k in ["age","gender","clinical phenotypes","drug"]}
+for o in data:
+    for k in miss:
+        if o.get(k)=="N/A": miss[k]+=1
+print("Missing counts:", miss)
+PY
+
+echo "Updated plan:"
+cat <<'PLAN'
+1. [✗] Retrieve GSM accessions via E-utilities gds→geo link (returned 0 GSM; approach/linking incorrect for these accessions).
+2. [✓] Re-attempt GSM discovery using GEO web HTML quickview.
+3. [✓] Fetch GSM quickview text and parse/normalize; save intermediate CSV.
+4. [✓] Write final JSON and validate.
+PLAN
+</execute>
+<observation>== Step 3: fetch GSM quickview (text) and parse fields in Python ==
+Samples written: 18
+Intermediate CSV: /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/covid_19_extract/parsed_samples_metadata.csv
+Final JSON: /root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/covid_19_extract.json
+== Validate output file exists and show summary ==
+Total objects: 18
+First object: {'sample': 'GSM4644121', 'age': '14 Months', 'gender': 'N/A', 'clinical phenotypes': 'tissue: Nasal airway epithelium; age group: Infant', 'drug': 'N/A'}
+Missing counts: {'age': 0, 'gender': 12, 'clinical phenotypes': 0, 'drug': 18}
+Updated plan:
+1. [✗] Retrieve GSM accessions via E-utilities gds→geo link (returned 0 GSM; approach/linking incorrect for these accessions).
+2. [✓] Re-attempt GSM discovery using GEO web HTML quickview.
+3. [✓] Fetch GSM quickview text and parse/normalize; save intermediate CSV.
+4. [✓] Write final JSON and validate.
+</observation>
+<solution>
+Completed extraction and saved results.
+
+- Final JSON saved to:
+`/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/covid_19_extract.json`
+
+- Intermediate files saved to:
+`/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/covid_19_extract/`
+  - `GSE153428_gsm_list.json`, `GSE154769_gsm_list.json`
+  - per-sample quickview snapshots: `GSM*_quickview.txt`
+  - parsed table: `parsed_samples_metadata.csv`
+
+Extraction summary (18 samples total):
+- age: available for all 18
+- gender: missing for 12 (set to "N/A")
+- clinical phenotypes: available for all 18
+- drug: missing for all 18 (set to "N/A"; no explicit drug/treatment fields found in GSM quickview metadata)
+
+Final plan status:
+1. [✗] Retrieve GSM accessions via E-utilities gds→geo link (returned 0 GSM; approach/linking incorrect for these accessions).
+2. [✓] Re-attempt GSM discovery using GEO web HTML quickview.
+3. [✓] Fetch GSM quickview text and parse/normalize; save intermediate CSV.
+4. [✓] Write final JSON and validate.
+</solution>

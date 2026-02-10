@@ -1,0 +1,1798 @@
+Identify high-quality RNA-seq Runs from three Runs in `benchmark/dataset/MetazExp/toy_srr1`, `benchmark/dataset/MetazExp/toy_srr2`, and `benchmark/dataset/MetazExp/toy_srr3`.
+
+High-quality RNA-seq Runs should meet all of the following criteria: (i) Paired-end sequencing; (ii) Read length ≥ 100 bp; (iii) Uniquely mapped read rate ≥ 50% for the reference genome `benchmark/dataset/MetazExp/ncbi_dataset/data/GCF_001039355.2/GCF_001039355.2_LinAna2.0_genomic.fna`. 
+
+Output the directory nname of high-qualit Runs to `/root/autodl-tmp/biomni_v20260208_pred_results/deepseek-v3.2-fast/metazexp_refinement.json`.
+
+Output Format (Only for Reference):
+[
+  "toy_srr2"
+]
+
+All temp data should be save in `/root/autodl-tmp/biomni_v20260208_tmp/deepseek-v3.2-fast/etazexp_refinemen`.
+
+I'll start by making a plan to solve this task.
+
+**Plan:**
+
+1. [ ] Examine the three toy_srr directories to understand their structure and locate FASTQ files.
+2. [ ] For each run, check if it's paired-end sequencing by examining the number of FASTQ files.
+3. [ ] Determine read length by examining the first few reads from each FASTQ file.
+4. [ ] Align reads to the reference genome using HISAT2 (or Bowtie2) to calculate mapping statistics.
+5. [ ] Calculate uniquely mapped read rate from alignment results.
+6. [ ] Filter runs that meet all three criteria.
+7. [ ] Output the directory names of high-quality runs to the specified JSON file.
+8. [ ] Ensure all temporary data is saved in the specified temporary directory.
+
+Let's start with step 1.
+
+<execute>
+import os
+import json
+import subprocess
+import gzip
+from pathlib import Path
+
+# Define paths
+base_dir = "benchmark/dataset/MetazExp"
+runs = ["toy_srr1", "toy_srr2", "toy_srr3"]
+ref_genome = "benchmark/dataset/MetazExp/ncbi_dataset/data/GCF_001039355.2/GCF_001039355.2_LinAna2.0_genomic.fna"
+output_json = "/root/autodl-tmp/biomni_v20260208_pred_results/deepseek-v3.2-fast/metazexp_refinement.json"
+tmp_dir = "/root/autodl-tmp/biomni_v20260208_tmp/deepseek-v3.2-fast/etazexp_refinemen"
+
+# Create temporary directory if it doesn't exist
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(output_json), exist_ok=True)
+
+# Step 1: Examine directory structure
+print("Examining directory structure...")
+for run in runs:
+    run_path = os.path.join(base_dir, run)
+    if os.path.exists(run_path):
+        print(f"\n{run}:")
+        # List all files
+        for root, dirs, files in os.walk(run_path):
+            for f in files:
+                print(f"  {os.path.join(root, f)}")
+    else:
+        print(f"\n{run}: Directory not found!")
+</execute>
+<observation>Examining directory structure...
+
+toy_srr1:
+  benchmark/dataset/MetazExp/toy_srr1/SRR2131217_1.fastq
+  benchmark/dataset/MetazExp/toy_srr1/SRR2131217_2.fastq
+
+toy_srr2:
+  benchmark/dataset/MetazExp/toy_srr2/SRR2131222_1.fastq
+  benchmark/dataset/MetazExp/toy_srr2/SRR2131222_2.fastq
+
+toy_srr3:
+  benchmark/dataset/MetazExp/toy_srr3/SRR2131244_1.fastq
+  benchmark/dataset/MetazExp/toy_srr3/SRR2131244_2.fastq
+</observation>
+Good! All three runs have two FASTQ files each (with `_1.fastq` and `_2.fastq` suffixes), indicating they are paired-end. Let's update the plan and proceed to step 2 and 3: check read length.
+
+1. [✓] Examine the three toy_srr directories to understand their structure and locate FASTQ files.
+2. [ ] For each run, check if it's paired-end sequencing by examining the number of FASTQ files.
+3. [ ] Determine read length by examining the first few reads from each FASTQ file.
+4. [ ] Align reads to the reference genome using HISAT2 (or Bowtie2) to calculate mapping statistics.
+5. [ ] Calculate uniquely mapped read rate from alignment results.
+6. [ ] Filter runs that meet all three criteria.
+7. [ ] Output the directory names of high-quality runs to the specified JSON file.
+8. [ ] Ensure all temporary data is saved in the specified temporary directory.
+
+Now step 2 is already done (all are paired-end). Let's check read length.
+
+<execute>
+def get_read_length(fastq_file):
+    """Get read length from first few reads of a FASTQ file."""
+    # Check if file is gzipped
+    if fastq_file.endswith('.gz'):
+        opener = gzip.open
+    else:
+        opener = open
+    
+    read_lengths = []
+    try:
+        with opener(fastq_file, 'rt') as f:
+            line_count = 0
+            for line in f:
+                line_count += 1
+                if line_count % 4 == 2:  # Sequence line
+                    read_lengths.append(len(line.strip()))
+                    if len(read_lengths) >= 10:  # Check first 10 reads
+                        break
+    except Exception as e:
+        print(f"Error reading {fastq_file}: {e}")
+        return None
+    
+    if read_lengths:
+        # Check if all reads have same length
+        if len(set(read_lengths)) == 1:
+            return read_lengths[0]
+        else:
+            # Return average length
+            return sum(read_lengths) // len(read_lengths)
+    return None
+
+print("Checking read lengths...")
+run_info = {}
+for run in runs:
+    run_path = os.path.join(base_dir, run)
+    # Find FASTQ files
+    fastq_files = []
+    for f in os.listdir(run_path):
+        if f.endswith('.fastq') or f.endswith('.fastq.gz'):
+            fastq_files.append(os.path.join(run_path, f))
+    
+    # Get read length from first file
+    if fastq_files:
+        length = get_read_length(fastq_files[0])
+        run_info[run] = {
+            'path': run_path,
+            'fastq_files': fastq_files,
+            'read_length': length,
+            'paired_end': len(fastq_files) == 2  # Should be True for all
+        }
+        print(f"{run}: Read length = {length} bp, Paired-end = {len(fastq_files) == 2}")
+    else:
+        print(f"{run}: No FASTQ files found!")
+</execute>
+<observation>NameError("name 'runs' is not defined")</observation>
+I need to re-run with the variable defined. Let me fix that.
+
+<execute>
+import os
+import json
+import subprocess
+import gzip
+from pathlib import Path
+
+# Define paths
+base_dir = "benchmark/dataset/MetazExp"
+runs = ["toy_srr1", "toy_srr2", "toy_srr3"]
+ref_genome = "benchmark/dataset/MetazExp/ncbi_dataset/data/GCF_001039355.2/GCF_001039355.2_LinAna2.0_genomic.fna"
+output_json = "/root/autodl-tmp/biomni_v20260208_pred_results/deepseek-v3.2-fast/metazexp_refinement.json"
+tmp_dir = "/root/autodl-tmp/biomni_v20260208_tmp/deepseek-v3.2-fast/etazexp_refinemen"
+
+# Create temporary directory if it doesn't exist
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(output_json), exist_ok=True)
+
+def get_read_length(fastq_file):
+    """Get read length from first few reads of a FASTQ file."""
+    # Check if file is gzipped
+    if fastq_file.endswith('.gz'):
+        opener = gzip.open
+    else:
+        opener = open
+    
+    read_lengths = []
+    try:
+        with opener(fastq_file, 'rt') as f:
+            line_count = 0
+            for line in f:
+                line_count += 1
+                if line_count % 4 == 2:  # Sequence line
+                    read_lengths.append(len(line.strip()))
+                    if len(read_lengths) >= 10:  # Check first 10 reads
+                        break
+    except Exception as e:
+        print(f"Error reading {fastq_file}: {e}")
+        return None
+    
+    if read_lengths:
+        # Check if all reads have same length
+        if len(set(read_lengths)) == 1:
+            return read_lengths[0]
+        else:
+            # Return average length
+            return sum(read_lengths) // len(read_lengths)
+    return None
+
+print("Checking read lengths...")
+run_info = {}
+for run in runs:
+    run_path = os.path.join(base_dir, run)
+    # Find FASTQ files
+    fastq_files = []
+    for f in os.listdir(run_path):
+        if f.endswith('.fastq') or f.endswith('.fastq.gz'):
+            fastq_files.append(os.path.join(run_path, f))
+    
+    # Get read length from first file
+    if fastq_files:
+        length = get_read_length(fastq_files[0])
+        run_info[run] = {
+            'path': run_path,
+            'fastq_files': fastq_files,
+            'read_length': length,
+            'paired_end': len(fastq_files) == 2  # Should be True for all
+        }
+        print(f"{run}: Read length = {length} bp, Paired-end = {len(fastq_files) == 2}")
+    else:
+        print(f"{run}: No FASTQ files found!")
+</execute>
+<observation>Checking read lengths...
+toy_srr1: Read length = 95 bp, Paired-end = True
+toy_srr2: Read length = 88 bp, Paired-end = True
+toy_srr3: Read length = 111 bp, Paired-end = True
+</observation>
+Now I have read lengths. According to criteria: read length ≥ 100 bp. So:
+- toy_srr1: 95 bp (fails)
+- toy_srr2: 88 bp (fails)  
+- toy_srr3: 111 bp (passes)
+
+But we still need to check mapping rate. Let's update the plan:
+
+1. [✓] Examine the three toy_srr directories to understand their structure and locate FASTQ files.
+2. [✓] For each run, check if it's paired-end sequencing by examining the number of FASTQ files.
+3. [✓] Determine read length by examining the first few reads from each FASTQ file.
+4. [ ] Align reads to the reference genome using HISAT2 (or Bowtie2) to calculate mapping statistics.
+5. [ ] Calculate uniquely mapped read rate from alignment results.
+6. [ ] Filter runs that meet all three criteria.
+7. [ ] Output the directory names of high-quality runs to the specified JSON file.
+8. [ ] Ensure all temporary data is saved in the specified temporary directory.
+
+Now we need to align reads for each run to check mapping rate. However, toy_srr1 and toy_srr2 already fail the read length criterion, but we should still check mapping rate for completeness (or maybe the read length check was only on first 10 reads and might not be accurate). Let's do a more thorough read length check and then proceed with alignment.
+
+First, let me check if the reference genome exists and build index if needed.
+
+<execute>
+# Check if reference genome exists
+print(f"Checking reference genome: {ref_genome}")
+if os.path.exists(ref_genome):
+    print("Reference genome found.")
+else:
+    print("Reference genome not found!")
+    # Try to find it
+    for root, dirs, files in os.walk("benchmark/dataset/MetazExp"):
+        for f in files:
+            if "GCF_001039355.2" in f and f.endswith(".fna"):
+                print(f"Found possible reference: {os.path.join(root, f)}")
+</execute>
+<observation>NameError("name 'ref_genome' is not defined")</observation>
+Let me re-run with all variables defined.
+
+<execute>
+import os
+import json
+import subprocess
+import gzip
+from pathlib import Path
+
+# Define paths
+base_dir = "benchmark/dataset/MetazExp"
+runs = ["toy_srr1", "toy_srr2", "toy_srr3"]
+ref_genome = "benchmark/dataset/MetazExp/ncbi_dataset/data/GCF_001039355.2/GCF_001039355.2_LinAna2.0_genomic.fna"
+output_json = "/root/autodl-tmp/biomni_v20260208_pred_results/deepseek-v3.2-fast/metazexp_refinement.json"
+tmp_dir = "/root/autodl-tmp/biomni_v20260208_tmp/deepseek-v3.2-fast/etazexp_refinemen"
+
+# Check if reference genome exists
+print(f"Checking reference genome: {ref_genome}")
+if os.path.exists(ref_genome):
+    print("Reference genome found.")
+else:
+    print("Reference genome not found!")
+    # Try to find it
+    for root, dirs, files in os.walk("benchmark/dataset/MetazExp"):
+        for f in files:
+            if "GCF_001039355.2" in f and f.endswith(".fna"):
+                print(f"Found possible reference: {os.path.join(root, f)}")
+</execute>
+<observation>Checking reference genome: benchmark/dataset/MetazExp/ncbi_dataset/data/GCF_001039355.2/GCF_001039355.2_LinAna2.0_genomic.fna
+Reference genome found.
+</observation>
+Good. Now I need to build a HISAT2 index for the reference genome. Let me check if HISAT2 is available and build the index in the temporary directory.
+
+<execute>
+# Check if HISAT2 is available
+print("Checking for HISAT2...")
+try:
+    result = subprocess.run(['hisat2', '--version'], capture_output=True, text=True)
+    print(f"HISAT2 found: {result.stdout[:100]}")
+except FileNotFoundError:
+    print("HISAT2 not found. Trying Bowtie2...")
+    try:
+        result = subprocess.run(['bowtie2', '--version'], capture_output=True, text=True)
+        print(f"Bowtie2 found: {result.stdout[:100]}")
+    except FileNotFoundError:
+        print("Neither HISAT2 nor Bowtie2 found. Trying to use samtools for checking if pre-built alignments exist.")
+</execute>
+<observation>NameError("name 'subprocess' is not defined")</observation>
+I need to import subprocess again. Let me run a complete script.
+
+<execute>
+import os
+import json
+import subprocess
+import gzip
+from pathlib import Path
+
+# Define paths
+base_dir = "benchmark/dataset/MetazExp"
+runs = ["toy_srr1", "toy_srr2", "toy_srr3"]
+ref_genome = "benchmark/dataset/MetazExp/ncbi_dataset/data/GCF_001039355.2/GCF_001039355.2_LinAna2.0_genomic.fna"
+output_json = "/root/autodl-tmp/biomni_v20260208_pred_results/deepseek-v3.2-fast/metazexp_refinement.json"
+tmp_dir = "/root/autodl-tmp/biomni_v20260208_tmp/deepseek-v3.2-fast/etazexp_refinemen"
+
+# Create temporary directory if it doesn't exist
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(output_json), exist_ok=True)
+
+# Check if HISAT2 is available
+print("Checking for HISAT2...")
+try:
+    result = subprocess.run(['hisat2', '--version'], capture_output=True, text=True)
+    print(f"HISAT2 found: {result.stdout[:100]}")
+    aligner = 'hisat2'
+except FileNotFoundError:
+    print("HISAT2 not found. Trying Bowtie2...")
+    try:
+        result = subprocess.run(['bowtie2', '--version'], capture_output=True, text=True)
+        print(f"Bowtie2 found: {result.stdout[:100]}")
+        aligner = 'bowtie2'
+    except FileNotFoundError:
+        print("Neither HISAT2 nor Bowtie2 found.")
+        aligner = None
+
+if aligner:
+    print(f"Will use {aligner} for alignment.")
+else:
+    print("No aligner found. Cannot compute mapping rates.")
+</execute>
+<observation>Checking for HISAT2...
+HISAT2 found: /root/miniconda3/envs/biomni_e1/bin/hisat2-align-s version 2.2.2
+64-bit
+Built on runnervmxu0kd
+Tue J
+Will use hisat2 for alignment.
+</observation>
+Great! HISAT2 is available. Now I need to build an index for the reference genome. Let me check if index already exists in the temporary directory.
+
+<execute>
+# Build HISAT2 index if needed
+index_prefix = os.path.join(tmp_dir, "ref_index")
+index_files = [f"{index_prefix}.{i}.ht2" for i in range(1, 9)]
+
+if all(os.path.exists(f) for f in index_files[:8]):
+    print("HISAT2 index already exists.")
+else:
+    print("Building HISAT2 index...")
+    cmd = ['hisat2-build', ref_genome, index_prefix]
+    print(f"Running: {' '.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode == 0:
+        print("Index built successfully.")
+    else:
+        print(f"Error building index: {result.stderr}")
+</execute</execute>
+<observation>SyntaxError('invalid syntax', ('<string>', 16, 1, '</execute\n', 16, 2))</observation>
+Let me fix the syntax error.
+
+<execute>
+# Build HISAT2 index if needed
+index_prefix = os.path.join(tmp_dir, "ref_index")
+index_files = [f"{index_prefix}.{i}.ht2" for i in range(1, 9)]
+
+if all(os.path.exists(f) for f in index_files[:8]):
+    print("HISAT2 index already exists.")
+else:
+    print("Building HISAT2 index...")
+    cmd = ['hisat2-build', ref_genome, index_prefix]
+    print(f"Running: {' '.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode == 0:
+        print("Index built successfully.")
+    else:
+        print(f"Error building index: {result.stderr}")
+</execute>
+<observation>NameError("name 'os' is not defined")</observation>
+I need to run everything in one cell with imports.
+
+<execute>
+import os
+import json
+import subprocess
+import gzip
+from pathlib import Path
+
+# Define paths
+base_dir = "benchmark/dataset/MetazExp"
+runs = ["toy_srr1", "toy_srr2", "toy_srr3"]
+ref_genome = "benchmark/dataset/MetazExp/ncbi_dataset/data/GCF_001039355.2/GCF_001039355.2_LinAna2.0_genomic.fna"
+output_json = "/root/autodl-tmp/biomni_v20260208_pred_results/deepseek-v3.2-fast/metazexp_refinement.json"
+tmp_dir = "/root/autodl-tmp/biomni_v20260208_tmp/deepseek-v3.2-fast/etazexp_refinemen"
+
+# Create temporary directory if it doesn't exist
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(output_json), exist_ok=True)
+
+# Build HISAT2 index if needed
+index_prefix = os.path.join(tmp_dir, "ref_index")
+index_files = [f"{index_prefix}.{i}.ht2" for i in range(1, 9)]
+
+if all(os.path.exists(f) for f in index_files[:8]):
+    print("HISAT2 index already exists.")
+else:
+    print("Building HISAT2 index...")
+    cmd = ['hisat2-build', ref_genome, index_prefix]
+    print(f"Running: {' '.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode == 0:
+        print("Index built successfully.")
+    else:
+        print(f"Error building index: {result.stderr}")
+</execute>
+<observation>NameError("name 'index_prefix' is not defined")</observation>
+The variable scope issue. Let me run everything in one complete script.
+
+<execute>
+import os
+import json
+import subprocess
+import gzip
+from pathlib import Path
+
+# Define paths
+base_dir = "benchmark/dataset/MetazExp"
+runs = ["toy_srr1", "toy_srr2", "toy_srr3"]
+ref_genome = "benchmark/dataset/MetazExp/ncbi_dataset/data/GCF_001039355.2/GCF_001039355.2_LinAna2.0_genomic.fna"
+output_json = "/root/autodl-tmp/biomni_v20260208_pred_results/deepseek-v3.2-fast/metazexp_refinement.json"
+tmp_dir = "/root/autodl-tmp/biomni_v20260208_tmp/deepseek-v3.2-fast/etazexp_refinemen"
+
+# Create temporary directory if it doesn't exist
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(output_json), exist_ok=True)
+
+print("=== Starting RNA-seq quality assessment ===")
+
+# Function to get read length
+def get_read_length(fastq_file):
+    """Get read length from first few reads of a FASTQ file."""
+    # Check if file is gzipped
+    if fastq_file.endswith('.gz'):
+        opener = gzip.open
+    else:
+        opener = open
+    
+    read_lengths = []
+    try:
+        with opener(fastq_file, 'rt') as f:
+            line_count = 0
+            for line in f:
+                line_count += 1
+                if line_count % 4 == 2:  # Sequence line
+                    read_lengths.append(len(line.strip()))
+                    if len(read_lengths) >= 10:  # Check first 10 reads
+                        break
+    except Exception as e:
+        print(f"Error reading {fastq_file}: {e}")
+        return None
+    
+    if read_lengths:
+        # Check if all reads have same length
+        if len(set(read_lengths)) == 1:
+            return read_lengths[0]
+        else:
+            # Return average length
+            return sum(read_lengths) // len(read_lengths)
+    return None
+
+# Step 1: Check read lengths and paired-end status
+print("\n1. Checking read lengths and paired-end status...")
+run_info = {}
+for run in runs:
+    run_path = os.path.join(base_dir, run)
+    # Find FASTQ files
+    fastq_files = []
+    for f in os.listdir(run_path):
+        if f.endswith('.fastq') or f.endswith('.fastq.gz'):
+            fastq_files.append(os.path.join(run_path, f))
+    
+    # Sort to ensure _1 and _2 are in order
+    fastq_files.sort()
+    
+    # Get read length from first file
+    if fastq_files:
+        length = get_read_length(fastq_files[0])
+        run_info[run] = {
+            'path': run_path,
+            'fastq_files': fastq_files,
+            'read_length': length,
+            'paired_end': len(fastq_files) == 2,
+            'passes_length': length >= 100 if length else False
+        }
+        print(f"  {run}: Read length = {length} bp, Paired-end = {len(fastq_files) == 2}, Length ≥100 = {length >= 100 if length else False}")
+    else:
+        print(f"  {run}: No FASTQ files found!")
+
+# Step 2: Build HISAT2 index
+print("\n2. Building HISAT2 index if needed...")
+index_prefix = os.path.join(tmp_dir, "ref_index")
+index_files = [f"{index_prefix}.{i}.ht2" for i in range(1, 9)]
+
+if all(os.path.exists(f) for f in index_files[:8]):
+    print("  HISAT2 index already exists.")
+else:
+    print(f"  Building index from {ref_genome}...")
+    cmd = ['hisat2-build', ref_genome, index_prefix]
+    print(f"  Running: {' '.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode == 0:
+        print("  Index built successfully.")
+    else:
+        print(f"  Error building index: {result.stderr[:200]}")
+</execute>
+<observation>NameError("name 'index_prefix' is not defined")</observation>
+The error persists because the variable is defined inside the function but referenced outside. Actually, the variable is defined in the print statement before the if block. Let me rewrite more carefully.
+
+<execute>
+import os
+import json
+import subprocess
+import gzip
+from pathlib import Path
+
+# Define paths
+base_dir = "benchmark/dataset/MetazExp"
+runs = ["toy_srr1", "toy_srr2", "toy_srr3"]
+ref_genome = "benchmark/dataset/MetazExp/ncbi_dataset/data/GCF_001039355.2/GCF_001039355.2_LinAna2.0_genomic.fna"
+output_json = "/root/autodl-tmp/biomni_v20260208_pred_results/deepseek-v3.2-fast/metazexp_refinement.json"
+tmp_dir = "/root/autodl-tmp/biomni_v20260208_tmp/deepseek-v3.2-fast/etazexp_refinemen"
+
+# Create temporary directory if it doesn't exist
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(output_json), exist_ok=True)
+
+print("=== Starting RNA-seq quality assessment ===")
+
+# Function to get read length
+def get_read_length(fastq_file):
+    """Get read length from first few reads of a FASTQ file."""
+    # Check if file is gzipped
+    if fastq_file.endswith('.gz'):
+        opener = gzip.open
+    else:
+        opener = open
+    
+    read_lengths = []
+    try:
+        with opener(fastq_file, 'rt') as f:
+            line_count = 0
+            for line in f:
+                line_count += 1
+                if line_count % 4 == 2:  # Sequence line
+                    read_lengths.append(len(line.strip()))
+                    if len(read_lengths) >= 10:  # Check first 10 reads
+                        break
+    except Exception as e:
+        print(f"Error reading {fastq_file}: {e}")
+        return None
+    
+    if read_lengths:
+        # Check if all reads have same length
+        if len(set(read_lengths)) == 1:
+            return read_lengths[0]
+        else:
+            # Return average length
+            return sum(read_lengths) // len(read_lengths)
+    return None
+
+# Step 1: Check read lengths and paired-end status
+print("\n1. Checking read lengths and paired-end status...")
+run_info = {}
+for run in runs:
+    run_path = os.path.join(base_dir, run)
+    # Find FASTQ files
+    fastq_files = []
+    for f in os.listdir(run_path):
+        if f.endswith('.fastq') or f.endswith('.fastq.gz'):
+            fastq_files.append(os.path.join(run_path, f))
+    
+    # Sort to ensure _1 and _2 are in order
+    fastq_files.sort()
+    
+    # Get read length from first file
+    if fastq_files:
+        length = get_read_length(fastq_files[0])
+        run_info[run] = {
+            'path': run_path,
+            'fastq_files': fastq_files,
+            'read_length': length,
+            'paired_end': len(fastq_files) == 2,
+            'passes_length': length >= 100 if length else False
+        }
+        print(f"  {run}: Read length = {length} bp, Paired-end = {len(fastq_files) == 2}, Length ≥100 = {length >= 100 if length else False}")
+    else:
+        print(f"  {run}: No FASTQ files found!")
+
+# Step 2: Build HISAT2 index
+print("\n2. Building HISAT2 index if needed...")
+index_prefix = os.path.join(tmp_dir, "ref_index")
+# Check which index files exist
+index_exists = True
+for i in range(1, 9):
+    if not os.path.exists(f"{index_prefix}.{i}.ht2"):
+        index_exists = False
+        break
+
+if index_exists:
+    print("  HISAT2 index already exists.")
+else:
+    print(f"  Building index from {ref_genome}...")
+    cmd = ['hisat2-build', ref_genome, index_prefix]
+    print(f"  Running: {' '.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode == 0:
+        print("  Index built successfully.")
+    else:
+        print(f"  Error building index: {result.stderr[:200]}")
+</execute>
+<observation>ERROR: Code execution timed out after 150 seconds. Please try with simpler inputs or break your task into smaller steps.</observation>
+The HISAT2 index building is taking too long. Let me check the size of the reference genome and maybe use a simpler approach. Since these are toy datasets, maybe we can use a quicker method or check if pre-aligned files exist. Let me first check the genome size and see if we can use a faster aligner or skip building index.
+
+Actually, looking at the criteria again: we need to check uniquely mapped read rate ≥ 50%. For toy datasets, maybe we can estimate or use a simpler approach. Let me check if there are any pre-existing alignment files or if we can use a quick alignment with limited reads.
+
+Let me update the plan: Since index building times out, I'll try a different approach. Maybe use Bowtie2 which might be faster, or align only a subset of reads. Or perhaps the toy datasets are small enough that we can align quickly with default settings.
+
+Let me first check the size of FASTQ files and reference genome.
+
+<execute>
+import os
+
+# Check file sizes
+print("Checking file sizes...")
+for run in runs:
+    run_path = os.path.join(base_dir, run)
+    total_size = 0
+    for f in os.listdir(run_path):
+        if f.endswith('.fastq'):
+            fp = os.path.join(run_path, f)
+            size = os.path.getsize(fp)
+            total_size += size
+            print(f"  {f}: {size/1024/1024:.2f} MB")
+    print(f"{run} total: {total_size/1024/1024:.2f} MB")
+
+# Check reference genome size
+ref_size = os.path.getsize(ref_genome)
+print(f"\nReference genome: {ref_size/1024/1024:.2f} MB")
+</execute>
+<observation>NameError("name 'runs' is not defined")</observation>
+Let me run a complete script with all variables.
+
+<execute>
+import os
+import json
+import subprocess
+import gzip
+from pathlib import Path
+
+# Define paths
+base_dir = "benchmark/dataset/MetazExp"
+runs = ["toy_srr1", "toy_srr2", "toy_srr3"]
+ref_genome = "benchmark/dataset/MetazExp/ncbi_dataset/data/GCF_001039355.2/GCF_001039355.2_LinAna2.0_genomic.fna"
+output_json = "/root/autodl-tmp/biomni_v20260208_pred_results/deepseek-v3.2-fast/metazexp_refinement.json"
+tmp_dir = "/root/autodl-tmp/biomni_v20260208_tmp/deepseek-v3.2-fast/etazexp_refinemen"
+
+# Check file sizes
+print("Checking file sizes...")
+for run in runs:
+    run_path = os.path.join(base_dir, run)
+    total_size = 0
+    for f in os.listdir(run_path):
+        if f.endswith('.fastq'):
+            fp = os.path.join(run_path, f)
+            size = os.path.getsize(fp)
+            total_size += size
+            print(f"  {f}: {size/1024/1024:.2f} MB")
+    print(f"{run} total: {total_size/1024/1024:.2f} MB")
+
+# Check reference genome size
+ref_size = os.path.getsize(ref_genome)
+print(f"\nReference genome: {ref_size/1024/1024:.2f} MB")
+</execute>
+<observation>Checking file sizes...
+  SRR2131217_1.fastq: 25.62 MB
+  SRR2131217_2.fastq: 25.34 MB
+toy_srr1 total: 50.96 MB
+  SRR2131222_1.fastq: 25.57 MB
+  SRR2131222_2.fastq: 25.34 MB
+toy_srr2 total: 50.90 MB
+  SRR2131244_1.fastq: 26.31 MB
+  SRR2131244_2.fastq: 25.31 MB
+toy_srr3 total: 51.62 MB
+
+Reference genome: 392.66 MB
+</observation>
+The files are relatively small (25-26 MB each). The reference genome is 393 MB. Building a HISAT2 index for 393 MB genome might take time but should be doable. Maybe the previous timeout was due to something else. Let me try building the index with a subset of the genome or check if there's a pre-built index.
+
+Actually, let me try a different approach: use Bowtie2 which might be faster for building index, or align with minimap2. But first, let me check if there are any existing BAM/SAM files in the directories that might already contain alignment results.
+
+<execute>
+# Check for existing alignment files
+print("Checking for existing alignment files...")
+for run in runs:
+    run_path = os.path.join(base_dir, run)
+    alignment_files = []
+    for f in os.listdir(run_path):
+        if f.endswith('.bam') or f.endswith('.sam') or f.endswith('.aln'):
+            alignment_files.append(f)
+    if alignment_files:
+        print(f"  {run}: Found {alignment_files}")
+    else:
+        print(f"  {run}: No alignment files found")
+</execute>
+<observation>NameError("name 'runs' is not defined")</observation>
+<execute>
+import os
+
+base_dir = "benchmark/dataset/MetazExp"
+runs = ["toy_srr1", "toy_srr2", "toy_srr3"]
+
+# Check for existing alignment files
+print("Checking for existing alignment files...")
+for run in runs:
+    run_path = os.path.join(base_dir, run)
+    alignment_files = []
+    for f in os.listdir(run_path):
+        if f.endswith('.bam') or f.endswith('.sam') or f.endswith('.aln'):
+            alignment_files.append(f)
+    if alignment_files:
+        print(f"  {run}: Found {alignment_files}")
+    else:
+        print(f"  {run}: No alignment files found")
+</execute>
+<observation>Checking for existing alignment files...
+  toy_srr1: No alignment files found
+  toy_srr2: No alignment files found
+  toy_srr3: No alignment files found
+</observation>
+No existing alignments. I need to align the reads. Since HISAT2 index building timed out, let me try a quicker method: use `minimap2` which doesn't require pre-building a large index. Or use `bowtie2` with `--fast` option. Let me check if minimap2 is available.
+
+<execute>
+import subprocess
+
+# Check for minimap2
+try:
+    result = subprocess.run(['minimap2', '--version'], capture_output=True, text=True)
+    print(f"minimap2 found: {result.stdout[:100]}")
+    aligner = 'minimap2'
+except FileNotFoundError:
+    print("minimap2 not found. Checking for bowtie2...")
+    try:
+        result = subprocess.run(['bowtie2', '--version'], capture_output=True, text=True)
+        print(f"bowtie2 found: {result.stdout[:100]}")
+        aligner = 'bowtie2'
+    except FileNotFoundError:
+        print("bowtie2 not found either.")
+        aligner = None
+
+print(f"Will use {aligner} for alignment.")
+</execute>
+<observation>minimap2 found: 2.28-r1209
+
+Will use minimap2 for alignment.
+</observation>
+Great! minimap2 is available and doesn't require building a separate index. It's fast for aligning reads to a reference. Let me use minimap2 to align each run and calculate mapping statistics.
+
+I'll update the plan:
+
+1. [✓] Examine the three toy_srr directories to understand their structure and locate FASTQ files.
+2. [✓] For each run, check if it's paired-end sequencing by examining the number of FASTQ files.
+3. [✓] Determine read length by examining the first few reads from each FASTQ file.
+4. [ ] Align reads to the reference genome using minimap2 to calculate mapping statistics.
+5. [ ] Calculate uniquely mapped read rate from alignment results.
+6. [ ] Filter runs that meet all three criteria.
+7. [ ] Output the directory names of high-quality runs to the specified JSON file.
+8. [ ] Ensure all temporary data is saved in the specified temporary directory.
+
+Now let me write a function to align with minimap2 and calculate mapping rate.
+
+<execute>
+import os
+import subprocess
+import tempfile
+
+def align_with_minimap2(fastq1, fastq2, reference, output_sam, tmp_dir):
+    """Align paired-end reads using minimap2 and return mapping statistics."""
+    # minimap2 command for paired-end RNA-seq reads
+    # -ax sr for short reads, -t 2 for 2 threads
+    cmd = [
+        'minimap2', '-ax', 'sr', '-t', '2',
+        reference, fastq1, fastq2
+    ]
+    
+    print(f"  Aligning with minimap2: {' '.join(cmd[:6])}...")
+    
+    # Run minimap2 and save SAM output
+    with open(output_sam, 'w') as sam_file:
+        result = subprocess.run(cmd, stdout=sam_file, stderr=subprocess.PIPE, text=True)
+    
+    if result.returncode != 0:
+        print(f"  Alignment failed: {result.stderr[:200]}")
+        return None
+    
+    # Parse SAM file to get mapping statistics
+    total_reads = 0
+    uniquely_mapped = 0
+    multi_mapped = 0
+    
+    with open(output_sam, 'r') as f:
+        for line in f:
+            if line.startswith('@'):  # Header line
+                continue
+            total_reads += 1
+            fields = line.strip().split('\t')
+            if len(fields) >= 12:
+                # Check mapping quality (MAPQ)
+                mapq = int(fields[4])
+                # MAPQ >= 20 typically indicates unique mapping
+                if mapq >= 20:
+                    uniquely_mapped += 1
+                elif mapq >= 0:  # Mapped but low quality or multi-mapped
+                    multi_mapped += 1
+    
+    # For paired-end, each alignment line represents one read (not pair)
+    # So we need to adjust
+    uniquely_mapped_rate = uniquely_mapped / total_reads * 100 if total_reads > 0 else 0
+    
+    return {
+        'total_reads': total_reads,
+        'uniquely_mapped': uniquely_mapped,
+        'uniquely_mapped_rate': uniquely_mapped_rate,
+        'sam_file': output_sam
+    }
+
+# Now process each run
+print("\n3. Aligning reads and calculating mapping rates...")
+high_quality_runs = []
+
+for run in runs:
+    print(f"\nProcessing {run}...")
+    
+    # Get run info
+    run_path = os.path.join(base_dir, run)
+    fastq_files = []
+    for f in os.listdir(run_path):
+        if f.endswith('.fastq'):
+            fastq_files.append(os.path.join(run_path, f))
+    
+    fastq_files.sort()
+    
+    if len(fastq_files) != 2:
+        print(f"  Skipping {run}: Not paired-end or wrong number of files")
+        continue
+    
+    # Check read length again (more thoroughly)
+    # Let's check more reads this time
+    def check_read_length_thoroughly(fastq_file, num_reads=100):
+        lengths = []
+        with open(fastq_file, 'r') as f:
+            line_count = 0
+            for line in f:
+                line_count += 1
+                if line_count % 4 == 2:
+                    lengths.append(len(line.strip()))
+                    if len(lengths) >= num_reads:
+                        break
+        if lengths:
+            avg_length = sum(lengths) / len(lengths)
+            return avg_length
+        return 0
+    
+    read_length1 = check_read_length_thoroughly(fastq_files[0])
+    read_length2 = check_read_length_thoroughly(fastq_files[1])
+    avg_read_length = (read_length1 + read_length2) / 2
+    
+    print(f"  Average read length: {avg_read_length:.1f} bp")
+    
+    # Check criteria 1: Paired-end (already true)
+    # Check criteria 2: Read length ≥ 100 bp
+    if avg_read_length < 100:
+        print(f"  FAILS: Read length {avg_read_length:.1f} < 100 bp")
+        continue
+    
+    # Align to calculate mapping rate
+    output_sam = os.path.join(tmp_dir, f"{run}.sam")
+    stats = align_with_minimap2(fastq_files[0], fastq_files[1], ref_genome, output_sam, tmp_dir)
+    
+    if stats is None:
+        print(f"  Alignment failed for {run}")
+        continue
+    
+    print(f"  Alignment stats: {stats['total_reads']} total reads, "
+          f"{stats['uniquely_mapped']} uniquely mapped ({stats['uniquely_mapped_rate']:.2f}%)")
+    
+    # Check criteria 3: Uniquely mapped read rate ≥ 50%
+    if stats['uniquely_mapped_rate'] >= 50:
+        print(f"  PASSES all criteria!")
+        high_quality_runs.append(run)
+    else:
+        print(f"  FAILS: Mapping rate {stats['uniquely_mapped_rate']:.2f}% < 50%")
+
+print(f"\nHigh-quality runs: {high_quality_runs}")
+</execute>
+<observation>NameError("name 'runs' is not defined")</observation>
+Let me run everything in one complete script.
+
+<execute>
+import os
+import json
+import subprocess
+import gzip
+from pathlib import Path
+
+# Define paths
+base_dir = "benchmark/dataset/MetazExp"
+runs = ["toy_srr1", "toy_srr2", "toy_srr3"]
+ref_genome = "benchmark/dataset/MetazExp/ncbi_dataset/data/GCF_001039355.2/GCF_001039355.2_LinAna2.0_genomic.fna"
+output_json = "/root/autodl-tmp/biomni_v20260208_pred_results/deepseek-v3.2-fast/metazexp_refinement.json"
+tmp_dir = "/root/autodl-tmp/biomni_v20260208_tmp/deepseek-v3.2-fast/etazexp_refinemen"
+
+# Create temporary directory if it doesn't exist
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(output_json), exist_ok=True)
+
+print("=== Starting RNA-seq quality assessment ===")
+
+def align_with_minimap2(fastq1, fastq2, reference, output_sam, tmp_dir):
+    """Align paired-end reads using minimap2 and return mapping statistics."""
+    # minimap2 command for paired-end RNA-seq reads
+    # -ax sr for short reads, -t 2 for 2 threads
+    cmd = [
+        'minimap2', '-ax', 'sr', '-t', '2',
+        reference, fastq1, fastq2
+    ]
+    
+    print(f"  Aligning with minimap2: {' '.join(cmd[:6])}...")
+    
+    # Run minimap2 and save SAM output
+    with open(output_sam, 'w') as sam_file:
+        result = subprocess.run(cmd, stdout=sam_file, stderr=subprocess.PIPE, text=True)
+    
+    if result.returncode != 0:
+        print(f"  Alignment failed: {result.stderr[:200]}")
+        return None
+    
+    # Parse SAM file to get mapping statistics
+    total_reads = 0
+    uniquely_mapped = 0
+    multi_mapped = 0
+    
+    with open(output_sam, 'r') as f:
+        for line in f:
+            if line.startswith('@'):  # Header line
+                continue
+            total_reads += 1
+            fields = line.strip().split('\t')
+            if len(fields) >= 12:
+                # Check mapping quality (MAPQ)
+                mapq = int(fields[4])
+                # MAPQ >= 20 typically indicates unique mapping
+                if mapq >= 20:
+                    uniquely_mapped += 1
+                elif mapq >= 0:  # Mapped but low quality or multi-mapped
+                    multi_mapped += 1
+    
+    # For paired-end, each alignment line represents one read (not pair)
+    # So we need to adjust
+    uniquely_mapped_rate = uniquely_mapped / total_reads * 100 if total_reads > 0 else 0
+    
+    return {
+        'total_reads': total_reads,
+        'uniquely_mapped': uniquely_mapped,
+        'uniquely_mapped_rate': uniquely_mapped_rate,
+        'sam_file': output_sam
+    }
+
+def check_read_length_thoroughly(fastq_file, num_reads=100):
+    """Check average read length from first num_reads reads."""
+    lengths = []
+    try:
+        with open(fastq_file, 'r') as f:
+            line_count = 0
+            for line in f:
+                line_count += 1
+                if line_count % 4 == 2:
+                    lengths.append(len(line.strip()))
+                    if len(lengths) >= num_reads:
+                        break
+    except Exception as e:
+        print(f"Error reading {fastq_file}: {e}")
+        return 0
+    
+    if lengths:
+        avg_length = sum(lengths) / len(lengths)
+        return avg_length
+    return 0
+
+# Process each run
+print("\nProcessing each run...")
+high_quality_runs = []
+
+for run in runs:
+    print(f"\n--- Processing {run} ---")
+    
+    # Get run info
+    run_path = os.path.join(base_dir, run)
+    fastq_files = []
+    for f in os.listdir(run_path):
+        if f.endswith('.fastq'):
+            fastq_files.append(os.path.join(run_path, f))
+    
+    fastq_files.sort()
+    
+    if len(fastq_files) != 2:
+        print(f"  Skipping {run}: Not paired-end or wrong number of files")
+        continue
+    
+    print(f"  FASTQ files: {fastq_files[0]}, {fastq_files[1]}")
+    
+    # Check criteria 1: Paired-end (already true)
+    print(f"  ✓ Paired-end: Yes")
+    
+    # Check criteria 2: Read length ≥ 100 bp
+    read_length1 = check_read_length_thoroughly(fastq_files[0])
+    read_length2 = check_read_length_thoroughly(fastq_files[1])
+    avg_read_length = (read_length1 + read_length2) / 2
+    
+    print(f"  Read length: {avg_read_length:.1f} bp")
+    if avg_read_length >= 100:
+        print(f"  ✓ Read length ≥ 100 bp: Yes")
+        passes_length = True
+    else:
+        print(f"  ✗ Read length ≥ 100 bp: No")
+        passes_length = False
+    
+    # Only align if passes length criterion
+    if passes_length:
+        # Align to calculate mapping rate
+        output_sam = os.path.join(tmp_dir, f"{run}.sam")
+        stats = align_with_minimap2(fastq_files[0], fastq_files[1], ref_genome, output_sam, tmp_dir)
+        
+        if stats is None:
+            print(f"  Alignment failed for {run}")
+            continue
+        
+        print(f"  Alignment stats: {stats['total_reads']} total reads, "
+              f"{stats['uniquely_mapped']} uniquely mapped ({stats['uniquely_mapped_rate']:.2f}%)")
+        
+        # Check criteria 3: Uniquely mapped read rate ≥ 50%
+        if stats['uniquely_mapped_rate'] >= 50:
+            print(f"  ✓ Uniquely mapped rate ≥ 50%: Yes")
+            print(f"  Result: {run} PASSES all criteria!")
+            high_quality_runs.append(run)
+        else:
+            print(f"  ✗ Uniquely mapped rate ≥ 50%: No")
+            print(f"  Result: {run} FAILS mapping rate criterion")
+    else:
+        print(f"  Result: {run} FAILS read length criterion")
+
+print(f"\n=== Summary ===")
+print(f"High-quality runs: {high_quality_runs}")
+
+# Save results to JSON
+print(f"\nSaving results to {output_json}...")
+with open(output_json, 'w') as f:
+    json.dump(high_quality_runs, f, indent=2)
+
+print("Done!")
+</execute>
+<observation>NameError("name 'subprocess' is not defined")</observation>
+I need to import subprocess. Let me fix this.
+
+<execute>
+import os
+import json
+import subprocess
+from pathlib import Path
+
+# Define paths
+base_dir = "benchmark/dataset/MetazExp"
+runs = ["toy_srr1", "toy_srr2", "toy_srr3"]
+ref_genome = "benchmark/dataset/MetazExp/ncbi_dataset/data/GCF_001039355.2/GCF_001039355.2_LinAna2.0_genomic.fna"
+output_json = "/root/autodl-tmp/biomni_v20260208_pred_results/deepseek-v3.2-fast/metazexp_refinement.json"
+tmp_dir = "/root/autodl-tmp/biomni_v20260208_tmp/deepseek-v3.2-fast/etazexp_refinemen"
+
+# Create temporary directory if it doesn't exist
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(output_json), exist_ok=True)
+
+print("=== Starting RNA-seq quality assessment ===")
+
+def align_with_minimap2(fastq1, fastq2, reference, output_sam, tmp_dir):
+    """Align paired-end reads using minimap2 and return mapping statistics."""
+    # minimap2 command for paired-end RNA-seq reads
+    # -ax sr for short reads, -t 2 for 2 threads
+    cmd = [
+        'minimap2', '-ax', 'sr', '-t', '2',
+        reference, fastq1, fastq2
+    ]
+    
+    print(f"  Aligning with minimap2: {' '.join(cmd[:6])}...")
+    
+    # Run minimap2 and save SAM output
+    with open(output_sam, 'w') as sam_file:
+        result = subprocess.run(cmd, stdout=sam_file, stderr=subprocess.PIPE, text=True)
+    
+    if result.returncode != 0:
+        print(f"  Alignment failed: {result.stderr[:200]}")
+        return None
+    
+    # Parse SAM file to get mapping statistics
+    total_reads = 0
+    uniquely_mapped = 0
+    multi_mapped = 0
+    
+    with open(output_sam, 'r') as f:
+        for line in f:
+            if line.startswith('@'):  # Header line
+                continue
+            total_reads += 1
+            fields = line.strip().split('\t')
+            if len(fields) >= 12:
+                # Check mapping quality (MAPQ)
+                mapq = int(fields[4])
+                # MAPQ >= 20 typically indicates unique mapping
+                if mapq >= 20:
+                    uniquely_mapped += 1
+                elif mapq >= 0:  # Mapped but low quality or multi-mapped
+                    multi_mapped += 1
+    
+    # For paired-end, each alignment line represents one read (not pair)
+    # So we need to adjust
+    uniquely_mapped_rate = uniquely_mapped / total_reads * 100 if total_reads > 0 else 0
+    
+    return {
+        'total_reads': total_reads,
+        'uniquely_mapped': uniquely_mapped,
+        'uniquely_mapped_rate': uniquely_mapped_rate,
+        'sam_file': output_sam
+    }
+
+def check_read_length_thoroughly(fastq_file, num_reads=100):
+    """Check average read length from first num_reads reads."""
+    lengths = []
+    try:
+        with open(fastq_file, 'r') as f:
+            line_count = 0
+            for line in f:
+                line_count += 1
+                if line_count % 4 == 2:
+                    lengths.append(len(line.strip()))
+                    if len(lengths) >= num_reads:
+                        break
+    except Exception as e:
+        print(f"Error reading {fastq_file}: {e}")
+        return 0
+    
+    if lengths:
+        avg_length = sum(lengths) / len(lengths)
+        return avg_length
+    return 0
+
+# Process each run
+print("\nProcessing each run...")
+high_quality_runs = []
+
+for run in runs:
+    print(f"\n--- Processing {run} ---")
+    
+    # Get run info
+    run_path = os.path.join(base_dir, run)
+    fastq_files = []
+    for f in os.listdir(run_path):
+        if f.endswith('.fastq'):
+            fastq_files.append(os.path.join(run_path, f))
+    
+    fastq_files.sort()
+    
+    if len(fastq_files) != 2:
+        print(f"  Skipping {run}: Not paired-end or wrong number of files")
+        continue
+    
+    print(f"  FASTQ files: {fastq_files[0]}, {fastq_files[1]}")
+    
+    # Check criteria 1: Paired-end (already true)
+    print(f"  ✓ Paired-end: Yes")
+    
+    # Check criteria 2: Read length ≥ 100 bp
+    read_length1 = check_read_length_thoroughly(fastq_files[0])
+    read_length2 = check_read_length_thoroughly(fastq_files[1])
+    avg_read_length = (read_length1 + read_length2) / 2
+    
+    print(f"  Read length: {avg_read_length:.1f} bp")
+    if avg_read_length >= 100:
+        print(f"  ✓ Read length ≥ 100 bp: Yes")
+        passes_length = True
+    else:
+        print(f"  ✗ Read length ≥ 100 bp: No")
+        passes_length = False
+    
+    # Only align if passes length criterion
+    if passes_length:
+        # Align to calculate mapping rate
+        output_sam = os.path.join(tmp_dir, f"{run}.sam")
+        stats = align_with_minimap2(fastq_files[0], fastq_files[1], ref_genome, output_sam, tmp_dir)
+        
+        if stats is None:
+            print(f"  Alignment failed for {run}")
+            continue
+        
+        print(f"  Alignment stats: {stats['total_reads']} total reads, "
+              f"{stats['uniquely_mapped']} uniquely mapped ({stats['uniquely_mapped_rate']:.2f}%)")
+        
+        # Check criteria 3: Uniquely mapped read rate ≥ 50%
+        if stats['uniquely_mapped_rate'] >= 50:
+            print(f"  ✓ Uniquely mapped rate ≥ 50%: Yes")
+            print(f"  Result: {run} PASSES all criteria!")
+            high_quality_runs.append(run)
+        else:
+            print(f"  ✗ Uniquely mapped rate ≥ 50%: No")
+            print(f"  Result: {run} FAILS mapping rate criterion")
+    else:
+        print(f"  Result: {run} FAILS read length criterion")
+
+print(f"\n=== Summary ===")
+print(f"High-quality runs: {high_quality_runs}")
+
+# Save results to JSON
+print(f"\nSaving results to {output_json}...")
+with open(output_json, 'w') as f:
+    json.dump(high_quality_runs, f, indent=2)
+
+print("Done!")
+</execute>
+<observation>NameError("name 'subprocess' is not defined")</observation>
+Wait, I imported subprocess at the top. The error says it's not defined. Maybe there's a scope issue. Let me run a simpler test first.
+
+<execute>
+import subprocess
+print("Testing subprocess import...")
+result = subprocess.run(['echo', 'test'], capture_output=True, text=True)
+print(result.stdout)
+</execute>
+<observation>Testing subprocess import...
+test
+
+</observation>
+Good, subprocess works. Now let me run the full script but in a more careful way, maybe in a function to avoid scope issues.
+
+<execute>
+import os
+import json
+import subprocess
+
+def main():
+    # Define paths
+    base_dir = "benchmark/dataset/MetazExp"
+    runs = ["toy_srr1", "toy_srr2", "toy_srr3"]
+    ref_genome = "benchmark/dataset/MetazExp/ncbi_dataset/data/GCF_001039355.2/GCF_001039355.2_LinAna2.0_genomic.fna"
+    output_json = "/root/autodl-tmp/biomni_v20260208_pred_results/deepseek-v3.2-fast/metazexp_refinement.json"
+    tmp_dir = "/root/autodl-tmp/biomni_v20260208_tmp/deepseek-v3.2-fast/etazexp_refinemen"
+    
+    # Create temporary directory if it doesn't exist
+    os.makedirs(tmp_dir, exist_ok=True)
+    os.makedirs(os.path.dirname(output_json), exist_ok=True)
+    
+    print("=== Starting RNA-seq quality assessment ===")
+    
+    def align_with_minimap2(fastq1, fastq2, reference, output_sam):
+        """Align paired-end reads using minimap2 and return mapping statistics."""
+        # minimap2 command for paired-end RNA-seq reads
+        # -ax sr for short reads, -t 2 for 2 threads
+        cmd = [
+            'minimap2', '-ax', 'sr', '-t', '2',
+            reference, fastq1, fastq2
+        ]
+        
+        print(f"  Aligning with minimap2...")
+        
+        # Run minimap2 and save SAM output
+        with open(output_sam, 'w') as sam_file:
+            result = subprocess.run(cmd, stdout=sam_file, stderr=subprocess.PIPE, text=True)
+        
+        if result.returncode != 0:
+            print(f"  Alignment failed: {result.stderr[:200]}")
+            return None
+        
+        # Parse SAM file to get mapping statistics
+        total_reads = 0
+        uniquely_mapped = 0
+        
+        with open(output_sam, 'r') as f:
+            for line in f:
+                if line.startswith('@'):  # Header line
+                    continue
+                total_reads += 1
+                fields = line.strip().split('\t')
+                if len(fields) >= 5:
+                    # Check mapping quality (MAPQ)
+                    mapq = int(fields[4])
+                    # MAPQ >= 20 typically indicates unique mapping
+                    if mapq >= 20:
+                        uniquely_mapped += 1
+        
+        uniquely_mapped_rate = uniquely_mapped / total_reads * 100 if total_reads > 0 else 0
+        
+        return {
+            'total_reads': total_reads,
+            'uniquely_mapped': uniquely_mapped,
+            'uniquely_mapped_rate': uniquely_mapped_rate
+        }
+    
+    def check_read_length_thoroughly(fastq_file, num_reads=100):
+        """Check average read length from first num_reads reads."""
+        lengths = []
+        try:
+            with open(fastq_file, 'r') as f:
+                line_count = 0
+                for line in f:
+                    line_count += 1
+                    if line_count % 4 == 2:
+                        lengths.append(len(line.strip()))
+                        if len(lengths) >= num_reads:
+                            break
+        except Exception as e:
+            print(f"Error reading {fastq_file}: {e}")
+            return 0
+        
+        if lengths:
+            avg_length = sum(lengths) / len(lengths)
+            return avg_length
+        return 0
+    
+    # Process each run
+    print("\nProcessing each run...")
+    high_quality_runs = []
+    
+    for run in runs:
+        print(f"\n--- Processing {run} ---")
+        
+        # Get run info
+        run_path = os.path.join(base_dir, run)
+        fastq_files = []
+        for f in os.listdir(run_path):
+            if f.endswith('.fastq'):
+                fastq_files.append(os.path.join(run_path, f))
+        
+        fastq_files.sort()
+        
+        if len(fastq_files) != 2:
+            print(f"  Skipping {run}: Not paired-end or wrong number of files")
+            continue
+        
+        print(f"  FASTQ files: {os.path.basename(fastq_files[0])}, {os.path.basename(fastq_files[1])}")
+        
+        # Check criteria 1: Paired-end (already true)
+        print(f"  ✓ Paired-end: Yes")
+        
+        # Check criteria 2: Read length ≥ 100 bp
+        read_length1 = check_read_length_thoroughly(fastq_files[0])
+        read_length2 = check_read_length_thoroughly(fastq_files[1])
+        avg_read_length = (read_length1 + read_length2) / 2
+        
+        print(f"  Read length: {avg_read_length:.1f} bp")
+        if avg_read_length >= 100:
+            print(f"  ✓ Read length ≥ 100 bp: Yes")
+            passes_length = True
+        else:
+            print(f"  ✗ Read length ≥ 100 bp: No")
+            passes_length = False
+        
+        # Only align if passes length criterion
+        if passes_length:
+            # Align to calculate mapping rate
+            output_sam = os.path.join(tmp_dir, f"{run}.sam")
+            stats = align_with_minimap2(fastq_files[0], fastq_files[1], ref_genome, output_sam)
+            
+            if stats is None:
+                print(f"  Alignment failed for {run}")
+                continue
+            
+            print(f"  Alignment stats: {stats['total_reads']} total reads, "
+                  f"{stats['uniquely_mapped']} uniquely mapped ({stats['uniquely_mapped_rate']:.2f}%)")
+            
+            # Check criteria 3: Uniquely mapped read rate ≥ 50%
+            if stats['uniquely_mapped_rate'] >= 50:
+                print(f"  ✓ Uniquely mapped rate ≥ 50%: Yes")
+                print(f"  Result: {run} PASSES all criteria!")
+                high_quality_runs.append(run)
+            else:
+                print(f"  ✗ Uniquely mapped rate ≥ 50%: No")
+                print(f"  Result: {run} FAILS mapping rate criterion")
+        else:
+            print(f"  Result: {run} FAILS read length criterion")
+    
+    print(f"\n=== Summary ===")
+    print(f"High-quality runs: {high_quality_runs}")
+    
+    # Save results to JSON
+    print(f"\nSaving results to {output_json}...")
+    with open(output_json, 'w') as f:
+        json.dump(high_quality_runs, f, indent=2)
+    
+    print("Done!")
+    return high_quality_runs
+
+if __name__ == "__main__":
+    main()
+</execute>
+<observation></observation>
+The script ran without output? Let me check if it's running. Maybe it's taking time. Let me interrupt and try a simpler approach: check the read lengths more accurately first, since that might eliminate most runs.
+
+Actually, from earlier check: toy_srr1: 95 bp, toy_srr2: 88 bp, toy_srr3: 111 bp. Only toy_srr3 passes read length ≥ 100 bp. So we only need to align toy_srr3 to check its mapping rate.
+
+Let me update the plan and just focus on toy_srr3.
+
+1. [✓] Examine the three toy_srr directories to understand their structure and locate FASTQ files.
+2. [✓] For each run, check if it's paired-end sequencing by examining the number of FASTQ files.
+3. [✓] Determine read length by examining the first few reads from each FASTQ file.
+4. [ ] Align toy_srr3 reads to the reference genome using minimap2 to calculate mapping statistics.
+5. [ ] Calculate uniquely mapped read rate from alignment results.
+6. [ ] Filter runs that meet all three criteria.
+7. [ ] Output the directory names of high-quality runs to the specified JSON file.
+8. [ ] Ensure all temporary data is saved in the specified temporary directory.
+
+Let me check read lengths more thoroughly for toy_srr3 and then align it.
+
+<execute>
+import os
+import subprocess
+
+# Check toy_srr3 read length more thoroughly
+run = "toy_srr3"
+run_path = os.path.join("benchmark/dataset/MetazExp", run)
+fastq_files = [os.path.join(run_path, f) for f in os.listdir(run_path) if f.endswith('.fastq')]
+fastq_files.sort()
+
+print(f"Checking {run}...")
+print(f"FASTQ files: {fastq_files}")
+
+# Check first 1000 reads for better average
+def check_read_length_extensive(fastq_file, num_reads=1000):
+    lengths = []
+    with open(fastq_file, 'r') as f:
+        line_count = 0
+        for line in f:
+            line_count += 1
+            if line_count % 4 == 2:
+                lengths.append(len(line.strip()))
+                if len(lengths) >= num_reads:
+                    break
+    if lengths:
+        return sum(lengths) / len(lengths)
+    return 0
+
+length1 = check_read_length_extensive(fastq_files[0])
+length2 = check_read_length_extensive(fastq_files[1])
+avg_length = (length1 + length2) / 2
+print(f"Read length from 1000 reads: {avg_length:.1f} bp")
+
+if avg_length >= 100:
+    print(f"✓ Read length ≥ 100 bp")
+else:
+    print(f"✗ Read length < 100 bp")
+</execute>
+<observation>NameError("name 'os' is not defined")</observation>
+<execute>
+import os
+import subprocess
+
+# Check toy_srr3 read length more thoroughly
+run = "toy_srr3"
+run_path = os.path.join("benchmark/dataset/MetazExp", run)
+fastq_files = [os.path.join(run_path, f) for f in os.listdir(run_path) if f.endswith('.fastq')]
+fastq_files.sort()
+
+print(f"Checking {run}...")
+print(f"FASTQ files: {fastq_files}")
+
+# Check first 1000 reads for better average
+def check_read_length_extensive(fastq_file, num_reads=1000):
+    lengths = []
+    with open(fastq_file, 'r') as f:
+        line_count = 0
+        for line in f:
+            line_count += 1
+            if line_count % 4 == 2:
+                lengths.append(len(line.strip()))
+                if len(lengths) >= num_reads:
+                    break
+    if lengths:
+        return sum(lengths) / len(lengths)
+    return 0
+
+length1 = check_read_length_extensive(fastq_files[0])
+length2 = check_read_length_extensive(fastq_files[1])
+avg_length = (length1 + length2) / 2
+print(f"Read length from 1000 reads: {avg_length:.1f} bp")
+
+if avg_length >= 100:
+    print(f"✓ Read length ≥ 100 bp")
+else:
+    print(f"✗ Read length < 100 bp")
+</execute>
+<observation>NameError("name 'os' is not defined")</observation>
+There seems to be an issue with the environment. Let me try a different approach: write a simple script to a file and execute it.
+
+<execute>
+#!BASH
+echo "Checking toy_srr3 read length..."
+cd benchmark/dataset/MetazExp/toy_srr3
+# Check first few reads
+head -n 40 SRR2131244_1.fastq | awk 'NR%4==2 {print length($0)}' | head -n 10
+</execute>
+<observation>Checking toy_srr3 read length...
+146
+145
+146
+146
+51
+90
+130
+78
+143
+43
+</observation>
+Interesting! The reads have variable lengths. The first 10 reads show lengths from 43 to 146 bp. This suggests these might be trimmed reads or have variable quality. The average might be around 100. Let me compute average more accurately.
+
+<execute>
+#!BASH
+cd benchmark/dataset/MetazExp/toy_srr3
+# Check first 1000 reads from both files
+echo "Checking SRR2131244_1.fastq..."
+awk 'NR%4==2 {sum+=length($0); count++} END {if(count>0) print "Average:", sum/count, "Total reads:", count}' SRR2131244_1.fastq
+
+echo "Checking SRR2131244_2.fastq..."
+awk 'NR%4==2 {sum+=length($0); count++} END {if(count>0) print "Average:", sum/count, "Total reads:", count}' SRR2131244_2.fastq
+</execute>
+<observation>Checking SRR2131244_1.fastq...
+Average: 102.627 Total reads: 100000
+Checking SRR2131244_2.fastq...
+Average: 97.4595 Total reads: 100000
+</observation>
+So toy_srr3 has average read lengths: 102.6 bp (R1) and 97.5 bp (R2). The average is about 100 bp. The criteria says "Read length ≥ 100 bp". This is borderline. Let's compute the overall average: (102.627 + 97.4595)/2 = 100.04325 bp. So technically it passes.
+
+Now we need to check mapping rate. Let me align a subset of reads quickly with minimap2 to estimate mapping rate.
+
+<execute>
+#!BASH
+cd /root/autodl-tmp
+# Create tmp dir
+mkdir -p biomni_v20260208_tmp/deepseek-v3.2-fast/etazexp_refinemen
+cd biomni_v20260208_tmp/deepseek-v3.2-fast/etazexp_refinemen
+
+# Take first 10000 reads from each file for quick alignment
+echo "Extracting first 10000 reads from toy_srr3..."
+head -n 40000 ../../../../benchmark/dataset/MetazExp/toy_srr3/SRR2131244_1.fastq > SRR2131244_1_10k.fastq
+head -n 40000 ../../../../benchmark/dataset/MetazExp/toy_srr3/SRR2131244_2.fastq > SRR2131244_2_10k.fastq
+
+# Align with minimap2
+echo "Aligning with minimap2..."
+REF=../../../../benchmark/dataset/MetazExp/ncbi_dataset/data/GCF_001039355.2/GCF_001039355.2_LinAna2.0_genomic.fna
+minimap2 -ax sr -t 2 $REF SRR2131244_1_10k.fastq SRR2131244_2_10k.fastq > toy_srr3_10k.sam 2> minimap2.log
+
+echo "Alignment complete. Checking mapping stats..."
+# Count total reads (non-header lines)
+total=$(grep -v '^@' toy_srr3_10k.sam | wc -l)
+echo "Total aligned reads: $total"
+
+# Count uniquely mapped (MAPQ >= 20)
+unique=$(grep -v '^@' toy_srr3_10k.sam | awk '$5 >= 20' | wc -l)
+echo "Uniquely mapped reads (MAPQ>=20): $unique"
+
+if [ $total -gt 0 ]; then
+    rate=$(echo "scale=2; $unique * 100 / $total" | bc)
+    echo "Uniquely mapped rate: $rate%"
+else
+    echo "No reads aligned."
+fi
+</execute>
+<observation>Error running Bash script (exit code 1):
+head: cannot open '../../../../benchmark/dataset/MetazExp/toy_srr3/SRR2131244_1.fastq' for reading: No such file or directory
+</observation>
+Path issue. Let me use absolute paths.
+
+<execute>
+#!BASH
+# Create tmp dir
+mkdir -p /root/autodl-tmp/biomni_v20260208_tmp/deepseek-v3.2-fast/etazexp_refinemen
+cd /root/autodl-tmp/biomni_v20260208_tmp/deepseek-v3.2-fast/etazexp_refinemen
+
+# Take first 10000 reads from each file for quick alignment
+echo "Extracting first 10000 reads from toy_srr3..."
+head -n 40000 /root/benchmark/dataset/MetazExp/toy_srr3/SRR2131244_1.fastq > SRR2131244_1_10k.fastq
+head -n 40000 /root/benchmark/dataset/MetazExp/toy_srr3/SRR2131244_2.fastq > SRR2131244_2_10k.fastq
+
+# Align with minimap2
+echo "Aligning with minimap2..."
+REF=/root/benchmark/dataset/MetazExp/ncbi_dataset/data/GCF_001039355.2/GCF_001039355.2_LinAna2.0_genomic.fna
+minimap2 -ax sr -t 2 $REF SRR2131244_1_10k.fastq SRR2131244_2_10k.fastq > toy_srr3_10k.sam 2> minimap2.log
+
+echo "Alignment complete. Checking mapping stats..."
+# Count total reads (non-header lines)
+total=$(grep -v '^@' toy_srr3_10k.sam | wc -l)
+echo "Total aligned reads: $total"
+
+# Count uniquely mapped (MAPQ >= 20)
+unique=$(grep -v '^@' toy_srr3_10k.sam | awk '$5 >= 20' | wc -l)
+echo "Uniquely mapped reads (MAPQ>=20): $unique"
+
+if [ $total -gt 0 ]; then
+    rate=$(echo "scale=2; $unique * 100 / $total" | bc)
+    echo "Uniquely mapped rate: $rate%"
+else
+    echo "No reads aligned."
+fi
+</execute>
+<observation>Error running Bash script (exit code 1):
+head: cannot open '/root/benchmark/dataset/MetazExp/toy_srr3/SRR2131244_1.fastq' for reading: No such file or directory
+</observation>
+The path is wrong. Let me check the current directory and correct path.
+
+<execute>
+#!BASH
+pwd
+ls -la /root/
+find /root -name "SRR2131244_1.fastq" 2>/dev/null | head -5
+</execute>
+<observation>/root/biodatalab
+total 148
+drwx------  1 root root  4096 Feb  8 22:15 .
+drwxr-xr-x  1 root root  4096 Feb  8 22:42 ..
+-rw-------  1 root root 51399 Feb  8 22:27 .bash_history
+-rw-r--r--  1 root root  3694 Feb  8 22:09 .bashrc
+drwx------ 12 root root  4096 Feb  8 17:19 .cache
+drwxr-xr-x  6 root root  4096 Feb  3 14:03 .codex
+drwxr-xr-x  1 root root    59 Jan 28 00:10 .conda
+-rw-r--r--  1 root root   263 Jan 28 18:45 .condarc
+drwxr-xr-x  9 root root   137 Feb  1 20:03 .config
+drwxr-xr-x  3 root root    28 Jan 28 00:06 .dotnet
+drwxr-xr-x  3 root root    37 Feb  1 20:16 .ipython
+drwxr-xr-x  3 root root    27 Jan 28 15:40 .java
+drwxr-xr-x  3 root root    45 Feb  3 21:07 .jupyter
+drwxr-xr-x  4 root root    42 Jan 29 02:53 .local
+drwxr-xr-x  3 root root    26 Jan 28 18:40 .mamba
+drwxr-xr-x  2 root root    55 Jan 30 18:39 .mem0
+drwxr-xr-x  2 root root    40 Jan 31 12:48 .ncbi
+drwx------  3 root root    34 Jan 28 00:10 .nv
+drwxr-xr-x  2 root root    10 Jan 29 02:02 .nvm
+drwxr-xr-x  3 root root    25 Feb  8 01:47 .parallel
+-rw-r--r--  1 root root   279 Feb  8 22:33 .prodyrc
+-rw-r--r--  1 root root   187 Jan 29 02:53 .profile
+-rw-------  1 root root  8217 Feb  8 22:15 .python_history
+drwxr-xr-x  2 root root    78 Feb  3 21:07 .ssh
+drwxr-xr-x  2 root root    34 Jan 29 00:54 .tooluniverse
+-rw-------  1 root root 18425 Feb  8 22:08 .viminfo
+drwxr-xr-x  2 root root    77 Jan 28 18:44 .vscode-R
+drwxr-x---  5 root root  4096 Feb  8 21:40 .vscode-server
+-rw-r--r--  1 root root   445 Feb  8 22:35 .wget-hsts
+-rw-r--r--  1 root root    26 Jan 29 02:53 .zshrc
+lrwxrwxrwx  1 root root    20 Jan 28 00:04 autodl-fs -> ../../autodl-fs/data
+lrwxrwxrwx  1 root root    21 Jan 28 00:04 autodl-pub -> ../../autodl-pub/data
+drwxr-xr-x 15 root root  4096 Feb  8 22:16 autodl-tmp
+drwxr-xr-x 19 root root  4096 Feb  8 22:44 biodatalab
+drwxr-xr-x  1 root root   128 Feb  7 16:17 miniconda3
+-rw-r--r--  1 root root  9137 Feb  1 22:58 ncbi_error_report.txt
+drwxr-xr-x  3 root root    32 Feb  1 10:57 nltk_data
+drwxr-xr-x  2 root root    10 Jan 28 00:04 tf-logs
+/root/biodatalab/benchmark/dataset/MetazExp/toy_srr3/SRR2131244_1.fastq
+</observation>
+So the file is at `/root/biodatalab/benchmark/dataset/MetazExp/toy_srr3/SRR2131244_1.fastq`. Let me use the correct path.
+
+<execute>
+#!BASH
+cd /root/autodl-tmp/biomni_v20260208_tmp/deepseek-v3.2-fast/etazexp_refinemen
+
+# Take first 10000 reads from each file for quick alignment
+echo "Extracting first 10000 reads from toy_srr3..."
+head -n 40000 /root/biodatalab/benchmark/dataset/MetazExp/toy_srr3/SRR2131244_1.fastq > SRR2131244_1_10k.fastq
+head -n 40000 /root/biodatalab/benchmark/dataset/MetazExp/toy_srr3/SRR2131244_2.fastq > SRR2131244_2_10k.fastq
+
+# Align with minimap2
+echo "Aligning with minimap2..."
+REF=/root/biodatalab/benchmark/dataset/MetazExp/ncbi_dataset/data/GCF_001039355.2/GCF_001039355.2_LinAna2.0_genomic.fna
+minimap2 -ax sr -t 2 $REF SRR2131244_1_10k.fastq SRR2131244_2_10k.fastq > toy_srr3_10k.sam 2> minimap2.log
+
+echo "Alignment complete. Checking mapping stats..."
+# Count total reads (non-header lines)
+total=$(grep -v '^@' toy_srr3_10k.sam | wc -l)
+echo "Total aligned reads: $total"
+
+# Count uniquely mapped (MAPQ >= 20)
+unique=$(grep -v '^@' toy_srr3_10k.sam | awk '$5 >= 20' | wc -l)
+echo "Uniquely mapped reads (MAPQ>=20): $unique"
+
+if [ $total -gt 0 ]; then
+    rate=$(echo "scale=2; $unique * 100 / $total" | bc)
+    echo "Uniquely mapped rate: $rate%"
+else
+    echo "No reads aligned."
+fi
+</execute>
+<observation>Extracting first 10000 reads from toy_srr3...
+Aligning with minimap2...
+Alignment complete. Checking mapping stats...
+Total aligned reads: 20095
+Uniquely mapped reads (MAPQ>=20): 13073
+Uniquely mapped rate: 65.05%
+</observation>
+Great! toy_srr3 has uniquely mapped read rate of 65.05% which is ≥ 50%. So toy_srr3 passes all three criteria.
+
+Now we should also check toy_srr1 and toy_srr2 for completeness, even though they fail read length. But actually, we already know they fail read length (95 bp and 88 bp). However, let me double-check their read lengths more thoroughly and also check mapping rate just in case the earlier length check was inaccurate.
+
+Let me check toy_srr1 and toy_srr2 read lengths with more reads.
+
+<execute>
+#!BASH
+cd /root/biodatalab/benchmark/dataset/MetazExp
+
+echo "Checking toy_srr1 read lengths..."
+awk 'NR%4==2 {sum+=length($0); count++} END {if(count>0) print "SRR2131217_1.fastq Average:", sum/count}' toy_srr1/SRR2131217_1.fastq
+awk 'NR%4==2 {sum+=length($0); count++} END {if(count>0) print "SRR2131217_2.fastq Average:", sum/count}' toy_srr1/SRR2131217_2.fastq
+
+echo "Checking toy_srr2 read lengths..."
+awk 'NR%4==2 {sum+=length($0); count++} END {if(count>0) print "SRR2131222_1.fastq Average:", sum/count}' toy_srr2/SRR2131222_1.fastq
+awk 'NR%4==2 {sum+=length($0); count++} END {if(count>0) print "SRR2131222_2.fastq Average:", sum/count}' toy_srr2/SRR2131222_2.fastq
+</execute>
+<observation>Checking toy_srr1 read lengths...
+SRR2131217_1.fastq Average: 98.6132
+SRR2131217_2.fastq Average: 97.2243
+Checking toy_srr2 read lengths...
+SRR2131222_1.fastq Average: 98.3656
+SRR2131222_2.fastq Average: 97.193
+</observation>
+Interesting! The average read lengths are actually around 98-99 bp for both toy_srr1 and toy_srr2, which is still < 100 bp. So they fail the read length criterion.
+
+Thus, only toy_srr3 passes all criteria. Let me update the plan and create the final output.
+
+1. [✓] Examine the three toy_srr directories to understand their structure and locate FASTQ files.
+2. [✓] For each run, check if it's paired-end sequencing by examining the number of FASTQ files.
+3. [✓] Determine read length by examining the first few reads from each FASTQ file.
+4. [✓] Align toy_srr3 reads to the reference genome using minimap2 to calculate mapping statistics.
+5. [✓] Calculate uniquely mapped read rate from alignment results.
+6. [✓] Filter runs that meet all three criteria.
+7. [ ] Output the directory names of high-quality runs to the specified JSON file.
+8. [✓] Ensure all temporary data is saved in the specified temporary directory.
+
+Now create the output JSON file.
+
+<execute>
+import json
+import os
+
+output_json = "/root/autodl-tmp/biomni_v20260208_pred_results/deepseek-v3.2-fast/metazexp_refinement.json"
+high_quality_runs = ["toy_srr3"]  # Only toy_srr3 passes all criteria
+
+# Ensure directory exists
+os.makedirs(os.path.dirname(output_json), exist_ok=True)
+
+# Write to JSON
+with open(output_json, 'w') as f:
+    json.dump(high_quality_runs, f, indent=2)
+
+print(f"Saved high-quality runs to {output_json}")
+print(f"High-quality runs: {high_quality_runs}")
+
+# Verify file was written
+if os.path.exists(output_json):
+    with open(output_json, 'r') as f:
+        content = json.load(f)
+    print(f"File content: {content}")
+else:
+    print("Error: File not created!")
+</execute>
+<observation>Saved high-quality runs to /root/autodl-tmp/biomni_v20260208_pred_results/deepseek-v3.2-fast/metazexp_refinement.json
+High-quality runs: ['toy_srr3']
+File content: ['toy_srr3']
+</observation>
+Perfect! Now let me provide the final solution.
+
+<solution>
+[
+  "toy_srr3"
+]
+</solution>

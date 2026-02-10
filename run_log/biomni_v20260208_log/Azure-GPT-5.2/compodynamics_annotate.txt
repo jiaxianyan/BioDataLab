@@ -1,0 +1,198 @@
+Calculate the genome-wide GC content for sequence from gene Accession Number NZ_WHYS01000010.1. 
+
+This should be done by computing a weighted average of the GC content of all individual CDS features. 
+
+The weight for each CDS is its length. Use the provided genome sequence `benchmark/dataset/CompoDynamics/GCF_009428885.1_ASM942888v1_cds_from_genomic.fna` and corresponding annotation file `benchmark/dataset/CompoDynamics/GCF_009428885.1_ASM942888v1_genomic.gff`. 
+
+Save the final calculated numeric value to `/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/compodynamics_annotate.txt`.
+
+Output format example:
+0.5678
+
+All temp data should be save in `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/compodynamics_annotate`.
+
+<execute>
+import os, re
+from collections import defaultdict
+
+tmp_dir="/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/compodynamics_annotate"
+out_file="/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/compodynamics_annotate.txt"
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(out_file), exist_ok=True)
+
+print("Plan:")
+plan = [
+"Locate CDS records on contig NZ_WHYS01000010.1 from the CDS FASTA and map each to its length and GC count.",
+"Parse the GFF to identify CDS features belonging to NZ_WHYS01000010.1 and connect them to CDS FASTA records via ID/Parent attributes.",
+"Compute weighted GC = (sum GC_bases across CDS) / (sum CDS_length) for the target contig, save numeric value to the required output path."
+]
+for i,s in enumerate(plan,1):
+    print(f"{i}. [ ] {s}")
+    
+fna_path="benchmark/dataset/CompoDynamics/GCF_009428885.1_ASM942888v1_cds_from_genomic.fna"
+gff_path="benchmark/dataset/CompoDynamics/GCF_009428885.1_ASM942888v1_genomic.gff"
+print("\nChecking inputs exist:", os.path.exists(fna_path), os.path.exists(gff_path))
+
+# Step 1: parse CDS FASTA; store by possible keys from header
+from Bio import SeqIO
+cds_records=[]
+key_to_rec={}
+for rec in SeqIO.parse(fna_path,"fasta"):
+    header=rec.description
+    seq=str(rec.seq).upper()
+    length=len(seq)
+    gc=seq.count("G")+seq.count("C")
+    # collect candidate ids: first token, and any [locus_tag=], [protein_id=], [gene=], [location=]
+    tokens=set()
+    tokens.add(rec.id)
+    m=re.findall(r'\[([^\]=]+)=([^\]]+)\]', header)
+    for k,v in m:
+        tokens.add(v)
+    # also capture "locus_tag" specifically
+    recinfo={"rec":rec, "len":length, "gc":gc, "tokens":tokens, "header":header}
+    cds_records.append(recinfo)
+    for t in tokens:
+        key_to_rec[t]=recinfo
+
+print(f"\nParsed CDS FASTA records: {len(cds_records)}")
+# quick peek at an example header
+print("Example header:", cds_records[0]["header"][:200])
+
+# Update plan after step 1
+print("\nUpdated plan:")
+print(f"1. [✓] {plan[0]} (completed)")
+print(f"2. [ ] {plan[1]}")
+print(f"3. [ ] {plan[2]}")
+
+# Step 2: parse GFF, extract CDS on target contig, collect IDs/Parents
+target="NZ_WHYS01000010.1"
+cds_features=[]
+def parse_attrs(attr_str):
+    d={}
+    for part in attr_str.strip().split(";"):
+        if not part: 
+            continue
+        if "=" in part:
+            k,v=part.split("=",1)
+            d[k]=v
+    return d
+
+with open(gff_path) as f:
+    for line in f:
+        if line.startswith("#") or not line.strip():
+            continue
+        cols=line.rstrip("\n").split("\t")
+        if len(cols)<9: 
+            continue
+        seqid, source, ftype, start, end, score, strand, phase, attrs = cols
+        if seqid!=target or ftype!="CDS":
+            continue
+        ad=parse_attrs(attrs)
+        cds_features.append(ad)
+
+print(f"\nCDS features in GFF on {target}: {len(cds_features)}")
+print("Example CDS attrs keys:", list(cds_features[0].keys())[:10] if cds_features else None)
+
+# map features to FASTA records
+matched=[]
+unmatched=[]
+for ad in cds_features:
+    candidates=[]
+    for k in ("ID","Parent","protein_id","locus_tag","gene","Name"):
+        if k in ad:
+            # may be comma separated
+            for val in ad[k].split(","):
+                candidates.append(val)
+    # also try stripping prefixes like 'cds-' etc
+    cand2=set(candidates)
+    for c in candidates:
+        cand2.add(c.replace("cds-",""))
+        cand2.add(c.replace("CDS:",""))
+    found=None
+    for c in cand2:
+        if c in key_to_rec:
+            found=key_to_rec[c]
+            break
+    if found:
+        matched.append(found)
+    else:
+        unmatched.append((ad, candidates))
+
+print(f"Matched CDS features to FASTA records: {len(matched)}")
+print(f"Unmatched: {len(unmatched)}")
+
+# If duplicates due to multi-exon or repeated features, deduplicate by FASTA rec.id
+uniq={}
+for r in matched:
+    uniq[r["rec"].id]=r
+matched_uniq=list(uniq.values())
+print(f"Unique matched CDS records (by rec.id): {len(matched_uniq)}")
+
+# Save debugging lists
+with open(os.path.join(tmp_dir,"unmatched_preview.txt"),"w") as w:
+    for ad,cands in unmatched[:50]:
+        w.write(str(ad)+"\nCAND:"+",".join(cands)+"\n\n")
+
+print("\nUpdated plan:")
+print(f"1. [✓] {plan[0]} (completed)")
+step2_status = "✓" if len(matched_uniq)>0 else "✗"
+print(f"2. [{step2_status}] {plan[1]} ({'completed' if step2_status=='✓' else 'failed: no matches'})")
+print(f"3. [ ] {plan[2]}")
+
+# Step 3: compute weighted GC over unique CDS records on target contig
+total_len=sum(r["len"] for r in matched_uniq)
+total_gc=sum(r["gc"] for r in matched_uniq)
+gc_weighted = total_gc/total_len if total_len else float("nan")
+print(f"\nTotal CDS length: {total_len}")
+print(f"Total GC bases: {total_gc}")
+print(f"Weighted GC content: {gc_weighted:.10f}")
+
+# write output numeric value
+with open(out_file,"w") as w:
+    w.write(f"{gc_weighted:.10f}\n")
+print("Wrote result to:", out_file)
+
+print("\nFinal updated plan:")
+print(f"1. [✓] {plan[0]} (completed)")
+print(f"2. [{step2_status}] {plan[1]} (completed)")
+print(f"3. [✓] {plan[2]} (completed)")
+</execute>
+<observation>Plan:
+1. [ ] Locate CDS records on contig NZ_WHYS01000010.1 from the CDS FASTA and map each to its length and GC count.
+2. [ ] Parse the GFF to identify CDS features belonging to NZ_WHYS01000010.1 and connect them to CDS FASTA records via ID/Parent attributes.
+3. [ ] Compute weighted GC = (sum GC_bases across CDS) / (sum CDS_length) for the target contig, save numeric value to the required output path.
+
+Checking inputs exist: True True
+
+Parsed CDS FASTA records: 2701
+Example header: lcl|NZ_WHYS01000010.1_cds_WP_152943596.1_1 [gene=csx7] [locus_tag=GFB69_RS13170] [protein=type III CRISPR-associated RAMP protein Csx7] [protein_id=WP_152943596.1] [location=182..991] [gbkey=CDS]
+
+Updated plan:
+1. [✓] Locate CDS records on contig NZ_WHYS01000010.1 from the CDS FASTA and map each to its length and GC count. (completed)
+2. [ ] Parse the GFF to identify CDS features belonging to NZ_WHYS01000010.1 and connect them to CDS FASTA records via ID/Parent attributes.
+3. [ ] Compute weighted GC = (sum GC_bases across CDS) / (sum CDS_length) for the target contig, save numeric value to the required output path.
+
+CDS features in GFF on NZ_WHYS01000010.1: 4
+Example CDS attrs keys: ['ID', 'Parent', 'Dbxref', 'Name', 'Ontology_term', 'gbkey', 'gene', 'go_process', 'inference', 'locus_tag']
+Matched CDS features to FASTA records: 4
+Unmatched: 0
+Unique matched CDS records (by rec.id): 4
+
+Updated plan:
+1. [✓] Locate CDS records on contig NZ_WHYS01000010.1 from the CDS FASTA and map each to its length and GC count. (completed)
+2. [✓] Parse the GFF to identify CDS features belonging to NZ_WHYS01000010.1 and connect them to CDS FASTA records via ID/Parent attributes. (completed)
+3. [ ] Compute weighted GC = (sum GC_bases across CDS) / (sum CDS_length) for the target contig, save numeric value to the required output path.
+
+Total CDS length: 3139
+Total GC bases: 1268
+Weighted GC content: 0.4039503026
+Wrote result to: /root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/compodynamics_annotate.txt
+
+Final updated plan:
+1. [✓] Locate CDS records on contig NZ_WHYS01000010.1 from the CDS FASTA and map each to its length and GC count. (completed)
+2. [✓] Parse the GFF to identify CDS features belonging to NZ_WHYS01000010.1 and connect them to CDS FASTA records via ID/Parent attributes. (completed)
+3. [✓] Compute weighted GC = (sum GC_bases across CDS) / (sum CDS_length) for the target contig, save numeric value to the required output path. (completed)
+</observation>
+<solution>
+0.4039503026
+</solution>

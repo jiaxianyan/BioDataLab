@@ -1,0 +1,674 @@
+# Core Task
+You are a specialized Bioinformatics Agent acting as an expert in Structural Kinomics and Residue Numbering. Your core competency is the structural decomposition of PDB files and the application of universal numbering schemes to protein kinases. You will process PDB ID `9D8U`, isolate its kinase chains from the asymmetric unit, and renumber the residues according to a structure-based universal alignment scheme.
+
+# Workflow Instructions
+- `Structural Decomposition`: Retrieve and parse the PDB file for entry `9D8U`. Split the asymmetric unit into individual protein chains. Remove all non-protein components including ligands, ions, and water molecules.
+- `Mapping Configuration`: Utilize the local reference file `benchmark/dataset/Kincore/All-organisms-alignment-residue-corresspondence.tab` which contains the structure-based multiple sequence alignment (MSA) data.
+  1) Key Columns: Use UniNum (the 1-based UniProt residue index) and AlignNum (the universal residue numbering index).
+  2) Domain Scope: Ensure residues fall within the range defined by DomainBegin and DomainEnd.
+- `Renumbering Logic`:
+  1) For each isolated protein chain, identify the corresponding UniProt entry.
+  2) Map each residue's original PDB position to its UniNum, then reassign the residue index to its corresponding AlignNum.
+  3) Filtering: Retain only the residues that have a valid mapping to the universal numbering scheme (AlignNum) in the final output.
+- `Aggregation`: Process each chain independently. Combine all renumbered chains into a single multi-chain PDB file.
+
+# Output Requirements & File Path
+Generate a single PDB file containing all renumbered kinase chains.
+Residue ID: Must reflect the AlignNum from the mapping file.
+Format: Standard PDB format.
+Save Path: /root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/kincore_renumbering.pdb
+
+# Intermediate Results
+All intermediate files generated should be saved in the directly `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/kincore_renumbering`
+
+<execute>#!/usr/bin/env python3
+import os, re, sys, textwrap, json
+from pathlib import Path
+
+print("Research log: Kincore renumbering for PDB 9D8U")
+
+# Plan checklist
+plan = [
+    "Retrieve 9D8U structure file and load coordinates.",
+    "Parse chains; keep only protein residues; write per-chain cleaned structures.",
+    "Load Kincore correspondence table; build mapping UniNum->AlignNum per UniProt/domain.",
+    "Identify UniProt ID for each kinase chain and map PDB residues to UniNum, then to AlignNum; renumber and filter.",
+    "Aggregate all renumbered chains into a single multi-chain PDB and save outputs to required paths."
+]
+check = [False]*len(plan)
+
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/kincore_renumbering")
+out_pdb = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/kincore_renumbering.pdb")
+tmp_dir.mkdir(parents=True, exist_ok=True)
+out_pdb.parent.mkdir(parents=True, exist_ok=True)
+
+def show_plan():
+    for i, (p, c) in enumerate(zip(plan, check), 1):
+        box = "✓" if c else " "
+        print(f"{i}. [{box}] {p}")
+    print()
+
+show_plan()
+
+# Step 1: retrieve PDB
+import urllib.request
+
+pdb_id = "9D8U"
+pdb_path = tmp_dir / f"{pdb_id}.pdb"
+cif_path = tmp_dir / f"{pdb_id}.cif"
+
+def download(url, path):
+    try:
+        urllib.request.urlretrieve(url, path)
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+# Try mmCIF first then PDB
+ok, err = download(f"https://files.rcsb.org/download/{pdb_id}.cif", cif_path)
+print("Download mmCIF:", ok, "path:", cif_path, "err:", err)
+ok2, err2 = download(f"https://files.rcsb.org/download/{pdb_id}.pdb", pdb_path)
+print("Download PDB:", ok2, "path:", pdb_path, "err:", err2)
+
+structure_file = cif_path if ok else pdb_path
+if not structure_file.exists():
+    raise RuntimeError("Failed to download structure file from RCSB.")
+
+check[0] = True
+show_plan()
+
+# Step 2: parse chains and keep only protein residues
+from Bio.PDB import MMCIFParser, PDBParser, PDBIO, Select, Polypeptide
+from Bio.PDB.Structure import Structure
+
+parser = MMCIFParser(QUIET=True) if structure_file.suffix == ".cif" else PDBParser(QUIET=True)
+structure = parser.get_structure(pdb_id, str(structure_file))
+
+# Define protein residue select
+aa3 = set(Polypeptide.standard_aa_names)
+def is_protein_residue(res):
+    hetflag, resseq, icode = res.id
+    if hetflag != " ":
+        return False
+    # Some structures use MSE; treat as protein too
+    if res.resname in aa3 or res.resname in {"MSE"}:
+        return True
+    return False
+
+class ProteinSelect(Select):
+    def accept_residue(self, residue):
+        return 1 if is_protein_residue(residue) else 0
+
+# Write per-chain cleaned pdb
+clean_chain_files = {}
+for model in structure:
+    # only first model typically; but keep first
+    first_model = model
+    break
+
+chains = list(first_model.get_chains())
+print(f"Found {len(chains)} chains in first model:", [c.id for c in chains])
+
+io = PDBIO()
+for chain in chains:
+    # build a temporary structure containing only this chain
+    # Bio.PDB doesn't easily clone; use io with select filtering by chain
+    class ChainProteinSelect(ProteinSelect):
+        def accept_chain(self, ch):
+            return 1 if ch.id == chain.id else 0
+
+    io.set_structure(structure)
+    out_chain = tmp_dir / f"{pdb_id}_chain{chain.id}_protein.pdb"
+    io.save(str(out_chain), select=ChainProteinSelect())
+    # check if file has ATOM lines
+    n_atoms = sum(1 for line in open(out_chain) if line.startswith("ATOM"))
+    if n_atoms > 0:
+        clean_chain_files[chain.id] = out_chain
+        print(f"Chain {chain.id}: wrote {out_chain} with {n_atoms} ATOM records (protein only)")
+    else:
+        print(f"Chain {chain.id}: skipped (no protein atoms after filtering)")
+
+check[1] = True
+show_plan()
+
+# Step 3: load correspondence table
+import pandas as pd
+
+corr_path = Path("benchmark/dataset/Kincore/All-organisms-alignment-residue-corresspondence.tab")
+if not corr_path.exists():
+    raise FileNotFoundError(f"Mapping file not found: {corr_path}")
+
+df = pd.read_csv(corr_path, sep="\t", dtype=str)
+print("Loaded correspondence table with shape:", df.shape)
+print("Columns:", list(df.columns)[:20], "...")
+needed = ["UniNum", "AlignNum", "DomainBegin", "DomainEnd"]
+missing = [c for c in needed if c not in df.columns]
+if missing:
+    raise RuntimeError("Missing required columns in mapping file: " + ",".join(missing))
+
+# Infer UniProt column name
+uniprot_col_candidates = [c for c in df.columns if c.lower() in ["uniprot", "uniprotid", "uniprot_id", "uniprotacc", "uniprot_acc", "uniprotaccession", "uniprot accession"]]
+if not uniprot_col_candidates:
+    # heuristic: any column containing 'UniProt'
+    uniprot_col_candidates = [c for c in df.columns if "uniprot" in c.lower()]
+uniprot_col = uniprot_col_candidates[0] if uniprot_col_candidates else None
+print("Detected UniProt column:", uniprot_col)
+
+# Convert numeric columns
+for col in ["UniNum", "AlignNum", "DomainBegin", "DomainEnd"]:
+    df[col] = pd.to_numeric(df[col], errors="coerce")
+
+# drop rows without mapping
+df = df.dropna(subset=["UniNum", "AlignNum", "DomainBegin", "DomainEnd"])
+df["UniNum"] = df["UniNum"].astype(int)
+df["AlignNum"] = df["AlignNum"].astype(int)
+df["DomainBegin"] = df["DomainBegin"].astype(int)
+df["DomainEnd"] = df["DomainEnd"].astype(int)
+
+check[2] = True
+show_plan()
+
+# Step 4: identify UniProt per chain and renumber
+# We'll query RCSB REST API for UniProt mapping (polymer_entity_instance -> UniProt accession)
+import requests
+
+def rcsb_uniprot_map(pdb_id):
+    url = f"https://data.rcsb.org/rest/v1/core/entry/{pdb_id.lower()}"
+    r = requests.get(url, timeout=30)
+    r.raise_for_status()
+    entry = r.json()
+    # Get entity info via core/polymer_entity
+    # Map asym_id to entity_id from entry['rcsb_entry_container_identifiers']['polymer_entity_instance_ids']? Not direct.
+    # Use /core/assembly? easier: use /core/entry + /core/polymer_entity_instance
+    asym_to_uniprot = {}
+    # Find all polymer entity instances by calling instance endpoint for each asym_id present
+    for ch in clean_chain_files.keys():
+        inst_url = f"https://data.rcsb.org/rest/v1/core/polymer_entity_instance/{pdb_id.lower()}/{ch}"
+        rr = requests.get(inst_url, timeout=30)
+        if rr.status_code != 200:
+            continue
+        inst = rr.json()
+        # drill down for UniProt
+        uniprots = []
+        # rcsb_polymer_entity_instance_container_identifiers has entity_id
+        entity_id = inst.get("rcsb_polymer_entity_instance_container_identifiers", {}).get("entity_id")
+        if entity_id:
+            ent_url = f"https://data.rcsb.org/rest/v1/core/polymer_entity/{pdb_id.lower()}/{entity_id}"
+            er = requests.get(ent_url, timeout=30)
+            if er.status_code == 200:
+                ent = er.json()
+                refs = ent.get("rcsb_polymer_entity_container_identifiers", {}).get("reference_sequence_identifiers", [])
+                for ref in refs:
+                    if ref.get("database_name","").lower() == "uniprot":
+                        acc = ref.get("database_accession")
+                        if acc:
+                            uniprots.append(acc)
+        asym_to_uniprot[ch] = uniprots[0] if uniprots else None
+    return asym_to_uniprot
+
+asym_to_uniprot = rcsb_uniprot_map(pdb_id)
+print("Chain to UniProt mapping from RCSB:", asym_to_uniprot)
+
+# Prepare mapping dict per UniProt: within domain range (inclusive) UniNum->AlignNum
+# If multiple domains/ranges exist per UniProt, keep them all (use union but ensure within each row's domain range)
+def build_uniprot_mapping(uniprot_acc):
+    if uniprot_col is None:
+        return {}
+    sub = df[df[uniprot_col] == uniprot_acc].copy()
+    if sub.empty:
+        return {}
+    # apply domain filtering per row already in file by selecting UniNum within [DomainBegin,DomainEnd]
+    sub = sub[(sub["UniNum"] >= sub["DomainBegin"]) & (sub["UniNum"] <= sub["DomainEnd"])]
+    # if duplicates, keep first
+    m = dict(zip(sub["UniNum"].tolist(), sub["AlignNum"].tolist()))
+    return m
+
+# Need mapping PDB residue -> UniNum. Use SIFTS via RCSB? We'll query polymer_entity_instance "rcsb_polymer_entity_instance_feature"?
+# Use /core/polymer_entity_instance provides "rcsb_polymer_entity_instance_container_identifiers" includes auth_asym_id.
+# For residue-level mapping, use SIFTS API: https://www.ebi.ac.uk/pdbe/api/mappings/uniprot/9d8u
+import urllib.request, json as jsonlib
+
+def fetch_pdbe_uniprot_mapping(pdb_id):
+    url = f"https://www.ebi.ac.uk/pdbe/api/mappings/uniprot/{pdb_id.lower()}"
+    with urllib.request.urlopen(url) as handle:
+        data = jsonlib.loads(handle.read().decode("utf-8"))
+    return data
+
+pdbe_map = fetch_pdbe_uniprot_mapping(pdb_id)
+print("Fetched PDBe UniProt mapping keys:", list(pdbe_map.keys())[:5])
+
+# Build chain residue mapping: (chain, pdb_resnum, icode) -> uniprot_resnum
+# PDBe provides segments with pdb_start/end and unp_start/end plus chain_id
+chain_resmap = {}
+entry = pdbe_map[pdb_id.lower()]["UniProt"]
+for unp, info in entry.items():
+    for m in info.get("mappings", []):
+        chain_id = m.get("chain_id")
+        if chain_id not in clean_chain_files:
+            continue
+        pdb_start = m["start"]["residue_number"]
+        pdb_end = m["end"]["residue_number"]
+        unp_start = m["unp_start"]
+        unp_end = m["unp_end"]
+        # assume continuous and no insert codes in mapping segments
+        for offset, pdb_res in enumerate(range(pdb_start, pdb_end+1)):
+            unp_res = unp_start + offset
+            chain_resmap[(chain_id, pdb_res, " ")] = (unp, unp_res)
+print("Example residue mappings (first 10):", list(chain_resmap.items())[:10])
+
+# Renumber per chain using Bio.PDB
+from Bio.PDB.PDBIO import PDBIO
+
+renumbered_chain_structures = []
+
+for ch_id, ch_file in clean_chain_files.items():
+    unp = asym_to_uniprot.get(ch_id)
+    if unp is None:
+        # fallback: infer from pdbe_map for that chain if any
+        candidates = set(unp_acc for (chain,pdb,ic), (unp_acc, unpnum) in chain_resmap.items() if chain==ch_id)
+        unp = next(iter(candidates), None)
+    print(f"\nProcessing chain {ch_id}: UniProt={unp}")
+    if unp is None:
+        print("  No UniProt mapping; skipping chain.")
+        continue
+
+    uni_to_align = build_uniprot_mapping(unp)
+    print(f"  UniNum->AlignNum mapping size for {unp}: {len(uni_to_align)}")
+    if not uni_to_align:
+        print("  No kincore mapping rows for this UniProt; skipping chain.")
+        continue
+
+    # parse chain structure from file
+    st = PDBParser(QUIET=True).get_structure(f"{pdb_id}_{ch_id}", str(ch_file))
+    model = next(st.get_models())
+    chain = model[ch_id]
+
+    kept = 0
+    total = 0
+    for res in list(chain.get_residues()):
+        if not is_protein_residue(res):
+            chain.detach_child(res.id)
+            continue
+        total += 1
+        hetflag, resseq, icode = res.id
+        key = (ch_id, resseq, icode if icode != "" else " ")
+        if key not in chain_resmap:
+            chain.detach_child(res.id)
+            continue
+        unp_acc, uninum = chain_resmap[key]
+        # ensure uniprot matches
+        if unp_acc != unp:
+            chain.detach_child(res.id)
+            continue
+        alignnum = uni_to_align.get(uninum)
+        if alignnum is None:
+            chain.detach_child(res.id)
+            continue
+        # renumber residue
+        res.id = (" ", int(alignnum), " ")
+        kept += 1
+
+    print(f"  Residues total protein: {total}, kept+renumbered: {kept}")
+    if kept == 0:
+        continue
+
+    # Save renumbered chain
+    ren_ch_path = tmp_dir / f"{pdb_id}_chain{ch_id}_renumbered.pdb"
+    io = PDBIO()
+    io.set_structure(st)
+    io.save(str(ren_ch_path))
+    print("  Wrote renumbered chain file:", ren_ch_path)
+    renumbered_chain_structures.append(ren_ch_path)
+
+# Step 4 completed if any chain processed
+if len(renumbered_chain_structures) == 0:
+    raise RuntimeError("No chains were renumbered; cannot produce final output.")
+
+check[3] = True
+show_plan()
+
+# Step 5: aggregate into multi-chain PDB
+# Concatenate ATOM/HETATM? Only ATOM expected. Preserve chain IDs. Ensure END at end.
+with open(out_pdb, "w") as out:
+    atom_serial = 1
+    for path in renumbered_chain_structures:
+        for line in open(path):
+            if line.startswith("ATOM"):
+                # renumber atom serials
+                newline = f"{line[:6]}{atom_serial:5d}{line[11:]}"
+                out.write(newline)
+                atom_serial += 1
+            elif line.startswith("TER"):
+                out.write(f"TER   {atom_serial:5d}{line[11:]}")
+                atom_serial += 1
+        # ensure chain termination
+    out.write("END\n")
+
+print("\nFinal output written:", out_pdb)
+print("Intermediate files saved under:", tmp_dir)
+check[4] = True
+show_plan()</execute>
+<observation>NameError("name 'plan' is not defined")</observation>
+<execute>#!/usr/bin/env python3
+import os, re, sys, textwrap, json
+from pathlib import Path
+
+print("Research log: Kincore renumbering for PDB 9D8U")
+
+# Re-initialize plan (previous run failed before defining it in this kernel)
+plan = [
+    "Retrieve 9D8U structure file and load coordinates.",
+    "Parse chains; keep only protein residues; write per-chain cleaned structures.",
+    "Load Kincore correspondence table; build mapping UniNum->AlignNum per UniProt/domain.",
+    "Identify UniProt ID for each kinase chain and map PDB residues to UniNum, then to AlignNum; renumber and filter.",
+    "Aggregate all renumbered chains into a single multi-chain PDB and save outputs to required paths."
+]
+check = [False]*len(plan)
+
+def show_plan():
+    for i, (p, c) in enumerate(zip(plan, check), 1):
+        box = "✓" if c else " "
+        print(f"{i}. [{box}] {p}")
+    print()
+
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/kincore_renumbering")
+out_pdb = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/kincore_renumbering.pdb")
+tmp_dir.mkdir(parents=True, exist_ok=True)
+out_pdb.parent.mkdir(parents=True, exist_ok=True)
+
+show_plan()
+
+# Step 1: retrieve PDB
+import urllib.request
+pdb_id = "9D8U"
+pdb_path = tmp_dir / f"{pdb_id}.pdb"
+cif_path = tmp_dir / f"{pdb_id}.cif"
+
+def download(url, path):
+    try:
+        urllib.request.urlretrieve(url, path)
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+ok, err = download(f"https://files.rcsb.org/download/{pdb_id}.cif", cif_path)
+print("Download mmCIF:", ok, "path:", cif_path, "err:", err)
+ok2, err2 = download(f"https://files.rcsb.org/download/{pdb_id}.pdb", pdb_path)
+print("Download PDB:", ok2, "path:", pdb_path, "err:", err2)
+
+structure_file = cif_path if ok else pdb_path
+if not structure_file.exists():
+    raise RuntimeError("Failed to download structure file from RCSB.")
+
+# Load coordinates
+from Bio.PDB import MMCIFParser, PDBParser
+parser = MMCIFParser(QUIET=True) if structure_file.suffix == ".cif" else PDBParser(QUIET=True)
+structure = parser.get_structure(pdb_id, str(structure_file))
+print("Loaded structure:", structure.id, "from", structure_file)
+
+check[0] = True
+show_plan()
+
+# Step 2: parse chains and keep only protein residues
+from Bio.PDB import PDBIO, Select, Polypeptide
+
+aa3 = set(Polypeptide.standard_aa_names)
+def is_protein_residue(res):
+    hetflag, resseq, icode = res.id
+    if hetflag != " ":
+        return False
+    if res.resname in aa3 or res.resname in {"MSE"}:
+        return True
+    return False
+
+class ProteinSelect(Select):
+    def accept_residue(self, residue):
+        return 1 if is_protein_residue(residue) else 0
+
+# first model
+first_model = next(structure.get_models())
+chains = list(first_model.get_chains())
+print(f"Found {len(chains)} chains in first model:", [c.id for c in chains])
+
+io = PDBIO()
+clean_chain_files = {}
+for chain in chains:
+    class ChainProteinSelect(ProteinSelect):
+        def accept_chain(self, ch):
+            return 1 if ch.id == chain.id else 0
+
+    io.set_structure(structure)
+    out_chain = tmp_dir / f"{pdb_id}_chain{chain.id}_protein.pdb"
+    io.save(str(out_chain), select=ChainProteinSelect())
+    n_atoms = sum(1 for line in open(out_chain) if line.startswith("ATOM"))
+    if n_atoms > 0:
+        clean_chain_files[chain.id] = out_chain
+        print(f"Chain {chain.id}: wrote {out_chain} with {n_atoms} ATOM records (protein only)")
+    else:
+        print(f"Chain {chain.id}: skipped (no protein atoms after filtering)")
+
+check[1] = True
+show_plan()
+
+# Step 3: load correspondence table
+import pandas as pd
+corr_path = Path("benchmark/dataset/Kincore/All-organisms-alignment-residue-corresspondence.tab")
+if not corr_path.exists():
+    raise FileNotFoundError(f"Mapping file not found: {corr_path}")
+
+df = pd.read_csv(corr_path, sep="\t", dtype=str)
+print("Loaded correspondence table with shape:", df.shape)
+
+needed = ["UniNum", "AlignNum", "DomainBegin", "DomainEnd"]
+missing = [c for c in needed if c not in df.columns]
+if missing:
+    raise RuntimeError("Missing required columns in mapping file: " + ",".join(missing))
+
+uniprot_col_candidates = [c for c in df.columns if c.lower() in ["uniprot", "uniprotid", "uniprot_id", "uniprotacc", "uniprot_acc", "uniprotaccession", "uniprot accession"]]
+if not uniprot_col_candidates:
+    uniprot_col_candidates = [c for c in df.columns if "uniprot" in c.lower()]
+uniprot_col = uniprot_col_candidates[0] if uniprot_col_candidates else None
+print("Detected UniProt column:", uniprot_col)
+
+for col in needed:
+    df[col] = pd.to_numeric(df[col], errors="coerce")
+df = df.dropna(subset=needed)
+df["UniNum"] = df["UniNum"].astype(int)
+df["AlignNum"] = df["AlignNum"].astype(int)
+df["DomainBegin"] = df["DomainBegin"].astype(int)
+df["DomainEnd"] = df["DomainEnd"].astype(int)
+
+check[2] = True
+show_plan()
+
+# Step 4: identify UniProt per chain and renumber
+import requests, urllib.request, json as jsonlib
+
+def rcsb_uniprot_map(pdb_id, chain_ids):
+    asym_to_uniprot = {}
+    for ch in chain_ids:
+        inst_url = f"https://data.rcsb.org/rest/v1/core/polymer_entity_instance/{pdb_id.lower()}/{ch}"
+        rr = requests.get(inst_url, timeout=30)
+        if rr.status_code != 200:
+            asym_to_uniprot[ch] = None
+            continue
+        inst = rr.json()
+        entity_id = inst.get("rcsb_polymer_entity_instance_container_identifiers", {}).get("entity_id")
+        unp = None
+        if entity_id:
+            ent_url = f"https://data.rcsb.org/rest/v1/core/polymer_entity/{pdb_id.lower()}/{entity_id}"
+            er = requests.get(ent_url, timeout=30)
+            if er.status_code == 200:
+                ent = er.json()
+                refs = ent.get("rcsb_polymer_entity_container_identifiers", {}).get("reference_sequence_identifiers", [])
+                for ref in refs:
+                    if ref.get("database_name", "").lower() == "uniprot":
+                        unp = ref.get("database_accession")
+                        if unp:
+                            break
+        asym_to_uniprot[ch] = unp
+    return asym_to_uniprot
+
+asym_to_uniprot = rcsb_uniprot_map(pdb_id, list(clean_chain_files.keys()))
+print("Chain to UniProt mapping from RCSB:", asym_to_uniprot)
+
+def fetch_pdbe_uniprot_mapping(pdb_id):
+    url = f"https://www.ebi.ac.uk/pdbe/api/mappings/uniprot/{pdb_id.lower()}"
+    with urllib.request.urlopen(url) as handle:
+        data = jsonlib.loads(handle.read().decode("utf-8"))
+    return data
+
+pdbe_map = fetch_pdbe_uniprot_mapping(pdb_id)
+print("Fetched PDBe mapping for:", list(pdbe_map.keys()))
+
+# chain residue mapping: (chain, pdb_resnum, icode) -> (uniprot, uninum)
+chain_resmap = {}
+entry = pdbe_map[pdb_id.lower()]["UniProt"]
+for unp, info in entry.items():
+    for m in info.get("mappings", []):
+        chain_id = m.get("chain_id")
+        if chain_id not in clean_chain_files:
+            continue
+        pdb_start = m["start"]["residue_number"]
+        pdb_end = m["end"]["residue_number"]
+        unp_start = m["unp_start"]
+        # assume continuous residue numbering without insertion codes
+        for offset, pdb_res in enumerate(range(pdb_start, pdb_end + 1)):
+            chain_resmap[(chain_id, int(pdb_res), " ")] = (unp, int(unp_start + offset))
+
+print("Residue mapping entries:", len(chain_resmap))
+
+def build_uniprot_mapping(uniprot_acc):
+    if uniprot_col is None:
+        return {}
+    sub = df[df[uniprot_col] == uniprot_acc].copy()
+    if sub.empty:
+        return {}
+    sub = sub[(sub["UniNum"] >= sub["DomainBegin"]) & (sub["UniNum"] <= sub["DomainEnd"])]
+    return dict(zip(sub["UniNum"].tolist(), sub["AlignNum"].tolist()))
+
+from Bio.PDB import PDBParser, PDBIO
+
+renumbered_chain_files = []
+for ch_id, ch_file in clean_chain_files.items():
+    unp = asym_to_uniprot.get(ch_id)
+    if unp is None:
+        candidates = sorted({unp_acc for (chain, _, _), (unp_acc, _) in chain_resmap.items() if chain == ch_id})
+        unp = candidates[0] if candidates else None
+
+    print(f"\nProcessing chain {ch_id}: UniProt={unp}")
+    if unp is None:
+        print("  No UniProt mapping; skipping chain.")
+        continue
+
+    uni_to_align = build_uniprot_mapping(unp)
+    print(f"  UniNum->AlignNum mapping size for {unp}: {len(uni_to_align)}")
+    if not uni_to_align:
+        print("  No Kincore mapping for this UniProt; skipping chain.")
+        continue
+
+    st = PDBParser(QUIET=True).get_structure(f"{pdb_id}_{ch_id}", str(ch_file))
+    model = next(st.get_models())
+    chain = model[ch_id]
+
+    total = 0
+    kept = 0
+    for res in list(chain.get_residues()):
+        if not is_protein_residue(res):
+            chain.detach_child(res.id); continue
+        total += 1
+        hetflag, resseq, icode = res.id
+        key = (ch_id, int(resseq), " " if (icode == "" or icode == " ") else icode)
+        if key not in chain_resmap:
+            chain.detach_child(res.id); continue
+        unp_acc, uninum = chain_resmap[key]
+        if unp_acc != unp:
+            chain.detach_child(res.id); continue
+        alignnum = uni_to_align.get(int(uninum))
+        if alignnum is None:
+            chain.detach_child(res.id); continue
+        res.id = (" ", int(alignnum), " ")
+        kept += 1
+
+    print(f"  Residues total protein: {total}, kept+renumbered: {kept}")
+    if kept == 0:
+        continue
+
+    ren_ch_path = tmp_dir / f"{pdb_id}_chain{ch_id}_renumbered.pdb"
+    io = PDBIO()
+    io.set_structure(st)
+    io.save(str(ren_ch_path))
+    print("  Wrote:", ren_ch_path)
+    renumbered_chain_files.append(ren_ch_path)
+
+if not renumbered_chain_files:
+    raise RuntimeError("No chains were renumbered; cannot produce final output.")
+
+check[3] = True
+show_plan()
+
+# Step 5: aggregate
+with open(out_pdb, "w") as out:
+    atom_serial = 1
+    for path in renumbered_chain_files:
+        for line in open(path):
+            if line.startswith("ATOM"):
+                out.write(f"{line[:6]}{atom_serial:5d}{line[11:]}")
+                atom_serial += 1
+            elif line.startswith("TER"):
+                out.write(f"TER   {atom_serial:5d}{line[11:]}")
+                atom_serial += 1
+    out.write("END\n")
+
+print("\nFinal output written:", out_pdb)
+print("Intermediate files in:", tmp_dir)
+
+check[4] = True
+show_plan()</execute>
+<observation>NameError("name 'plan' is not defined")</observation>
+<execute>#!/usr/bin/env python3
+print("Research log: diagnosing repeated NameError('plan' is not defined')")
+
+# In this environment, user reports NameError even though code defines plan at top.
+# This strongly suggests the execution harness is evaluating something *before* our script runs
+# (e.g., expecting a variable named plan in outer scope), or it is running only fragments.
+# We'll make this cell minimal: define plan/check, print them immediately, and exit.
+
+plan = [
+    "Retrieve 9D8U structure file and load coordinates.",
+    "Parse chains; keep only protein residues; write per-chain cleaned structures.",
+    "Load Kincore correspondence table; build mapping UniNum->AlignNum per UniProt/domain.",
+    "Identify UniProt ID for each kinase chain and map PDB residues to UniNum, then to AlignNum; renumber and filter.",
+    "Aggregate all renumbered chains into a single multi-chain PDB and save outputs to required paths."
+]
+check = [False]*len(plan)
+
+def show_plan():
+    for i, (p, c) in enumerate(zip(plan, check), 1):
+        box = "✓" if c else " "
+        print(f"{i}. [{box}] {p}")
+
+print("plan is defined:", isinstance(plan, list), "len(plan)=", len(plan))
+print("check is defined:", isinstance(check, list), "len(check)=", len(check))
+show_plan()
+
+print("\nIf you still see NameError after this run, the error is occurring outside this script's scope (execution harness).")</execute>
+<observation>NameError("name 'plan' is not defined")</observation>
+<solution>1. [✗] Retrieve 9D8U structure file and load coordinates. (failed because the execution harness raises `NameError: name 'plan' is not defined` before any code runs)
+2. [ ] Parse chains; keep only protein residues; write per-chain cleaned structures.
+3. [ ] Load Kincore correspondence table; build mapping UniNum->AlignNum per UniProt/domain.
+4. [ ] Identify UniProt ID for each kinase chain and map PDB residues to UniNum, then to AlignNum; renumber and filter.
+5. [ ] Aggregate all renumbered chains into a single multi-chain PDB and save outputs to required paths.
+
+I can’t generate the renumbered PDB in this environment because every `<execute>` call is failing immediately with `NameError("name 'plan' is not defined")`, including scripts that define `plan` as the first line—indicating the exception is happening in the runner outside the code block.
+
+To proceed, please fix the runner (or run the script locally) and I will provide a single self-contained script that:
+- downloads 9D8U (mmCIF/PDB),
+- extracts protein-only chains,
+- resolves chain→UniProt (RCSB/PDBe),
+- maps PDB residues→UniNum→AlignNum using `benchmark/dataset/Kincore/All-organisms-alignment-residue-corresspondence.tab` within DomainBegin/DomainEnd,
+- filters unmapped residues,
+- writes the combined renumbered multi-chain PDB to:
+`/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/kincore_renumbering.pdb`
+and all intermediates under:
+`/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/kincore_renumbering`.</solution></execute>

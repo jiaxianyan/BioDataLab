@@ -1,0 +1,1206 @@
+Given a list of smiles in `benchmark/dataset/FusionNeoAntigen/dock/smiles.txt`.
+
+Identify the smiles have highest vina affinity to protein `benchmark/dataset/FusionNeoAntigen/dock/1a1e_protein.pdb`.
+
+Docking pocket and size are listed in `benchmark/dataset/FusionNeoAntigen/dock/pocket_config.txt`.
+
+Save the final smiles `/root/autodl-tmp/biomni_v20260208_pred_results/doubao-seed-1-8/fusionneoantigen_annotate_2.txt`. 
+
+Output example for reference:
+```
+cccccc
+```
+
+All intermediate files generated during the extraction process should be stored in `/root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/fusionneoantigen_annotate_2/`.
+
+<execute>#!BASH
+# Create temporary directory
+mkdir -p /root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/fusionneoantigen_annotate_2/
+
+# Check input files exist
+ls -la benchmark/dataset/FusionNeoAntigen/dock/
+</execute>
+<observation>total 272
+drwxr-xr-x 3 root root    133 Feb  8 21:38 .
+drwxr-xr-x 3 root root     89 Feb  8 19:39 ..
+-rw-r--r-- 1 root root   7459 Feb  8 19:39 1a1e_ligand.mol2
+-rw-r--r-- 1 root root 260309 Feb  8 19:39 1a1e_protein.pdb
+drwxr-xr-x 2 root root     10 Feb  8 21:38 mols
+-rw-r--r-- 1 root root    134 Feb  8 21:07 pocket_config.txt
+-rw-r--r-- 1 root root    348 Feb  8 21:02 smiles.txt
+</observation>
+<execute>#!BASH
+# Read pocket configuration
+cat benchmark/dataset/FusionNeoAntigen/dock/pocket_config.txt
+</execute>
+<observation>center_x = 41.769
+center_y = -7.402
+center_z = 42.155
+size_x = 19.789
+size_y = 20.561
+size_z = 28.931
+exhaustiveness = 8
+num_modes = 9</observation>
+<execute>
+import os
+import subprocess
+from rdkit import Chem
+from rdkit.Chem import AllChem
+
+# Configuration
+smiles_file = "benchmark/dataset/FusionNeoAntigen/dock/smiles.txt"
+protein_pdb = "benchmark/dataset/FusionNeoAntigen/dock/1a1e_protein.pdb"
+pocket_config = "benchmark/dataset/FusionNeoAntigen/dock/pocket_config.txt"
+tmp_dir = "/root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/fusionneoantigen_annotate_2/"
+result_file = "/root/autodl-tmp/biomni_v20260208_pred_results/doubao-seed-1-8/fusionneoantigen_annotate_2.txt"
+
+# Read pocket configuration
+pocket_params = {}
+with open(pocket_config, 'r') as f:
+    for line in f:
+        key, value = line.strip().split(' = ')
+        pocket_params[key] = float(value)
+
+# Read SMILES
+with open(smiles_file, 'r') as f:
+    smiles_list = [line.strip() for line in f if line.strip()]
+
+# Prepare protein PDBQT (if not exists)
+protein_pdbqt = os.path.join(tmp_dir, "protein.pdbqt")
+if not os.path.exists(protein_pdbqt):
+    subprocess.run([
+        "prepare_receptor4.py", 
+        "-r", protein_pdb, 
+        "-o", protein_pdbqt
+    ], check=True)
+
+# Process each SMILES
+best_affinity = float('inf')
+best_smiles = None
+
+for idx, smiles in enumerate(smiles_list):
+    print(f"Processing SMILES {idx+1}/{len(smiles_list)}: {smiles}")
+    
+    # Convert SMILES to PDBQT
+    ligand_name = f"ligand_{idx}"
+    ligand_pdbqt = os.path.join(tmp_dir, f"{ligand_name}.pdbqt")
+    
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        print(f"Invalid SMILES: {smiles}")
+        continue
+    
+    mol = Chem.AddHs(mol)
+    AllChem.EmbedMolecule(mol)
+    AllChem.UFFOptimizeMolecule(mol)
+    
+    # Save to PDB then convert to PDBQT
+    ligand_pdb = os.path.join(tmp_dir, f"{ligand_name}.pdb")
+    Chem.MolToPDBFile(mol, ligand_pdb)
+    
+    subprocess.run([
+        "prepare_ligand4.py", 
+        "-l", ligand_pdb, 
+        "-o", ligand_pdbqt
+    ], check=True)
+    
+    # Run Vina docking
+    vina_output = os.path.join(tmp_dir, f"{ligand_name}_vina_out.pdbqt")
+    log_file = os.path.join(tmp_dir, f"{ligand_name}_vina_log.txt")
+    
+    subprocess.run([
+        "vina", 
+        "--receptor", protein_pdbqt,
+        "--ligand", ligand_pdbqt,
+        "--center_x", str(pocket_params['center_x']),
+        "--center_y", str(pocket_params['center_y']),
+        "--center_z", str(pocket_params['center_z']),
+        "--size_x", str(pocket_params['size_x']),
+        "--size_y", str(pocket_params['size_y']),
+        "--size_z", str(pocket_params['size_z']),
+        "--exhaustiveness", str(int(pocket_params['exhaustiveness'])),
+        "--num_modes", str(int(pocket_params['num_modes'])),
+        "--out", vina_output,
+        "--log", log_file
+    ], check=True)
+    
+    # Extract best affinity from log
+    with open(log_file, 'r') as f:
+        for line in f:
+            if "Affinity:" in line:
+                affinity = float(line.strip().split()[1])
+                print(f"  Affinity: {affinity} kcal/mol")
+                
+                # Update best affinity (more negative is better)
+                if affinity < best_affinity:
+                    best_affinity = affinity
+                    best_smiles = smiles
+                break
+
+# Save result
+os.makedirs(os.path.dirname(result_file), exist_ok=True)
+with open(result_file, 'w') as f:
+    f.write(best_smiles + "\n")
+
+print(f"\nBest SMILES with affinity {best_affinity} kcal/mol: {best_smiles}")
+print(f"Result saved to: {result_file}")
+</execute>
+<observation>CalledProcessError(1, ['prepare_receptor4.py', '-r', 'benchmark/dataset/FusionNeoAntigen/dock/1a1e_protein.pdb', '-o', '/root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/fusionneoantigen_annotate_2/protein.pdbqt'])</observation>
+<execute>#!BASH
+# Check if prepare_receptor4.py is available
+which prepare_receptor4.py
+echo $PATH
+
+# Try using pdbqt conversion with OpenBabel
+obabel -V
+</execute>
+<observation>/root/miniconda3/envs/biomni_e1/bin/prepare_receptor4.py
+/root/miniconda3/envs/biomni_e1/bin.AVX2_256:/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:/root/miniconda3/envs/biomni_e1/bin:/usr/local/bin:/root/.vscode-server/data/User/globalStorage/github.copilot-chat/debugCommand:/root/.vscode-server/data/User/globalStorage/github.copilot-chat/copilotCli:/root/.vscode-server/cli/servers/Stable-bdd88df003631aaa0bcbe057cb0a940b80a476fa/server/bin/remote-cli:/root/miniconda3/bin:/root/miniconda3/condabin:/root/.local/bin:/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin:/root/miniconda3/bin:/usr/local/bin:/root/miniconda3/bin:/usr/local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/root/.vscode-server/extensions/ms-python.debugpy-2025.18.0-linux-x64/bundled/scripts/noConfigScripts
+Open Babel 2.4.1 -- Jan 25 2017 -- 17:44:52
+</observation>
+<execute>
+import os
+import subprocess
+from rdkit import Chem
+from rdkit.Chem import AllChem
+
+# Configuration
+smiles_file = "benchmark/dataset/FusionNeoAntigen/dock/smiles.txt"
+protein_pdb = "benchmark/dataset/FusionNeoAntigen/dock/1a1e_protein.pdb"
+pocket_config = "benchmark/dataset/FusionNeoAntigen/dock/pocket_config.txt"
+tmp_dir = "/root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/fusionneoantigen_annotate_2/"
+result_file = "/root/autodl-tmp/biomni_v20260208_pred_results/doubao-seed-1-8/fusionneoantigen_annotate_2.txt"
+
+# Create tmp directory
+os.makedirs(tmp_dir, exist_ok=True)
+
+# Read pocket configuration
+pocket_params = {}
+with open(pocket_config, 'r') as f:
+    for line in f:
+        key, value = line.strip().split(' = ')
+        pocket_params[key] = float(value)
+
+# Read SMILES
+with open(smiles_file, 'r') as f:
+    smiles_list = [line.strip() for line in f if line.strip()]
+
+# Prepare protein PDBQT using OpenBabel
+protein_pdbqt = os.path.join(tmp_dir, "protein.pdbqt")
+if not os.path.exists(protein_pdbqt):
+    subprocess.run([
+        "obabel", protein_pdb, 
+        "-O", protein_pdbqt,
+        "-xr",  # Remove hydrogens
+        "-p"    # Add polar hydrogens
+    ], check=True)
+    print(f"Protein converted to PDBQT: {protein_pdbqt}")
+
+# Process each SMILES
+best_affinity = float('inf')
+best_smiles = None
+
+for idx, smiles in enumerate(smiles_list):
+    print(f"\nProcessing SMILES {idx+1}/{len(smiles_list)}: {smiles}")
+    
+    # Convert SMILES to PDBQT
+    ligand_name = f"ligand_{idx}"
+    ligand_pdbqt = os.path.join(tmp_dir, f"{ligand_name}.pdbqt")
+    
+    try:
+        # Convert SMILES to mol
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            print(f"Invalid SMILES: {smiles}")
+            continue
+        
+        # Add hydrogens and optimize
+        mol = Chem.AddHs(mol)
+        AllChem.EmbedMolecule(mol)
+        AllChem.UFFOptimizeMolecule(mol)
+        
+        # Save to SDF then convert to PDBQT
+        ligand_sdf = os.path.join(tmp_dir, f"{ligand_name}.sdf")
+        with open(ligand_sdf, 'w') as f:
+            w = Chem.SDWriter(f)
+            w.write(mol)
+            w.close()
+        
+        # Convert to PDBQT using OpenBabel
+        subprocess.run([
+            "obabel", ligand_sdf,
+            "-O", ligand_pdbqt,
+            "-xh",  # Remove non-polar hydrogens
+            "-p"    # Add polar hydrogens
+        ], check=True)
+        
+        # Run Vina docking
+        vina_output = os.path.join(tmp_dir, f"{ligand_name}_vina_out.pdbqt")
+        log_file = os.path.join(tmp_dir, f"{ligand_name}_vina_log.txt")
+        
+        result = subprocess.run([
+            "vina", 
+            "--receptor", protein_pdbqt,
+            "--ligand", ligand_pdbqt,
+            "--center_x", str(pocket_params['center_x']),
+            "--center_y", str(pocket_params['center_y']),
+            "--center_z", str(pocket_params['center_z']),
+            "--size_x", str(pocket_params['size_x']),
+            "--size_y", str(pocket_params['size_y']),
+            "--size_z", str(pocket_params['size_z']),
+            "--exhaustiveness", str(int(pocket_params['exhaustiveness'])),
+            "--num_modes", str(int(pocket_params['num_modes'])),
+            "--out", vina_output,
+            "--log", log_file
+        ], capture_output=True, text=True)
+        
+        # Check if Vina ran successfully
+        if result.returncode != 0:
+            print(f"Vina failed for {smiles}: {result.stderr}")
+            continue
+        
+        # Extract best affinity from log
+        with open(log_file, 'r') as f:
+            for line in f:
+                if "Affinity:" in line:
+                    affinity = float(line.strip().split()[1])
+                    print(f"  Affinity: {affinity} kcal/mol")
+                    
+                    # Update best affinity (more negative is better)
+                    if affinity < best_affinity:
+                        best_affinity = affinity
+                        best_smiles = smiles
+                    break
+                    
+    except Exception as e:
+        print(f"Error processing {smiles}: {str(e)}")
+        continue
+
+# Save result
+os.makedirs(os.path.dirname(result_file), exist_ok=True)
+with open(result_file, 'w') as f:
+    f.write(best_smiles + "\n")
+
+print(f"\n=== Final Result ===")
+print(f"Best SMILES: {best_smiles}")
+print(f"Best Affinity: {best_affinity} kcal/mol")
+print(f"Result saved to: {result_file}")
+</execute>
+<observation>TypeError("unsupported operand type(s) for +: 'NoneType' and 'str'")</observation>
+<execute>
+import os
+import subprocess
+from rdkit import Chem
+from rdkit.Chem import AllChem
+
+# Configuration
+smiles_file = "benchmark/dataset/FusionNeoAntigen/dock/smiles.txt"
+protein_pdb = "benchmark/dataset/FusionNeoAntigen/dock/1a1e_protein.pdb"
+pocket_config = "benchmark/dataset/FusionNeoAntigen/dock/pocket_config.txt"
+tmp_dir = "/root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/fusionneoantigen_annotate_2/"
+result_file = "/root/autodl-tmp/biomni_v20260208_pred_results/doubao-seed-1-8/fusionneoantigen_annotate_2.txt"
+
+# Create tmp directory
+os.makedirs(tmp_dir, exist_ok=True)
+
+# Read pocket configuration
+pocket_params = {}
+with open(pocket_config, 'r') as f:
+    for line in f:
+        key, value = line.strip().split(' = ')
+        pocket_params[key] = float(value)
+
+# Read SMILES
+with open(smiles_file, 'r') as f:
+    smiles_list = [line.strip() for line in f if line.strip()]
+
+print(f"Found {len(smiles_list)} SMILES to process")
+
+# Initialize best values
+best_affinity = float('inf')
+best_smiles = None
+
+# Process each SMILES
+for idx, smiles in enumerate(smiles_list):
+    print(f"\nProcessing SMILES {idx+1}/{len(smiles_list)}: {smiles}")
+    
+    # Skip if SMILES is empty
+    if not smiles:
+        print("Empty SMILES, skipping")
+        continue
+    
+    try:
+        # Convert SMILES to mol
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            print(f"Invalid SMILES: {smiles}")
+            continue
+        
+        # Add hydrogens and optimize
+        mol = Chem.AddHs(mol)
+        AllChem.EmbedMolecule(mol)
+        AllChem.UFFOptimizeMolecule(mol)
+        
+        # Save to SDF
+        ligand_sdf = os.path.join(tmp_dir, f"ligand_{idx}.sdf")
+        with open(ligand_sdf, 'w') as f:
+            w = Chem.SDWriter(f)
+            w.write(mol)
+            w.close()
+        
+        # Convert to PDBQT using OpenBabel
+        ligand_pdbqt = os.path.join(tmp_dir, f"ligand_{idx}.pdbqt")
+        subprocess.run([
+            "obabel", ligand_sdf,
+            "-O", ligand_pdbqt,
+            "-xh",  # Remove non-polar hydrogens
+            "-p"    # Add polar hydrogens
+        ], check=True, capture_output=True)
+        
+        # Prepare protein PDBQT once
+        protein_pdbqt = os.path.join(tmp_dir, "protein.pdbqt")
+        if not os.path.exists(protein_pdbqt):
+            subprocess.run([
+                "obabel", protein_pdb, 
+                "-O", protein_pdbqt,
+                "-xr",  # Remove hydrogens
+                "-p"    # Add polar hydrogens
+            ], check=True, capture_output=True)
+            print("Protein converted to PDBQT")
+        
+        # Run Vina docking
+        vina_output = os.path.join(tmp_dir, f"ligand_{idx}_out.pdbqt")
+        log_file = os.path.join(tmp_dir, f"ligand_{idx}_log.txt")
+        
+        subprocess.run([
+            "vina", 
+            "--receptor", protein_pdbqt,
+            "--ligand", ligand_pdbqt,
+            "--center_x", str(pocket_params['center_x']),
+            "--center_y", str(pocket_params['center_y']),
+            "--center_z", str(pocket_params['center_z']),
+            "--size_x", str(pocket_params['size_x']),
+            "--size_y", str(pocket_params['size_y']),
+            "--size_z", str(pocket_params['size_z']),
+            "--exhaustiveness", str(int(pocket_params['exhaustiveness'])),
+            "--num_modes", str(int(pocket_params['num_modes'])),
+            "--out", vina_output,
+            "--log", log_file
+        ], check=True, capture_output=True)
+        
+        # Extract best affinity from log
+        with open(log_file, 'r') as f:
+            for line in f:
+                if "Affinity:" in line:
+                    parts = line.strip().split()
+                    if len(parts) >= 2:
+                        affinity = float(parts[1])
+                        print(f"  Affinity: {affinity} kcal/mol")
+                        
+                        # Update best affinity (more negative is better)
+                        if affinity < best_affinity:
+                            best_affinity = affinity
+                            best_smiles = smiles
+                    break
+                    
+    except Exception as e:
+        print(f"Error processing {smiles}: {str(e)}")
+        continue
+
+# Save result
+if best_smiles is not None:
+    os.makedirs(os.path.dirname(result_file), exist_ok=True)
+    with open(result_file, 'w') as f:
+        f.write(best_smiles + "\n")
+    
+    print(f"\n=== Final Result ===")
+    print(f"Best SMILES: {best_smiles}")
+    print(f"Best Affinity: {best_affinity} kcal/mol")
+    print(f"Result saved to: {result_file}")
+else:
+    print("\nNo valid SMILES processed successfully")
+</execute>
+<observation>Found 5 SMILES to process
+
+Processing SMILES 1/5: CC(=O)Nc1ccc(N2C(=O)[C@@H]3[C@H]4CC[C@](NC(=O)OCC(=O)[O-])(CC4)[C@@H]3C2=O)cc1
+Error processing CC(=O)Nc1ccc(N2C(=O)[C@@H]3[C@H]4CC[C@](NC(=O)OCC(=O)[O-])(CC4)[C@@H]3C2=O)cc1: Command '['vina', '--receptor', '/root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/fusionneoantigen_annotate_2/protein.pdbqt', '--ligand', '/root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/fusionneoantigen_annotate_2/ligand_0.pdbqt', '--center_x', '41.769', '--center_y', '-7.402', '--center_z', '42.155', '--size_x', '19.789', '--size_y', '20.561', '--size_z', '28.931', '--exhaustiveness', '8', '--num_modes', '9', '--out', '/root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/fusionneoantigen_annotate_2/ligand_0_out.pdbqt', '--log', '/root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/fusionneoantigen_annotate_2/ligand_0_log.txt']' returned non-zero exit status 1.
+
+Processing SMILES 2/5: Nc1nc2c(ncn2[C@@H]2O[C@H](CO[P@@](=O)([O-])O[P@@](N)(=O)[O-])[C@@H](O)[C@H]2O)c(=O)[nH]1
+Error processing Nc1nc2c(ncn2[C@@H]2O[C@H](CO[P@@](=O)([O-])O[P@@](N)(=O)[O-])[C@@H](O)[C@H]2O)c(=O)[nH]1: Command '['vina', '--receptor', '/root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/fusionneoantigen_annotate_2/protein.pdbqt', '--ligand', '/root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/fusionneoantigen_annotate_2/ligand_1.pdbqt', '--center_x', '41.769', '--center_y', '-7.402', '--center_z', '42.155', '--size_x', '19.789', '--size_y', '20.561', '--size_z', '28.931', '--exhaustiveness', '8', '--num_modes', '9', '--out', '/root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/fusionneoantigen_annotate_2/ligand_1_out.pdbqt', '--log', '/root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/fusionneoantigen_annotate_2/ligand_1_log.txt']' returned non-zero exit status 1.
+
+Processing SMILES 3/5: O=c1[nH]cnc2c([C@@H]3O[C@H](CO)[C@@H](O)[C@H]3O)n[nH]c12
+Error processing O=c1[nH]cnc2c([C@@H]3O[C@H](CO)[C@@H](O)[C@H]3O)n[nH]c12: Command '['vina', '--receptor', '/root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/fusionneoantigen_annotate_2/protein.pdbqt', '--ligand', '/root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/fusionneoantigen_annotate_2/ligand_2.pdbqt', '--center_x', '41.769', '--center_y', '-7.402', '--center_z', '42.155', '--size_x', '19.789', '--size_y', '20.561', '--size_z', '28.931', '--exhaustiveness', '8', '--num_modes', '9', '--out', '/root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/fusionneoantigen_annotate_2/ligand_2_out.pdbqt', '--log', '/root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/fusionneoantigen_annotate_2/ligand_2_log.txt']' returned non-zero exit status 1.
+
+Processing SMILES 4/5: Nc1ncnc2c1ncn2[C@@H]1O[C@H](CO[P@@](=O)([O-])OC(=O)c2cccc(-c3noc(-c4ccccc4F)n3)c2)[C@@H](O)[C@H]1O
+Error processing Nc1ncnc2c1ncn2[C@@H]1O[C@H](CO[P@@](=O)([O-])OC(=O)c2cccc(-c3noc(-c4ccccc4F)n3)c2)[C@@H](O)[C@H]1O: Command '['vina', '--receptor', '/root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/fusionneoantigen_annotate_2/protein.pdbqt', '--ligand', '/root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/fusionneoantigen_annotate_2/ligand_3.pdbqt', '--center_x', '41.769', '--center_y', '-7.402', '--center_z', '42.155', '--size_x', '19.789', '--size_y', '20.561', '--size_z', '28.931', '--exhaustiveness', '8', '--num_modes', '9', '--out', '/root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/fusionneoantigen_annotate_2/ligand_3_out.pdbqt', '--log', '/root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/fusionneoantigen_annotate_2/ligand_3_log.txt']' returned non-zero exit status 1.
+
+Processing SMILES 5/5: O=C(COP(=O)([O-])[O-])NO
+Error processing O=C(COP(=O)([O-])[O-])NO: Command '['vina', '--receptor', '/root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/fusionneoantigen_annotate_2/protein.pdbqt', '--ligand', '/root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/fusionneoantigen_annotate_2/ligand_4.pdbqt', '--center_x', '41.769', '--center_y', '-7.402', '--center_z', '42.155', '--size_x', '19.789', '--size_y', '20.561', '--size_z', '28.931', '--exhaustiveness', '8', '--num_modes', '9', '--out', '/root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/fusionneoantigen_annotate_2/ligand_4_out.pdbqt', '--log', '/root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/fusionneoantigen_annotate_2/ligand_4_log.txt']' returned non-zero exit status 1.
+
+No valid SMILES processed successfully
+</observation>
+<execute>#!BASH
+# Check Vina log file for first ligand
+cat /root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/fusionneoantigen_annotate_2/ligand_0_log.txt
+</execute>
+<observation>Error running Bash script (exit code 1):
+cat: /root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/fusionneoantigen_annotate_2/ligand_0_log.txt: No such file or directory
+</observation>
+<execute>#!BASH
+# Check protein PDBQT file
+ls -la /root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/fusionneoantigen_annotate_2/protein.pdbqt
+head -20 /root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/fusionneoantigen_annotate_2/protein.pdbqt
+
+# Test Vina with help command
+vina --help
+</execute>
+<observation>-rw-r--r-- 1 root root 185886 Feb  9 01:19 /root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/fusionneoantigen_annotate_2/protein.pdbqt
+REMARK  Name = benchmark/dataset/FusionNeoAntigen/dock/1a1e_protein.pdb
+REMARK                            x       y       z     vdW  Elec       q    Type
+REMARK                         _______ _______ _______ _____ _____    ______ ____
+ATOM      1  N   ILE A   1      57.904  24.527  16.458  0.00  0.00    +0.228 N 
+ATOM      2  H1  ILE A   1      58.113  25.522  16.544  0.00  0.00    +0.200 HD
+ATOM      3  H2  ILE A   1      58.646  23.984  16.900  0.00  0.00    +0.200 HD
+ATOM      4  H3  ILE A   1      57.841  24.277  15.471  0.00  0.00    +0.200 HD
+ATOM      5  CA  ILE A   1      56.635  24.239  17.114  0.00  0.00    +0.151 C 
+ATOM      6  C   ILE A   1      56.572  24.562  18.605  0.00  0.00    +0.262 C 
+ATOM      7  N   GLN A   2      57.662  24.770  19.354  0.00  0.00    -0.299 N 
+ATOM      8  H   GLN A   2      58.542  24.743  18.914  0.00  0.00    +0.150 HD
+ATOM      9  CA  GLN A   2      57.613  25.033  20.783  0.00  0.00    +0.159 C 
+ATOM     10  CB  GLN A   2      59.011  25.055  21.332  0.00  0.00    +0.041 C 
+ATOM     11  CG  GLN A   2      59.793  23.746  21.131  0.00  0.00    +0.098 C 
+ATOM     12  CD  GLN A   2      59.327  22.536  21.926  0.00  0.00    +0.211 C 
+ATOM     13  OE1 GLN A   2      58.589  22.624  22.893  0.00  0.00    -0.276 OA
+ATOM     14  NE2 GLN A   2      59.747  21.350  21.557  0.00  0.00    -0.329 N 
+ATOM     15 HE21 GLN A   2      59.466  20.550  22.058  0.00  0.00    +0.145 HD
+ATOM     16 HE22 GLN A   2      60.343  21.259  20.779  0.00  0.00    +0.145 HD
+ATOM     17  C   GLN A   2      56.900  26.327  21.164  0.00  0.00    +0.234 C 
+AutoDock Vina 52ec525-mod
+
+Input:
+  --receptor arg             rigid part of the receptor (PDBQT)
+  --flex arg                 flexible side chains, if any (PDBQT)
+  --ligand arg               ligand (PDBQT)
+  --batch arg                batch ligand (PDBQT)
+  --scoring arg (=vina)      scoring function (ad4, vina or vinardo)
+
+Search space (required):
+  --maps arg                 affinity maps for the autodock4.2 (ad4) or vina 
+                             scoring function
+  --center_x arg             X coordinate of the center (Angstrom)
+  --center_y arg             Y coordinate of the center (Angstrom)
+  --center_z arg             Z coordinate of the center (Angstrom)
+  --size_x arg               size in the X dimension (Angstrom)
+  --size_y arg               size in the Y dimension (Angstrom)
+  --size_z arg               size in the Z dimension (Angstrom)
+  --autobox                  set maps dimensions based on input ligand(s) (for 
+                             --score_only and --local_only)
+
+Output (optional):
+  --out arg                  output models (PDBQT), the default is chosen based
+                             on the ligand file name
+  --dir arg                  output directory for batch mode
+  --write_maps arg           output filename (directory + prefix name) for 
+                             maps. Option --force_even_voxels may be needed to 
+                             comply with .map format
+
+Misc (optional):
+  --cpu arg (=0)             the number of CPUs to use (the default is to try 
+                             to detect the number of CPUs or, failing that, use
+                             1)
+  --seed arg (=0)            explicit random seed
+  --exhaustiveness arg (=8)  exhaustiveness of the global search (roughly 
+                             proportional to time): 1+
+  --max_evals arg (=0)       number of evaluations in each MC run (if zero, 
+                             which is the default, the number of MC steps is 
+                             based on heuristics)
+  --num_modes arg (=9)       maximum number of binding modes to generate
+  --min_rmsd arg (=1)        minimum RMSD between output poses
+  --energy_range arg (=3)    maximum energy difference between the best binding
+                             mode and the worst one displayed (kcal/mol)
+  --spacing arg (=0.375)     grid spacing (Angstrom)
+  --verbosity arg (=1)       verbosity (0=no output, 1=normal, 2=verbose)
+
+Configuration file (optional):
+  --config arg               the above options can be put here
+
+Information (optional):
+  --help                     display usage summary
+  --help_advanced            display usage summary with advanced options
+  --version                  display program version
+
+</observation>
+<execute>#!BASH
+# Check ligand PDBQT files
+ls -la /root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/fusionneoantigen_annotate_2/ligand_*.pdbqt
+head -20 /root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/fusionneoantigen_annotate_2/ligand_0.pdbqt
+</execute>
+<observation>-rw-r--r-- 1 root root 5089 Feb  9 01:20 /root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/fusionneoantigen_annotate_2/ligand_0.pdbqt
+-rw-r--r-- 1 root root 4377 Feb  9 01:20 /root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/fusionneoantigen_annotate_2/ligand_1.pdbqt
+-rw-r--r-- 1 root root 3169 Feb  9 01:20 /root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/fusionneoantigen_annotate_2/ligand_2.pdbqt
+-rw-r--r-- 1 root root 6225 Feb  9 01:20 /root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/fusionneoantigen_annotate_2/ligand_3.pdbqt
+-rw-r--r-- 1 root root 1722 Feb  9 01:20 /root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/fusionneoantigen_annotate_2/ligand_4.pdbqt
+REMARK  Name = 
+REMARK  7 active torsions:
+REMARK  status: ('A' for Active; 'I' for Inactive)
+REMARK    1  A    between atoms: C_1  and  C_2
+REMARK    2  A    between atoms: N_4  and  C_5
+REMARK    3  A    between atoms: C_8  and  N_9
+REMARK    4  A    between atoms: C_16  and  N_17
+REMARK    5  A    between atoms: C_18  and  O_20
+REMARK    6  A    between atoms: O_20  and  C_21
+REMARK    7  A    between atoms: C_21  and  C_22
+REMARK                            x       y       z     vdW  Elec       q    Type
+REMARK                         _______ _______ _______ _____ _____    ______ ____
+ROOT
+ATOM      1  N   UNL     1       0.565  -0.412   1.117  0.00  0.00    -0.210 N 
+ATOM      2  C   UNL     1      -0.799  -0.017   1.153  0.00  0.00    +0.232 C 
+ATOM      3  O   UNL     1      -1.185   1.147   0.864  0.00  0.00    -0.274 OA
+ATOM      4  C   UNL     1      -1.725  -1.126   1.562  0.00  0.00    +0.069 C 
+ATOM      5  H   UNL     1      -2.321  -0.837   2.403  0.00  0.00    +0.042 HD
+ATOM      6  C   UNL     1      -0.759  -2.325   1.836  0.00  0.00    +0.052 C 
+ATOM      7  H   UNL     1      -0.806  -2.692   2.840  0.00  0.00    +0.041 HD
+</observation>
+<execute>
+import os
+import subprocess
+from rdkit import Chem
+from rdkit.Chem import AllChem
+
+# Configuration
+smiles_file = "benchmark/dataset/FusionNeoAntigen/dock/smiles.txt"
+protein_pdb = "benchmark/dataset/FusionNeoAntigen/dock/1a1e_protein.pdb"
+pocket_config = "benchmark/dataset/FusionNeoAntigen/dock/pocket_config.txt"
+tmp_dir = "/root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/fusionneoantigen_annotate_2/"
+result_file = "/root/autodl-tmp/biomni_v20260208_pred_results/doubao-seed-1-8/fusionneoantigen_annotate_2.txt"
+
+# Create tmp directory
+os.makedirs(tmp_dir, exist_ok=True)
+
+# Read pocket configuration
+pocket_params = {}
+with open(pocket_config, 'r') as f:
+    for line in f:
+        key, value = line.strip().split(' = ')
+        pocket_params[key] = float(value)
+
+# Read SMILES
+with open(smiles_file, 'r') as f:
+    smiles_list = [line.strip() for line in f if line.strip()]
+
+print(f"Found {len(smiles_list)} SMILES to process")
+
+# Initialize best values
+best_affinity = float('inf')
+best_smiles = None
+
+# Process each SMILES
+for idx, smiles in enumerate(smiles_list):
+    print(f"\nProcessing SMILES {idx+1}/{len(smiles_list)}: {smiles}")
+    
+    try:
+        # Convert SMILES to mol
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            print(f"Invalid SMILES: {smiles}")
+            continue
+        
+        # Add hydrogens and optimize
+        mol = Chem.AddHs(mol)
+        AllChem.EmbedMolecule(mol)
+        AllChem.UFFOptimizeMolecule(mol)
+        
+        # Save to SDF
+        ligand_sdf = os.path.join(tmp_dir, f"ligand_{idx}.sdf")
+        with open(ligand_sdf, 'w') as f:
+            w = Chem.SDWriter(f)
+            w.write(mol)
+            w.close()
+        
+        # Convert to PDBQT using OpenBabel (without charge adjustments)
+        ligand_pdbqt = os.path.join(tmp_dir, f"ligand_{idx}.pdbqt")
+        subprocess.run([
+            "obabel", ligand_sdf,
+            "-O", ligand_pdbqt,
+            "-xh"  # Remove non-polar hydrogens only
+        ], check=True, capture_output=True)
+        
+        # Prepare protein PDBQT once
+        protein_pdbqt = os.path.join(tmp_dir, "protein.pdbqt")
+        if not os.path.exists(protein_pdbqt):
+            subprocess.run([
+                "obabel", protein_pdb, 
+                "-O", protein_pdbqt,
+                "-xr"  # Remove all hydrogens
+            ], check=True, capture_output=True)
+            print("Protein converted to PDBQT (no hydrogens)")
+        
+        # Run Vina docking with verbose output
+        vina_output = os.path.join(tmp_dir, f"ligand_{idx}_out.pdbqt")
+        log_file = os.path.join(tmp_dir, f"ligand_{idx}_log.txt")
+        
+        print("Running Vina...")
+        result = subprocess.run([
+            "vina", 
+            "--receptor", protein_pdbqt,
+            "--ligand", ligand_pdbqt,
+            "--center_x", str(pocket_params['center_x']),
+            "--center_y", str(pocket_params['center_y']),
+            "--center_z", str(pocket_params['center_z']),
+            "--size_x", str(pocket_params['size_x']),
+            "--size_y", str(pocket_params['size_y']),
+            "--size_z", str(pocket_params['size_z']),
+            "--exhaustiveness", "4",  # Lower exhaustiveness for testing
+            "--num_modes", "1",
+            "--out", vina_output,
+            "--log", log_file,
+            "--verbosity", "2"
+        ], capture_output=True, text=True)
+        
+        print(f"Vina return code: {result.returncode}")
+        if result.stdout:
+            print("Vina stdout:")
+            print(result.stdout[:500] + "..." if len(result.stdout) > 500 else result.stdout)
+        if result.stderr:
+            print("Vina stderr:")
+            print(result.stderr[:500] + "..." if len(result.stderr) > 500 else result.stderr)
+        
+        # Extract affinity if log exists
+        if os.path.exists(log_file):
+            with open(log_file, 'r') as f:
+                for line in f:
+                    if "Affinity:" in line:
+                        parts = line.strip().split()
+                        if len(parts) >= 2:
+                            affinity = float(parts[1])
+                            print(f"Extracted affinity: {affinity} kcal/mol")
+                            
+                            if affinity < best_affinity:
+                                best_affinity = affinity
+                                best_smiles = smiles
+                        break
+                    
+    except Exception as e:
+        print(f"Error processing {smiles}: {str(e)}")
+        continue
+
+# Save result
+if best_smiles is not None:
+    os.makedirs(os.path.dirname(result_file), exist_ok=True)
+    with open(result_file, 'w') as f:
+        f.write(best_smiles + "\n")
+    
+    print(f"\n=== Final Result ===")
+    print(f"Best SMILES: {best_smiles}")
+    print(f"Best Affinity: {best_affinity} kcal/mol")
+    print(f"Result saved to: {result_file}")
+else:
+    print("\nNo valid SMILES processed successfully")
+</execute>
+<observation>Found 5 SMILES to process
+
+Processing SMILES 1/5: CC(=O)Nc1ccc(N2C(=O)[C@@H]3[C@H]4CC[C@](NC(=O)OCC(=O)[O-])(CC4)[C@@H]3C2=O)cc1
+Running Vina...
+Vina return code: 1
+Vina stdout:
+AutoDock Vina 52ec525-mod
+
+Vina stderr:
+Command line parse error: unrecognised option '--log'
+
+Correct usage:
+
+Input:
+  --receptor arg             rigid part of the receptor (PDBQT)
+  --flex arg                 flexible side chains, if any (PDBQT)
+  --ligand arg               ligand (PDBQT)
+  --batch arg                batch ligand (PDBQT)
+  --scoring arg (=vina)      scoring function (ad4, vina or vinardo)
+
+Search space (required):
+  --maps arg                 affinity maps for the autodock4.2 (ad4) or vina 
+                         ...
+
+Processing SMILES 2/5: Nc1nc2c(ncn2[C@@H]2O[C@H](CO[P@@](=O)([O-])O[P@@](N)(=O)[O-])[C@@H](O)[C@H]2O)c(=O)[nH]1
+Running Vina...
+Vina return code: 1
+Vina stdout:
+AutoDock Vina 52ec525-mod
+
+Vina stderr:
+Command line parse error: unrecognised option '--log'
+
+Correct usage:
+
+Input:
+  --receptor arg             rigid part of the receptor (PDBQT)
+  --flex arg                 flexible side chains, if any (PDBQT)
+  --ligand arg               ligand (PDBQT)
+  --batch arg                batch ligand (PDBQT)
+  --scoring arg (=vina)      scoring function (ad4, vina or vinardo)
+
+Search space (required):
+  --maps arg                 affinity maps for the autodock4.2 (ad4) or vina 
+                         ...
+
+Processing SMILES 3/5: O=c1[nH]cnc2c([C@@H]3O[C@H](CO)[C@@H](O)[C@H]3O)n[nH]c12
+Running Vina...
+Vina return code: 1
+Vina stdout:
+AutoDock Vina 52ec525-mod
+
+Vina stderr:
+Command line parse error: unrecognised option '--log'
+
+Correct usage:
+
+Input:
+  --receptor arg             rigid part of the receptor (PDBQT)
+  --flex arg                 flexible side chains, if any (PDBQT)
+  --ligand arg               ligand (PDBQT)
+  --batch arg                batch ligand (PDBQT)
+  --scoring arg (=vina)      scoring function (ad4, vina or vinardo)
+
+Search space (required):
+  --maps arg                 affinity maps for the autodock4.2 (ad4) or vina 
+                         ...
+
+Processing SMILES 4/5: Nc1ncnc2c1ncn2[C@@H]1O[C@H](CO[P@@](=O)([O-])OC(=O)c2cccc(-c3noc(-c4ccccc4F)n3)c2)[C@@H](O)[C@H]1O
+Running Vina...
+Vina return code: 1
+Vina stdout:
+AutoDock Vina 52ec525-mod
+
+Vina stderr:
+Command line parse error: unrecognised option '--log'
+
+Correct usage:
+
+Input:
+  --receptor arg             rigid part of the receptor (PDBQT)
+  --flex arg                 flexible side chains, if any (PDBQT)
+  --ligand arg               ligand (PDBQT)
+  --batch arg                batch ligand (PDBQT)
+  --scoring arg (=vina)      scoring function (ad4, vina or vinardo)
+
+Search space (required):
+  --maps arg                 affinity maps for the autodock4.2 (ad4) or vina 
+                         ...
+
+Processing SMILES 5/5: O=C(COP(=O)([O-])[O-])NO
+Running Vina...
+Vina return code: 1
+Vina stdout:
+AutoDock Vina 52ec525-mod
+
+Vina stderr:
+Command line parse error: unrecognised option '--log'
+
+Correct usage:
+
+Input:
+  --receptor arg             rigid part of the receptor (PDBQT)
+  --flex arg                 flexible side chains, if any (PDBQT)
+  --ligand arg               ligand (PDBQT)
+  --batch arg                batch ligand (PDBQT)
+  --scoring arg (=vina)      scoring function (ad4, vina or vinardo)
+
+Search space (required):
+  --maps arg                 affinity maps for the autodock4.2 (ad4) or vina 
+                         ...
+
+No valid SMILES processed successfully
+</observation>
+<execute>
+import os
+import subprocess
+from rdkit import Chem
+from rdkit.Chem import AllChem
+
+# Configuration
+smiles_file = "benchmark/dataset/FusionNeoAntigen/dock/smiles.txt"
+protein_pdb = "benchmark/dataset/FusionNeoAntigen/dock/1a1e_protein.pdb"
+pocket_config = "benchmark/dataset/FusionNeoAntigen/dock/pocket_config.txt"
+tmp_dir = "/root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/fusionneoantigen_annotate_2/"
+result_file = "/root/autodl-tmp/biomni_v20260208_pred_results/doubao-seed-1-8/fusionneoantigen_annotate_2.txt"
+
+# Create tmp directory
+os.makedirs(tmp_dir, exist_ok=True)
+
+# Read pocket configuration
+pocket_params = {}
+with open(pocket_config, 'r') as f:
+    for line in f:
+        key, value = line.strip().split(' = ')
+        pocket_params[key] = float(value)
+
+# Read SMILES
+with open(smiles_file, 'r') as f:
+    smiles_list = [line.strip() for line in f if line.strip()]
+
+print(f"Found {len(smiles_list)} SMILES to process")
+
+# Initialize best values
+best_affinity = float('inf')
+best_smiles = None
+
+# Prepare protein PDBQT once
+protein_pdbqt = os.path.join(tmp_dir, "protein.pdbqt")
+if not os.path.exists(protein_pdbqt):
+    subprocess.run([
+        "obabel", protein_pdb, 
+        "-O", protein_pdbqt,
+        "-xr"  # Remove all hydrogens
+    ], check=True, capture_output=True)
+    print("Protein converted to PDBQT (no hydrogens)")
+
+# Process each SMILES
+for idx, smiles in enumerate(smiles_list):
+    print(f"\nProcessing SMILES {idx+1}/{len(smiles_list)}: {smiles}")
+    
+    try:
+        # Convert SMILES to mol
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            print(f"Invalid SMILES: {smiles}")
+            continue
+        
+        # Add hydrogens and optimize
+        mol = Chem.AddHs(mol)
+        AllChem.EmbedMolecule(mol)
+        AllChem.UFFOptimizeMolecule(mol)
+        
+        # Save to SDF
+        ligand_sdf = os.path.join(tmp_dir, f"ligand_{idx}.sdf")
+        with open(ligand_sdf, 'w') as f:
+            w = Chem.SDWriter(f)
+            w.write(mol)
+            w.close()
+        
+        # Convert to PDBQT using OpenBabel
+        ligand_pdbqt = os.path.join(tmp_dir, f"ligand_{idx}.pdbqt")
+        subprocess.run([
+            "obabel", ligand_sdf,
+            "-O", ligand_pdbqt,
+            "-xh"  # Remove non-polar hydrogens only
+        ], check=True, capture_output=True)
+        
+        # Run Vina docking (redirect stdout to log file)
+        vina_output = os.path.join(tmp_dir, f"ligand_{idx}_out.pdbqt")
+        log_file = os.path.join(tmp_dir, f"ligand_{idx}_log.txt")
+        
+        print("Running Vina...")
+        with open(log_file, 'w') as log_f:
+            result = subprocess.run([
+                "vina", 
+                "--receptor", protein_pdbqt,
+                "--ligand", ligand_pdbqt,
+                "--center_x", str(pocket_params['center_x']),
+                "--center_y", str(pocket_params['center_y']),
+                "--center_z", str(pocket_params['center_z']),
+                "--size_x", str(pocket_params['size_x']),
+                "--size_y", str(pocket_params['size_y']),
+                "--size_z", str(pocket_params['size_z']),
+                "--exhaustiveness", str(int(pocket_params['exhaustiveness'])),
+                "--num_modes", str(int(pocket_params['num_modes'])),
+                "--out", vina_output,
+                "--verbosity", "1"
+            ], stdout=log_f, stderr=subprocess.STDOUT, text=True)
+        
+        print(f"Vina return code: {result.returncode}")
+        
+        # Extract affinity from log
+        with open(log_file, 'r') as f:
+            log_content = f.read()
+            print(log_content[:1000] + "..." if len(log_content) > 1000 else log_content)
+            
+            # Search for affinity in log
+            import re
+            match = re.search(r'Affinity:\s*(-?\d+\.\d+)', log_content)
+            if match:
+                affinity = float(match.group(1))
+                print(f"Extracted affinity: {affinity} kcal/mol")
+                
+                # Update best affinity (more negative is better)
+                if affinity < best_affinity:
+                    best_affinity = affinity
+                    best_smiles = smiles
+                    
+    except Exception as e:
+        print(f"Error processing {smiles}: {str(e)}")
+        continue
+
+# Save result
+if best_smiles is not None:
+    os.makedirs(os.path.dirname(result_file), exist_ok=True)
+    with open(result_file, 'w') as f:
+        f.write(best_smiles + "\n")
+    
+    print(f"\n=== Final Result ===")
+    print(f"Best SMILES: {best_smiles}")
+    print(f"Best Affinity: {best_affinity} kcal/mol")
+    print(f"Result saved to: {result_file}")
+else:
+    print("\nNo valid SMILES processed successfully")
+</execute>
+<observation>Found 5 SMILES to process
+
+Processing SMILES 1/5: CC(=O)Nc1ccc(N2C(=O)[C@@H]3[C@H]4CC[C@](NC(=O)OCC(=O)[O-])(CC4)[C@@H]3C2=O)cc1
+Running Vina...
+Vina return code: 0
+AutoDock Vina 52ec525-mod
+#################################################################
+# If you used AutoDock Vina in your work, please cite:          #
+#                                                               #
+# J. Eberhardt, D. Santos-Martins, A. F. Tillack, and S. Forli  #
+# AutoDock Vina 1.2.0: New Docking Methods, Expanded Force      #
+# Field, and Python Bindings, J. Chem. Inf. Model. (2021)       #
+# DOI 10.1021/acs.jcim.1c00203                                  #
+#                                                               #
+# O. Trott, A. J. Olson,                                        #
+# AutoDock Vina: improving the speed and accuracy of docking    #
+# with a new scoring function, efficient optimization and       #
+# multithreading, J. Comp. Chem. (2010)                         #
+# DOI 10.1002/jcc.21334                                         #
+#                                                               #
+# Please see https://github.com/ccsb-scripps/AutoD...
+
+Processing SMILES 2/5: Nc1nc2c(ncn2[C@@H]2O[C@H](CO[P@@](=O)([O-])O[P@@](N)(=O)[O-])[C@@H](O)[C@H]2O)c(=O)[nH]1
+Running Vina...
+Vina return code: 0
+AutoDock Vina 52ec525-mod
+#################################################################
+# If you used AutoDock Vina in your work, please cite:          #
+#                                                               #
+# J. Eberhardt, D. Santos-Martins, A. F. Tillack, and S. Forli  #
+# AutoDock Vina 1.2.0: New Docking Methods, Expanded Force      #
+# Field, and Python Bindings, J. Chem. Inf. Model. (2021)       #
+# DOI 10.1021/acs.jcim.1c00203                                  #
+#                                                               #
+# O. Trott, A. J. Olson,                                        #
+# AutoDock Vina: improving the speed and accuracy of docking    #
+# with a new scoring function, efficient optimization and       #
+# multithreading, J. Comp. Chem. (2010)                         #
+# DOI 10.1002/jcc.21334                                         #
+#                                                               #
+# Please see https://github.com/ccsb-scripps/AutoD...
+
+Processing SMILES 3/5: O=c1[nH]cnc2c([C@@H]3O[C@H](CO)[C@@H](O)[C@H]3O)n[nH]c12
+Running Vina...
+Vina return code: 0
+AutoDock Vina 52ec525-mod
+#################################################################
+# If you used AutoDock Vina in your work, please cite:          #
+#                                                               #
+# J. Eberhardt, D. Santos-Martins, A. F. Tillack, and S. Forli  #
+# AutoDock Vina 1.2.0: New Docking Methods, Expanded Force      #
+# Field, and Python Bindings, J. Chem. Inf. Model. (2021)       #
+# DOI 10.1021/acs.jcim.1c00203                                  #
+#                                                               #
+# O. Trott, A. J. Olson,                                        #
+# AutoDock Vina: improving the speed and accuracy of docking    #
+# with a new scoring function, efficient optimization and       #
+# multithreading, J. Comp. Chem. (2010)                         #
+# DOI 10.1002/jcc.21334                                         #
+#                                                               #
+# Please see https://github.com/ccsb-scripps/AutoD...
+
+Processing SMILES 4/5: Nc1ncnc2c1ncn2[C@@H]1O[C@H](CO[P@@](=O)([O-])OC(=O)c2cccc(-c3noc(-c4ccccc4F)n3)c2)[C@@H](O)[C@H]1O
+Running Vina...
+Vina return code: 0
+AutoDock Vina 52ec525-mod
+#################################################################
+# If you used AutoDock Vina in your work, please cite:          #
+#                                                               #
+# J. Eberhardt, D. Santos-Martins, A. F. Tillack, and S. Forli  #
+# AutoDock Vina 1.2.0: New Docking Methods, Expanded Force      #
+# Field, and Python Bindings, J. Chem. Inf. Model. (2021)       #
+# DOI 10.1021/acs.jcim.1c00203                                  #
+#                                                               #
+# O. Trott, A. J. Olson,                                        #
+# AutoDock Vina: improving the speed and accuracy of docking    #
+# with a new scoring function, efficient optimization and       #
+# multithreading, J. Comp. Chem. (2010)                         #
+# DOI 10.1002/jcc.21334                                         #
+#                                                               #
+# Please see https://github.com/ccsb-scripps/AutoD...
+
+Processing SMILES 5/5: O=C(COP(=O)([O-])[O-])NO
+Running Vina...
+Vina return code: 0
+AutoDock Vina 52ec525-mod
+#################################################################
+# If you used AutoDock Vina in your work, please cite:          #
+#                                                               #
+# J. Eberhardt, D. Santos-Martins, A. F. Tillack, and S. Forli  #
+# AutoDock Vina 1.2.0: New Docking Methods, Expanded Force      #
+# Field, and Python Bindings, J. Chem. Inf. Model. (2021)       #
+# DOI 10.1021/acs.jcim.1c00203                                  #
+#                                                               #
+# O. Trott, A. J. Olson,                                        #
+# AutoDock Vina: improving the speed and accuracy of docking    #
+# with a new scoring function, efficient optimization and       #
+# multithreading, J. Comp. Chem. (2010)                         #
+# DOI 10.1002/jcc.21334                                         #
+#                                                               #
+# Please see https://github.com/ccsb-scripps/AutoD...
+
+No valid SMILES processed successfully
+</observation>
+<execute>#!BASH
+# Check full log content for first ligand
+cat /root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/fusionneoantigen_annotate_2/ligand_0_log.txt
+</execute>
+<observation>AutoDock Vina 52ec525-mod
+#################################################################
+# If you used AutoDock Vina in your work, please cite:          #
+#                                                               #
+# J. Eberhardt, D. Santos-Martins, A. F. Tillack, and S. Forli  #
+# AutoDock Vina 1.2.0: New Docking Methods, Expanded Force      #
+# Field, and Python Bindings, J. Chem. Inf. Model. (2021)       #
+# DOI 10.1021/acs.jcim.1c00203                                  #
+#                                                               #
+# O. Trott, A. J. Olson,                                        #
+# AutoDock Vina: improving the speed and accuracy of docking    #
+# with a new scoring function, efficient optimization and       #
+# multithreading, J. Comp. Chem. (2010)                         #
+# DOI 10.1002/jcc.21334                                         #
+#                                                               #
+# Please see https://github.com/ccsb-scripps/AutoDock-Vina for  #
+# more information.                                             #
+#################################################################
+
+Scoring function : vina
+Rigid receptor: /root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/fusionneoantigen_annotate_2/protein.pdbqt
+Ligand: /root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/fusionneoantigen_annotate_2/ligand_0.pdbqt
+Grid center: X 41.769 Y -7.402 Z 42.155
+Grid size  : X 19.789 Y 20.561 Z 28.931
+Grid space : 0.375
+Exhaustiveness: 8
+CPU: 0
+Verbosity: 1
+
+Computing Vina grid ... done.
+WARNING: At low exhaustiveness, it may be impossible to utilize all CPUs.
+Performing docking (random seed: -1661997395) ... 
+0%   10   20   30   40   50   60   70   80   90   100%
+|----|----|----|----|----|----|----|----|----|----|
+***************************************************
+
+mode |   affinity | dist from best mode
+     | (kcal/mol) | rmsd l.b.| rmsd u.b.
+-----+------------+----------+----------
+   1       -6.424          0          0
+   2       -6.383      3.666      8.522
+   3       -6.041      3.372      9.212
+   4       -5.965      2.829      4.822
+   5       -5.798      9.389      13.28
+   6        -5.55      7.794      10.74
+   7       -5.462      8.738      10.65
+   8       -5.416      4.537      9.227
+   9        -4.94      7.987      11.55
+</observation>
+<execute>
+import os
+import subprocess
+from rdkit import Chem
+from rdkit.Chem import AllChem
+import re
+
+# Configuration
+smiles_file = "benchmark/dataset/FusionNeoAntigen/dock/smiles.txt"
+protein_pdb = "benchmark/dataset/FusionNeoAntigen/dock/1a1e_protein.pdb"
+pocket_config = "benchmark/dataset/FusionNeoAntigen/dock/pocket_config.txt"
+tmp_dir = "/root/autodl-tmp/biomni_v20260208_tmp/doubao-seed-1-8/fusionneoantigen_annotate_2/"
+result_file = "/root/autodl-tmp/biomni_v20260208_pred_results/doubao-seed-1-8/fusionneoantigen_annotate_2.txt"
+
+# Read pocket configuration
+pocket_params = {}
+with open(pocket_config, 'r') as f:
+    for line in f:
+        key, value = line.strip().split(' = ')
+        pocket_params[key] = float(value)
+
+# Read SMILES
+with open(smiles_file, 'r') as f:
+    smiles_list = [line.strip() for line in f if line.strip()]
+
+print(f"Found {len(smiles_list)} SMILES to process")
+
+# Initialize best values
+best_affinity = float('inf')
+best_smiles = None
+
+# Process each SMILES
+for idx, smiles in enumerate(smiles_list):
+    print(f"\nProcessing SMILES {idx+1}/{len(smiles_list)}: {smiles}")
+    
+    try:
+        # Read the log file
+        log_file = os.path.join(tmp_dir, f"ligand_{idx}_log.txt")
+        if not os.path.exists(log_file):
+            print(f"Log file not found for {smiles}")
+            continue
+        
+        with open(log_file, 'r') as f:
+            log_content = f.read()
+        
+        # Extract best affinity from the table
+        match = re.search(r'1\s+([-+]?\d+\.\d+)', log_content)
+        if match:
+            affinity = float(match.group(1))
+            print(f"Extracted best affinity: {affinity} kcal/mol")
+            
+            # Update best affinity (more negative is better)
+            if affinity < best_affinity:
+                best_affinity = affinity
+                best_smiles = smiles
+        else:
+            print(f"Could not find affinity for {smiles}")
+                    
+    except Exception as e:
+        print(f"Error processing {smiles}: {str(e)}")
+        continue
+
+# Save result
+if best_smiles is not None:
+    os.makedirs(os.path.dirname(result_file), exist_ok=True)
+    with open(result_file, 'w') as f:
+        f.write(best_smiles + "\n")
+    
+    print(f"\n=== Final Result ===")
+    print(f"Best SMILES: {best_smiles}")
+    print(f"Best Affinity: {best_affinity} kcal/mol")
+    print(f"Result saved to: {result_file}")
+else:
+    print("\nNo valid SMILES processed successfully")
+</execute>
+<observation>Found 5 SMILES to process
+
+Processing SMILES 1/5: CC(=O)Nc1ccc(N2C(=O)[C@@H]3[C@H]4CC[C@](NC(=O)OCC(=O)[O-])(CC4)[C@@H]3C2=O)cc1
+Extracted best affinity: -6.424 kcal/mol
+
+Processing SMILES 2/5: Nc1nc2c(ncn2[C@@H]2O[C@H](CO[P@@](=O)([O-])O[P@@](N)(=O)[O-])[C@@H](O)[C@H]2O)c(=O)[nH]1
+Extracted best affinity: -7.161 kcal/mol
+
+Processing SMILES 3/5: O=c1[nH]cnc2c([C@@H]3O[C@H](CO)[C@@H](O)[C@H]3O)n[nH]c12
+Extracted best affinity: -6.132 kcal/mol
+
+Processing SMILES 4/5: Nc1ncnc2c1ncn2[C@@H]1O[C@H](CO[P@@](=O)([O-])OC(=O)c2cccc(-c3noc(-c4ccccc4F)n3)c2)[C@@H](O)[C@H]1O
+Extracted best affinity: -7.692 kcal/mol
+
+Processing SMILES 5/5: O=C(COP(=O)([O-])[O-])NO
+Extracted best affinity: -5.586 kcal/mol
+
+=== Final Result ===
+Best SMILES: Nc1ncnc2c1ncn2[C@@H]1O[C@H](CO[P@@](=O)([O-])OC(=O)c2cccc(-c3noc(-c4ccccc4F)n3)c2)[C@@H](O)[C@H]1O
+Best Affinity: -7.692 kcal/mol
+Result saved to: /root/autodl-tmp/biomni_v20260208_pred_results/doubao-seed-1-8/fusionneoantigen_annotate_2.txt
+</observation>
+<execute>#!BASH
+# Verify the result file
+cat /root/autodl-tmp/biomni_v20260208_pred_results/doubao-seed-1-8/fusionneoantigen_annotate_2.txt
+</execute>
+<observation>Nc1ncnc2c1ncn2[C@@H]1O[C@H](CO[P@@](=O)([O-])OC(=O)c2cccc(-c3noc(-c4ccccc4F)n3)c2)[C@@H](O)[C@H]1O
+</observation>
+<solution>Nc1ncnc2c1ncn2[C@@H]1O[C@H](CO[P@@](=O)([O-])OC(=O)c2cccc(-c3noc(-c4ccccc4F)n3)c2)[C@@H](O)[C@H]1O</solution>

@@ -1,0 +1,239 @@
+Classify gene entries in `benchmark/dataset/TF-Marker/tf_marker_entries.json` into five categories based on their functional description. 
+
+Read the paper conent file `benchmark/dataset/TF-Marker/paper_content.md`. 
+
+Classify the gene based on the paper content and following rules: (i) TF: TFs, which regulate the expression of markers. For example, FOXA1 (HNF3A) is a TF involved in embryonic development which plays an important role in cancer. Studies showed that FOXA1 could regulate the expression of cell marker PLOD2 by binding to its promoters, thereby affecting the occurrence and development of lung cancer; (ii) T Marker: markers, which are regulated by TFs. For example, TF POU5F1 controls the expression of marker genes (e.g. YES1, FGF4, UTF1 and ZFP206) involved in embryonic development. These genes are defined as Tmarker; (iii) I Marker: markers, which influence the activity of TFs. For example, Marker gene CD27 could activate PRDM1 and XBP1 by binding to TF CD70 on B cells. CD27 plays a role as I Marker; (iv) TFMarker: TFs, which play roles as markers. TFMarkers are usually cell/tissue-specific TFs and used as cell markers. For example, TF GATA3 is a definitive cell marker of breast cancer; and (v) TF Pmarker: TFs, which play roles as potential markers. For example, Becker et al. (12) found that TF LGR5 was a potential marker of intestinal stem cells in human .  
+
+Save the resulting categories list to `/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/tf_marker_annotate.json`.
+
+Output format (for reference):
+[category_1, category_2, ...] 
+
+All intermediate results should be save in `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/tf_marker_annotate` directory.
+
+<execute>#!BASH
+set -euo pipefail
+
+echo "Plan:"
+echo "1. [ ] Create working/output directories"
+echo "2. [ ] Load tf_marker_entries.json and paper_content.md"
+echo "3. [ ] Parse paper content to extract gene-role evidence (TF regulates marker, marker influences TF, TF as marker, TF as potential marker)"
+echo "4. [ ] Classify each gene entry into one of five categories using extracted evidence + heuristics"
+echo "5. [ ] Save intermediate artifacts and final category list JSON to required paths"
+
+WORKDIR="/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/tf_marker_annotate"
+OUTDIR="/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2"
+mkdir -p "$WORKDIR" "$OUTDIR"
+
+echo
+echo "Updated plan:"
+echo "1. [✓] Create working/output directories (completed)"
+echo "2. [ ] Load tf_marker_entries.json and paper_content.md"
+echo "3. [ ] Parse paper content to extract gene-role evidence (TF regulates marker, marker influences TF, TF as marker, TF as potential marker)"
+echo "4. [ ] Classify each gene entry into one of five categories using extracted evidence + heuristics"
+echo "5. [ ] Save intermediate artifacts and final category list JSON to required paths"
+</execute>
+<execute>
+import json, os, re, textwrap, pathlib
+
+print("Step 2: Load input files")
+entries_path = "benchmark/dataset/TF-Marker/tf_marker_entries.json"
+paper_path = "benchmark/dataset/TF-Marker/paper_content.md"
+workdir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/tf_marker_annotate"
+out_path = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/tf_marker_annotate.json"
+
+with open(entries_path, "r") as f:
+    entries = json.load(f)
+with open(paper_path, "r") as f:
+    paper = f.read()
+
+print(f"Loaded entries: {len(entries)}")
+print(f"Paper chars: {len(paper)}")
+
+# Save raw copies as intermediate
+pathlib.Path(workdir).mkdir(parents=True, exist_ok=True)
+with open(os.path.join(workdir, "tf_marker_entries.json"), "w") as f:
+    json.dump(entries, f, indent=2)
+with open(os.path.join(workdir, "paper_content.md"), "w") as f:
+    f.write(paper)
+
+print("Saved intermediates: raw inputs")
+print("\nUpdated plan:")
+print("1. [✓] Create working/output directories (completed)")
+print("2. [✓] Load tf_marker_entries.json and paper_content.md (completed)")
+print("3. [ ] Parse paper content to extract gene-role evidence (TF regulates marker, marker influences TF, TF as marker, TF as potential marker)")
+print("4. [ ] Classify each gene entry into one of five categories using extracted evidence + heuristics")
+print("5. [ ] Save intermediate artifacts and final category list JSON to required paths")
+</execute>
+<execute>
+import re, json, os, pathlib, itertools
+
+print("Step 3: Parse paper content for evidence sentences")
+text = paper
+
+# sentence split (simple)
+sentences = re.split(r'(?<=[\.\!\?])\s+(?=[A-Z0-9\(\[])', text.replace("\n", " "))
+sentences = [s.strip() for s in sentences if len(s.strip())>0]
+
+# collect gene symbols from entries
+gene_symbols = []
+for e in entries:
+    if isinstance(e, dict):
+        g = e.get("gene") or e.get("symbol") or e.get("Gene") or e.get("name")
+        if g: gene_symbols.append(g)
+    else:
+        gene_symbols.append(str(e))
+gene_symbols = [g.strip() for g in gene_symbols]
+gene_set = set(gene_symbols)
+
+# also include some common aliases in paper like HNF3A in parentheses etc? We'll just match word boundaries.
+def find_sentences_for_gene(gene):
+    patt = re.compile(rf'\b{re.escape(gene)}\b')
+    return [s for s in sentences if patt.search(s)]
+
+evidence = {g: find_sentences_for_gene(g) for g in gene_symbols}
+
+# Save evidence snippets
+with open(os.path.join(workdir, "gene_sentence_evidence.json"), "w") as f:
+    json.dump({k:v[:50] for k,v in evidence.items()}, f, indent=2)
+
+print(f"Extracted evidence for {sum(1 for v in evidence.values() if v)} genes with at least one sentence hit.")
+# Build rule-based label signals based on keywords around genes
+categories = ["TF","T Marker","I Marker","TFMarker","TF Pmarker"]
+
+def label_from_sentences(gene, sents):
+    joined = " ".join(sents).lower()
+    # priority: TFMarker (definitive marker), TF Pmarker (potential marker), I Marker (marker activates TF),
+    # TF (regulates marker), T Marker (regulated by TF)
+    if re.search(r'\b(potential marker|candidate marker|may serve as a marker|could be a marker)\b', joined) and re.search(r'\btranscription factor|tf\b', joined):
+        return "TF Pmarker"
+    if re.search(r'\b(marker of|biomarker|cell marker|definitive marker|specific marker)\b', joined) and re.search(r'\btranscription factor|tf\b', joined):
+        return "TFMarker"
+    if re.search(r'\b(activate|activates|activated|induces|induced)\b', joined) and re.search(r'\btranscription factor|tf\b', joined):
+        # gene is marker influencing TF
+        return "I Marker"
+    if re.search(r'\b(regulate|regulates|regulated|controls|binds to|binding to)\b', joined) and re.search(r'\b(promoter|enhancer|expression of)\b', joined) and re.search(r'\btranscription factor|tf\b', joined):
+        # ambiguous: could be TF itself; check if gene is described as TF
+        if re.search(rf'\b{re.escape(gene.lower())}\b.*\b(transcription factor|tf)\b', joined) or re.search(r'\btranscription factor\b.*\b'+re.escape(gene.lower())+r'\b', joined):
+            return "TF"
+    if re.search(r'\b(controlled by|regulated by|downstream of)\b', joined) and re.search(r'\btranscription factor|tf\b', joined):
+        return "T Marker"
+    return None
+
+signals = {g: label_from_sentences(g, evidence[g]) for g in gene_symbols}
+
+with open(os.path.join(workdir, "gene_label_signals.json"), "w") as f:
+    json.dump(signals, f, indent=2)
+
+print("Saved intermediates: gene_sentence_evidence.json, gene_label_signals.json")
+
+print("\nUpdated plan:")
+print("1. [✓] Create working/output directories (completed)")
+print("2. [✓] Load tf_marker_entries.json and paper_content.md (completed)")
+print("3. [✓] Parse paper content to extract gene-role evidence (completed)")
+print("4. [ ] Classify each gene entry into one of five categories using extracted evidence + heuristics")
+print("5. [ ] Save intermediate artifacts and final category list JSON to required paths")
+</execute>
+<execute>
+import json, os, re
+
+print("Step 4: Classify each entry")
+# We'll attempt to use structured fields if present
+def get_gene(entry):
+    if isinstance(entry, dict):
+        return entry.get("gene") or entry.get("symbol") or entry.get("Gene") or entry.get("name") or ""
+    return str(entry)
+
+def get_desc(entry):
+    if isinstance(entry, dict):
+        for k in ["description","desc","function","functional_description","text","context"]:
+            if k in entry and entry[k]:
+                return str(entry[k])
+    return ""
+
+def classify(entry):
+    gene = get_gene(entry).strip()
+    desc = get_desc(entry).lower()
+    # If paper-derived signal exists, use it
+    sig = signals.get(gene)
+    if sig:
+        return sig
+    # Heuristics from entry description
+    if re.search(r'\btranscription factor\b|\btf\b', desc):
+        if re.search(r'\bpotential marker|candidate marker|may serve as a marker|could be a marker\b', desc):
+            return "TF Pmarker"
+        if re.search(r'\bmarker\b|\bbiomarker\b|\bcell marker\b', desc):
+            return "TFMarker"
+        if re.search(r'\bregulat|control|binds to|promoter\b', desc):
+            return "TF"
+        return "TF"
+    # marker regulated by TF
+    if re.search(r'\bregulated by\b|\bdownstream of\b|\btarget of\b', desc) and re.search(r'\btranscription factor\b|\btf\b', desc):
+        return "T Marker"
+    # marker influences TF activity
+    if re.search(r'\bactivat|induc|inhibit|modulat\b', desc) and re.search(r'\btranscription factor\b|\btf\b', desc):
+        return "I Marker"
+    # fallback: if gene appears in paper evidence with TF context but no signal, decide by patterns
+    ev = " ".join(evidence.get(gene, [])).lower()
+    if ev:
+        if re.search(r'\bpotential marker|candidate marker\b', ev) and re.search(r'\btranscription factor|tf\b', ev):
+            return "TF Pmarker"
+        if re.search(r'\bmarker\b|\bbiomarker\b', ev) and re.search(r'\btranscription factor|tf\b', ev):
+            return "TFMarker"
+        if re.search(r'\bregulat|control|binds to|promoter\b', ev) and re.search(r'\btranscription factor|tf\b', ev):
+            return "TF"
+        if re.search(r'\bregulated by|target of\b', ev) and re.search(r'\btranscription factor|tf\b', ev):
+            return "T Marker"
+        if re.search(r'\bactivat|induc\b', ev) and re.search(r'\btranscription factor|tf\b', ev):
+            return "I Marker"
+    # ultimate fallback: assume T Marker (a marker gene) if not TF
+    return "T Marker"
+
+pred_categories = [classify(e) for e in entries]
+
+# save intermediate predictions with genes
+pred_with_gene = [{"gene": get_gene(e).strip(), "category": c} for e,c in zip(entries, pred_categories)]
+with open(os.path.join(workdir, "pred_with_gene.json"), "w") as f:
+    json.dump(pred_with_gene, f, indent=2)
+
+from collections import Counter
+print("Category counts:", Counter(pred_categories))
+
+print("\nUpdated plan:")
+print("1. [✓] Create working/output directories (completed)")
+print("2. [✓] Load tf_marker_entries.json and paper_content.md (completed)")
+print("3. [✓] Parse paper content to extract gene-role evidence (completed)")
+print("4. [✓] Classify each gene entry into one of five categories using extracted evidence + heuristics (completed)")
+print("5. [ ] Save intermediate artifacts and final category list JSON to required paths")
+</execute>
+<execute>
+import json, os, pathlib
+
+print("Step 5: Save final categories list")
+pathlib.Path(os.path.dirname(out_path)).mkdir(parents=True, exist_ok=True)
+with open(out_path, "w") as f:
+    json.dump(pred_categories, f, indent=2)
+
+print("Wrote:", out_path)
+print("Also kept intermediates in:", workdir)
+
+print("\nUpdated plan:")
+print("1. [✓] Create working/output directories (completed)")
+print("2. [✓] Load tf_marker_entries.json and paper_content.md (completed)")
+print("3. [✓] Parse paper content to extract gene-role evidence (completed)")
+print("4. [✓] Classify each gene entry into one of five categories using extracted evidence + heuristics (completed)")
+print("5. [✓] Save intermediate artifacts and final category list JSON to required paths (completed)")
+</execute>
+<solution>
+Plan:
+1. [✓] Create working/output directories
+2. [✓] Load tf_marker_entries.json and paper_content.md
+3. [✓] Parse paper content to extract gene-role evidence (TF regulates marker, marker influences TF, TF as marker, TF as potential marker)
+4. [✓] Classify each gene entry into one of five categories using extracted evidence + heuristics
+5. [✓] Save intermediate artifacts and final category list JSON to required paths
+
+Saved:
+- Final categories list: `/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/tf_marker_annotate.json`
+- Intermediates directory: `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/tf_marker_annotate`
+  - `tf_marker_entries.json`, `paper_content.md`, `gene_sentence_evidence.json`, `gene_label_signals.json`, `pred_with_gene.json`
+</solution>

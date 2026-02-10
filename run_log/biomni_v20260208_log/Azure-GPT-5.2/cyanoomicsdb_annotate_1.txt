@@ -1,0 +1,4108 @@
+Extract basic information for each gene from the annotation GFF file `benchmark/dataset/CyanoOmicsDB/ncbi_dataset/data/GCF_000009725.1/demo_genomic.gff`, including locus tags, gene symbols, genomic coordinates, protein ID, and product. 
+
+Then, for each protein-coding gene, integrate the Pfam accessions from InterProScan. The protein sequence as saved in `benchmark/dataset/CyanoOmicsDB/ncbi_dataset/data/GCF_000009725.1/protein.faa`.
+
+Finally, aggregate the extracted gene information and functional annotations into a comprehensive master TSV file `/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/cyanoomicsdb_annotate_1.tsv`.
+
+All temp data should be save in `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb`.
+
+The reference format for the output file:
+Locus_Tag       Symbol  Old_Locus_Tag   Location        Protein_ID      Product      Pfam
+SGL_RS01970     -       -       NC_005232.1:77988-78551(+)      WP_223211257.1  hypothetical protein      PF01497
+SGL_RS01975     -       -       NC_005232.1:78616-78828(-)      WP_011153842.1  hypothetical protein      PF11741;PF07715;PF00593
+SGL_RS01980     -       -       NC_005232.1:78981-79160(+)      WP_011153843.1  hypothetical protein      PF12833
+
+# Intermediate Results
+All intermediate files generated should be saved in the directly `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb_annotate_1`
+
+<execute>
+import os, re, csv, sys, json, textwrap, subprocess
+from collections import defaultdict, OrderedDict
+
+print("Research log: CyanoOmicsDB gene-info + Pfam integration")
+
+# -----------------------------
+# Plan (checklist)
+# -----------------------------
+plan = [
+    "[ ] Create required output/temp directories",
+    "[ ] Parse GFF to extract per-gene basic fields (locus tag, symbol, old locus tag, coordinates, product, protein_id)",
+    "[ ] Prepare protein FASTA mapping (protein_id -> sequence) for InterProScan input",
+    "[ ] Run InterProScan (or reuse existing results) to obtain Pfam accessions per protein_id",
+    "[ ] Integrate Pfam with gene table and write master TSV + intermediate files"
+]
+def show_plan(plan):
+    print("\nPLAN:")
+    for i, p in enumerate(plan, 1):
+        print(f"{i}. {p}")
+show_plan(plan)
+
+# -----------------------------
+# Step 1: dirs
+# -----------------------------
+gff_path = "benchmark/dataset/CyanoOmicsDB/ncbi_dataset/data/GCF_000009725.1/demo_genomic.gff"
+faa_path = "benchmark/dataset/CyanoOmicsDB/ncbi_dataset/data/GCF_000009725.1/protein.faa"
+
+tmp_root = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb"
+tmp_job = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb_annotate_1"
+out_tsv  = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/cyanoomicsdb_annotate_1.tsv"
+
+os.makedirs(tmp_root, exist_ok=True)
+os.makedirs(tmp_job, exist_ok=True)
+os.makedirs(os.path.dirname(out_tsv), exist_ok=True)
+
+assert os.path.exists(gff_path), f"Missing GFF: {gff_path}"
+assert os.path.exists(faa_path), f"Missing FAA: {faa_path}"
+
+plan[0] = "[✓] Create required output/temp directories"
+show_plan(plan)
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def parse_attrs(attr_str):
+    d = {}
+    for part in attr_str.strip().split(";"):
+        if not part:
+            continue
+        if "=" in part:
+            k,v = part.split("=", 1)
+            d[k] = v
+        elif " " in part:
+            k,v = part.split(" ",1)
+            d[k] = v
+        else:
+            d[part] = ""
+    return d
+
+def normalize_missing(x):
+    return x if (x is not None and x != "") else "-"
+
+# -----------------------------
+# Step 2: Parse GFF
+# Strategy:
+# - Build gene rows primarily from "gene" features with locus_tag.
+# - Fill Product/Protein_ID from child CDS with matching Parent/ID relations.
+# - If "gene" is absent, create rows from CDS locus_tag as fallback.
+# -----------------------------
+gene_by_id = {}         # gene ID -> row dict
+gene_by_locus = {}      # locus_tag -> row dict
+cds_pending = []        # store CDS info to link later
+
+with open(gff_path, "r") as fh:
+    for line in fh:
+        if not line.strip() or line.startswith("#"):
+            continue
+        cols = line.rstrip("\n").split("\t")
+        if len(cols) != 9:
+            continue
+        seqid, source, ftype, start, end, score, strand, phase, attrs = cols
+        a = parse_attrs(attrs)
+
+        if ftype == "gene":
+            locus = a.get("locus_tag") or a.get("Name") or a.get("gene")  # fallback
+            if not locus:
+                continue
+            gene_id = a.get("ID")
+            symbol = a.get("gene") or a.get("Name")  # NCBI often uses gene= for symbol; Name can be locus sometimes
+            # If Name equals locus, prefer gene=
+            if symbol == locus:
+                symbol = a.get("gene")
+            old_locus = a.get("old_locus_tag")
+            row = {
+                "Locus_Tag": locus,
+                "Symbol": normalize_missing(symbol) if symbol else "-",
+                "Old_Locus_Tag": normalize_missing(old_locus),
+                "seqid": seqid,
+                "start": int(start),
+                "end": int(end),
+                "strand": strand,
+                "Protein_ID": "-",
+                "Product": "-",
+            }
+            if gene_id:
+                gene_by_id[gene_id] = row
+            gene_by_locus[locus] = row
+
+        elif ftype == "CDS":
+            locus = a.get("locus_tag") or a.get("Name") or a.get("gene")
+            prot_id = a.get("protein_id")
+            product = a.get("product")
+            parent = a.get("Parent")  # can be comma-separated
+            cds_pending.append({
+                "locus": locus,
+                "prot_id": prot_id,
+                "product": product,
+                "parent": parent,
+                "seqid": seqid,
+                "start": int(start),
+                "end": int(end),
+                "strand": strand
+            })
+
+# Link CDS -> gene
+for cds in cds_pending:
+    linked = False
+    # Try Parent linking
+    if cds["parent"]:
+        for pid in cds["parent"].split(","):
+            if pid in gene_by_id:
+                row = gene_by_id[pid]
+                if cds["prot_id"]:
+                    row["Protein_ID"] = cds["prot_id"]
+                if cds["product"]:
+                    row["Product"] = cds["product"]
+                linked = True
+    # Try locus_tag direct
+    if (not linked) and cds["locus"] and cds["locus"] in gene_by_locus:
+        row = gene_by_locus[cds["locus"]]
+        if cds["prot_id"]:
+            row["Protein_ID"] = cds["prot_id"]
+        if cds["product"]:
+            row["Product"] = cds["product"]
+        linked = True
+    # Fallback: create from CDS if no gene row exists
+    if (not linked) and cds["locus"]:
+        locus = cds["locus"]
+        if locus not in gene_by_locus:
+            row = {
+                "Locus_Tag": locus,
+                "Symbol": "-",
+                "Old_Locus_Tag": "-",
+                "seqid": cds["seqid"],
+                "start": cds["start"],
+                "end": cds["end"],
+                "strand": cds["strand"],
+                "Protein_ID": cds["prot_id"] or "-",
+                "Product": cds["product"] or "-",
+            }
+            gene_by_locus[locus] = row
+
+# Finalize and sort rows by contig/start
+rows = list(gene_by_locus.values())
+rows.sort(key=lambda r: (r["seqid"], r["start"], r["end"], r["Locus_Tag"]))
+
+def format_location(r):
+    return f'{r["seqid"]}:{r["start"]}-{r["end"]}({r["strand"]})'
+
+gene_table_path = os.path.join(tmp_job, "genes_from_gff.tsv")
+with open(gene_table_path, "w", newline="") as out:
+    w = csv.writer(out, delimiter="\t")
+    w.writerow(["Locus_Tag","Symbol","Old_Locus_Tag","Location","Protein_ID","Product"])
+    for r in rows:
+        w.writerow([
+            r["Locus_Tag"],
+            normalize_missing(r["Symbol"]),
+            normalize_missing(r["Old_Locus_Tag"]),
+            format_location(r),
+            normalize_missing(r["Protein_ID"]),
+            normalize_missing(r["Product"]),
+        ])
+
+print(f"\nParsed genes: {len(rows)}")
+print(f"Wrote intermediate gene table: {gene_table_path}")
+
+plan[1] = "[✓] Parse GFF to extract per-gene basic fields (locus tag, symbol, old locus tag, coordinates, product, protein_id)"
+show_plan(plan)
+
+# -----------------------------
+# Step 3: Read protein FASTA mapping
+# -----------------------------
+prot_seqs = {}
+prot_order = []
+current_id = None
+seq_chunks = []
+
+with open(faa_path, "r") as fh:
+    for line in fh:
+        line = line.rstrip("\n")
+        if line.startswith(">"):
+            if current_id is not None:
+                prot_seqs[current_id] = "".join(seq_chunks)
+            header = line[1:]
+            # NCBI protein.faa headers typically include accession as first token
+            current_id = header.split()[0]
+            prot_order.append(current_id)
+            seq_chunks = []
+        else:
+            seq_chunks.append(line.strip())
+    if current_id is not None:
+        prot_seqs[current_id] = "".join(seq_chunks)
+
+print(f"\nLoaded protein sequences: {len(prot_seqs)}")
+
+# Create a FASTA containing only proteins referenced in gene table (protein-coding)
+prot_ids_in_genes = sorted({r["Protein_ID"] for r in rows if r["Protein_ID"] not in (None,"","-")})
+subset_faa = os.path.join(tmp_job, "proteins_for_interproscan.faa")
+
+with open(subset_faa, "w") as out:
+    kept = 0
+    missing = 0
+    for pid in prot_ids_in_genes:
+        seq = prot_seqs.get(pid)
+        if seq:
+            out.write(f">{pid}\n")
+            # wrap at 60
+            for i in range(0, len(seq), 60):
+                out.write(seq[i:i+60] + "\n")
+            kept += 1
+        else:
+            missing += 1
+
+print(f"Wrote subset FASTA for InterProScan: {subset_faa}")
+print(f"Proteins referenced by GFF: {len(prot_ids_in_genes)} | present in FAA: {kept} | missing: {missing}")
+
+plan[2] = "[✓] Prepare protein FASTA mapping (protein_id -> sequence) for InterProScan input"
+show_plan(plan)
+
+# -----------------------------
+# Step 4: InterProScan for Pfam
+# We'll try to detect interproscan.sh; if unavailable, fail with clear message.
+# Output in TSV; parse Pfam (Db=Pfam) accessions.
+# -----------------------------
+def which(cmd):
+    r = subprocess.run(["bash","-lc", f"command -v {cmd}"], capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+interproscan = which("interproscan.sh")
+ipr_tsv = os.path.join(tmp_job, "interproscan.tsv")
+
+if interproscan:
+    print(f"\nFound InterProScan: {interproscan}")
+    # Run only if output not already there
+    if not os.path.exists(ipr_tsv) or os.path.getsize(ipr_tsv) == 0:
+        cmd = f"""
+        set -euo pipefail
+        interproscan.sh -i "{subset_faa}" -f tsv -dp -appl Pfam -o "{ipr_tsv}" >/dev/null 2>&1 || interproscan.sh -i "{subset_faa}" -f tsv -appl Pfam -o "{ipr_tsv}"
+        """
+        print("Running InterProScan (Pfam)...")
+        r = subprocess.run(["bash","-lc", cmd], capture_output=True, text=True)
+        print("InterProScan return code:", r.returncode)
+        if r.stdout.strip():
+            print("STDOUT:\n", r.stdout[:2000])
+        if r.stderr.strip():
+            print("STDERR:\n", r.stderr[:2000])
+        if r.returncode != 0:
+            raise RuntimeError("InterProScan failed; see logs above.")
+    else:
+        print("Reusing existing InterProScan TSV:", ipr_tsv)
+else:
+    print("\nWARNING: interproscan.sh not found in PATH.")
+    print("Will proceed with empty Pfam annotations (Pfam='-').")
+    # create empty placeholder
+    with open(ipr_tsv, "w") as out:
+        out.write("")
+
+# Parse InterProScan TSV
+# Format (InterProScan TSV): columns include
+# 1: protein accession, 4: analysis, 5: signature accession, 6: signature desc, ...
+pfam_by_prot = defaultdict(set)
+if os.path.exists(ipr_tsv) and os.path.getsize(ipr_tsv) > 0:
+    with open(ipr_tsv, "r") as fh:
+        for line in fh:
+            if not line.strip() or line.startswith("#"):
+                continue
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 6:
+                continue
+            prot = parts[0]
+            analysis = parts[3]
+            sig_acc = parts[4]
+            if analysis == "Pfam" and sig_acc:
+                pfam_by_prot[prot].add(sig_acc)
+
+pfam_map_path = os.path.join(tmp_job, "pfam_by_protein.tsv")
+with open(pfam_map_path, "w", newline="") as out:
+    w = csv.writer(out, delimiter="\t")
+    w.writerow(["Protein_ID","Pfam"])
+    for prot in sorted(set(prot_ids_in_genes)):
+        pf = sorted(pfam_by_prot.get(prot, set()))
+        w.writerow([prot, ";".join(pf) if pf else "-"])
+
+print(f"\nProteins with >=1 Pfam hit: {sum(1 for k in pfam_by_prot if pfam_by_prot[k])}")
+print(f"Wrote intermediate Pfam map: {pfam_map_path}")
+print(f"Wrote/used InterProScan TSV: {ipr_tsv}")
+
+plan[3] = "[✓] Run InterProScan (or reuse existing results) to obtain Pfam accessions per protein_id"
+show_plan(plan)
+
+# -----------------------------
+# Step 5: Integrate and write master TSV
+# -----------------------------
+with open(out_tsv, "w", newline="") as out:
+    w = csv.writer(out, delimiter="\t")
+    w.writerow(["Locus_Tag","Symbol","Old_Locus_Tag","Location","Protein_ID","Product","Pfam"])
+    for r in rows:
+        prot = r["Protein_ID"]
+        pf = "-"
+        if prot not in (None,"","-"):
+            s = sorted(pfam_by_prot.get(prot, set()))
+            pf = ";".join(s) if s else "-"
+        w.writerow([
+            r["Locus_Tag"],
+            normalize_missing(r["Symbol"]),
+            normalize_missing(r["Old_Locus_Tag"]),
+            format_location(r),
+            normalize_missing(prot),
+            normalize_missing(r["Product"]),
+            pf
+        ])
+
+master_copy_path = os.path.join(tmp_job, "cyanoomicsdb_annotate_1.master.tsv")
+# also save a copy under tmp as requested intermediate
+subprocess.run(["bash","-lc", f'cp -f "{out_tsv}" "{master_copy_path}"'], check=True)
+
+print(f"\nWrote master TSV: {out_tsv}")
+print(f"Saved intermediate master copy: {master_copy_path}")
+
+plan[4] = "[✓] Integrate Pfam with gene table and write master TSV + intermediate files"
+show_plan(plan)
+
+# Final sanity preview
+print("\nPreview (first 5 data lines):")
+with open(out_tsv, "r") as fh:
+    for i, line in enumerate(fh):
+        if i > 5:
+            break
+        print(line.rstrip("\n"))
+</execute>
+<observation>NameError("name 'subprocess' is not defined")</observation>
+<execute>
+import os, re, csv, sys, json, textwrap
+import subprocess
+from collections import defaultdict
+
+print("Research log: CyanoOmicsDB gene-info + Pfam integration (rerun after fixing subprocess import)")
+
+# -----------------------------
+# Plan (checklist)
+# -----------------------------
+plan = [
+    "[ ] Create required output/temp directories",
+    "[ ] Parse GFF to extract per-gene basic fields (locus tag, symbol, old locus tag, coordinates, product, protein_id)",
+    "[ ] Prepare protein FASTA mapping (protein_id -> sequence) for InterProScan input",
+    "[ ] Run InterProScan (or reuse existing results) to obtain Pfam accessions per protein_id",
+    "[ ] Integrate Pfam with gene table and write master TSV + intermediate files"
+]
+def show_plan(plan):
+    print("\nPLAN:")
+    for i, p in enumerate(plan, 1):
+        print(f"{i}. {p}")
+show_plan(plan)
+
+# -----------------------------
+# Step 1: dirs
+# -----------------------------
+gff_path = "benchmark/dataset/CyanoOmicsDB/ncbi_dataset/data/GCF_000009725.1/demo_genomic.gff"
+faa_path = "benchmark/dataset/CyanoOmicsDB/ncbi_dataset/data/GCF_000009725.1/protein.faa"
+
+tmp_root = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb"
+tmp_job = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb_annotate_1"
+out_tsv  = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/cyanoomicsdb_annotate_1.tsv"
+
+os.makedirs(tmp_root, exist_ok=True)
+os.makedirs(tmp_job, exist_ok=True)
+os.makedirs(os.path.dirname(out_tsv), exist_ok=True)
+
+assert os.path.exists(gff_path), f"Missing GFF: {gff_path}"
+assert os.path.exists(faa_path), f"Missing FAA: {faa_path}"
+
+plan[0] = "[✓] Create required output/temp directories"
+show_plan(plan)
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def parse_attrs(attr_str):
+    d = {}
+    for part in attr_str.strip().split(";"):
+        if not part:
+            continue
+        if "=" in part:
+            k, v = part.split("=", 1)
+            d[k] = v
+        else:
+            d[part] = ""
+    return d
+
+def normalize_missing(x):
+    return x if (x is not None and x != "") else "-"
+
+# -----------------------------
+# Step 2: Parse GFF
+# -----------------------------
+gene_by_id = {}
+gene_by_locus = {}
+cds_pending = []
+
+with open(gff_path, "r") as fh:
+    for line in fh:
+        if not line.strip() or line.startswith("#"):
+            continue
+        cols = line.rstrip("\n").split("\t")
+        if len(cols) != 9:
+            continue
+        seqid, source, ftype, start, end, score, strand, phase, attrs = cols
+        a = parse_attrs(attrs)
+
+        if ftype == "gene":
+            locus = a.get("locus_tag") or a.get("Name") or a.get("gene")
+            if not locus:
+                continue
+            gene_id = a.get("ID")
+            symbol = a.get("gene") or a.get("Name")
+            if symbol == locus:
+                symbol = a.get("gene")
+            old_locus = a.get("old_locus_tag")
+            row = {
+                "Locus_Tag": locus,
+                "Symbol": normalize_missing(symbol) if symbol else "-",
+                "Old_Locus_Tag": normalize_missing(old_locus),
+                "seqid": seqid,
+                "start": int(start),
+                "end": int(end),
+                "strand": strand,
+                "Protein_ID": "-",
+                "Product": "-",
+            }
+            if gene_id:
+                gene_by_id[gene_id] = row
+            gene_by_locus[locus] = row
+
+        elif ftype == "CDS":
+            locus = a.get("locus_tag") or a.get("Name") or a.get("gene")
+            cds_pending.append({
+                "locus": locus,
+                "prot_id": a.get("protein_id"),
+                "product": a.get("product"),
+                "parent": a.get("Parent"),
+                "seqid": seqid,
+                "start": int(start),
+                "end": int(end),
+                "strand": strand
+            })
+
+# link CDS to genes
+for cds in cds_pending:
+    linked = False
+    if cds["parent"]:
+        for pid in cds["parent"].split(","):
+            if pid in gene_by_id:
+                row = gene_by_id[pid]
+                if cds["prot_id"]:
+                    row["Protein_ID"] = cds["prot_id"]
+                if cds["product"]:
+                    row["Product"] = cds["product"]
+                linked = True
+    if (not linked) and cds["locus"] and cds["locus"] in gene_by_locus:
+        row = gene_by_locus[cds["locus"]]
+        if cds["prot_id"]:
+            row["Protein_ID"] = cds["prot_id"]
+        if cds["product"]:
+            row["Product"] = cds["product"]
+        linked = True
+    if (not linked) and cds["locus"]:
+        locus = cds["locus"]
+        if locus not in gene_by_locus:
+            gene_by_locus[locus] = {
+                "Locus_Tag": locus,
+                "Symbol": "-",
+                "Old_Locus_Tag": "-",
+                "seqid": cds["seqid"],
+                "start": cds["start"],
+                "end": cds["end"],
+                "strand": cds["strand"],
+                "Protein_ID": cds["prot_id"] or "-",
+                "Product": cds["product"] or "-",
+            }
+
+rows = list(gene_by_locus.values())
+rows.sort(key=lambda r: (r["seqid"], r["start"], r["end"], r["Locus_Tag"]))
+
+def format_location(r):
+    return f'{r["seqid"]}:{r["start"]}-{r["end"]}({r["strand"]})'
+
+gene_table_path = os.path.join(tmp_job, "genes_from_gff.tsv")
+with open(gene_table_path, "w", newline="") as out:
+    w = csv.writer(out, delimiter="\t")
+    w.writerow(["Locus_Tag","Symbol","Old_Locus_Tag","Location","Protein_ID","Product"])
+    for r in rows:
+        w.writerow([
+            r["Locus_Tag"],
+            normalize_missing(r["Symbol"]),
+            normalize_missing(r["Old_Locus_Tag"]),
+            format_location(r),
+            normalize_missing(r["Protein_ID"]),
+            normalize_missing(r["Product"]),
+        ])
+
+print(f"\nParsed genes: {len(rows)}")
+print(f"Wrote intermediate gene table: {gene_table_path}")
+
+plan[1] = "[✓] Parse GFF to extract per-gene basic fields (locus tag, symbol, old locus tag, coordinates, product, protein_id)"
+show_plan(plan)
+
+# -----------------------------
+# Step 3: protein FASTA mapping + subset
+# -----------------------------
+prot_seqs = {}
+current_id = None
+seq_chunks = []
+
+with open(faa_path, "r") as fh:
+    for line in fh:
+        line = line.rstrip("\n")
+        if line.startswith(">"):
+            if current_id is not None:
+                prot_seqs[current_id] = "".join(seq_chunks)
+            header = line[1:]
+            current_id = header.split()[0]
+            seq_chunks = []
+        else:
+            seq_chunks.append(line.strip())
+    if current_id is not None:
+        prot_seqs[current_id] = "".join(seq_chunks)
+
+prot_ids_in_genes = sorted({r["Protein_ID"] for r in rows if r["Protein_ID"] not in (None,"","-")})
+subset_faa = os.path.join(tmp_job, "proteins_for_interproscan.faa")
+
+kept = missing = 0
+with open(subset_faa, "w") as out:
+    for pid in prot_ids_in_genes:
+        seq = prot_seqs.get(pid)
+        if seq:
+            out.write(f">{pid}\n")
+            for i in range(0, len(seq), 60):
+                out.write(seq[i:i+60] + "\n")
+            kept += 1
+        else:
+            missing += 1
+
+print(f"\nLoaded protein sequences: {len(prot_seqs)}")
+print(f"Wrote subset FASTA for InterProScan: {subset_faa}")
+print(f"Proteins referenced by GFF: {len(prot_ids_in_genes)} | present in FAA: {kept} | missing: {missing}")
+
+plan[2] = "[✓] Prepare protein FASTA mapping (protein_id -> sequence) for InterProScan input"
+show_plan(plan)
+
+# -----------------------------
+# Step 4: run InterProScan if available; parse Pfam
+# -----------------------------
+def which(cmd):
+    r = subprocess.run(["bash","-lc", f"command -v {cmd}"], capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+interproscan = which("interproscan.sh")
+ipr_tsv = os.path.join(tmp_job, "interproscan.tsv")
+
+if interproscan:
+    print(f"\nFound InterProScan: {interproscan}")
+    if not os.path.exists(ipr_tsv) or os.path.getsize(ipr_tsv) == 0:
+        cmd = f"""
+        set -euo pipefail
+        interproscan.sh -i "{subset_faa}" -f tsv -dp -appl Pfam -o "{ipr_tsv}"
+        """
+        print("Running InterProScan (Pfam)...")
+        r = subprocess.run(["bash","-lc", cmd], capture_output=True, text=True)
+        print("InterProScan return code:", r.returncode)
+        if r.stdout.strip():
+            print("STDOUT (head):\n", r.stdout[:2000])
+        if r.stderr.strip():
+            print("STDERR (head):\n", r.stderr[:2000])
+        if r.returncode != 0:
+            raise RuntimeError("InterProScan failed; see logs above.")
+    else:
+        print("Reusing existing InterProScan TSV:", ipr_tsv)
+else:
+    print("\nWARNING: interproscan.sh not found in PATH.")
+    print("Proceeding with empty Pfam annotations (Pfam='-').")
+    open(ipr_tsv, "w").close()
+
+pfam_by_prot = defaultdict(set)
+if os.path.exists(ipr_tsv) and os.path.getsize(ipr_tsv) > 0:
+    with open(ipr_tsv, "r") as fh:
+        for line in fh:
+            if not line.strip() or line.startswith("#"):
+                continue
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) < 6:
+                continue
+            prot = parts[0]
+            analysis = parts[3]
+            sig_acc = parts[4]
+            if analysis == "Pfam" and sig_acc:
+                pfam_by_prot[prot].add(sig_acc)
+
+pfam_map_path = os.path.join(tmp_job, "pfam_by_protein.tsv")
+with open(pfam_map_path, "w", newline="") as out:
+    w = csv.writer(out, delimiter="\t")
+    w.writerow(["Protein_ID","Pfam"])
+    for prot in prot_ids_in_genes:
+        pf = sorted(pfam_by_prot.get(prot, set()))
+        w.writerow([prot, ";".join(pf) if pf else "-"])
+
+print(f"\nProteins with >=1 Pfam hit: {sum(1 for k in pfam_by_prot if pfam_by_prot[k])}")
+print(f"Wrote intermediate Pfam map: {pfam_map_path}")
+print(f"Wrote/used InterProScan TSV: {ipr_tsv}")
+
+plan[3] = "[✓] Run InterProScan (or reuse existing results) to obtain Pfam accessions per protein_id"
+show_plan(plan)
+
+# -----------------------------
+# Step 5: integrate + master TSV
+# -----------------------------
+with open(out_tsv, "w", newline="") as out:
+    w = csv.writer(out, delimiter="\t")
+    w.writerow(["Locus_Tag","Symbol","Old_Locus_Tag","Location","Protein_ID","Product","Pfam"])
+    for r in rows:
+        prot = r["Protein_ID"]
+        pf = "-"
+        if prot not in (None,"","-"):
+            s = sorted(pfam_by_prot.get(prot, set()))
+            pf = ";".join(s) if s else "-"
+        w.writerow([
+            r["Locus_Tag"],
+            normalize_missing(r["Symbol"]),
+            normalize_missing(r["Old_Locus_Tag"]),
+            format_location(r),
+            normalize_missing(prot),
+            normalize_missing(r["Product"]),
+            pf
+        ])
+
+master_copy_path = os.path.join(tmp_job, "cyanoomicsdb_annotate_1.master.tsv")
+subprocess.run(["bash","-lc", f'cp -f "{out_tsv}" "{master_copy_path}"'], check=True)
+
+print(f"\nWrote master TSV: {out_tsv}")
+print(f"Saved intermediate master copy: {master_copy_path}")
+
+plan[4] = "[✓] Integrate Pfam with gene table and write master TSV + intermediate files"
+show_plan(plan)
+
+print("\nPreview (header + first 5 rows):")
+with open(out_tsv, "r") as fh:
+    for i, line in enumerate(fh):
+        if i > 5:
+            break
+        print(line.rstrip("\n"))
+</execute>
+<observation>NameError("name 'subprocess' is not defined")</observation>
+<execute>
+# Research log: fix prior NameError by ensuring subprocess is imported in THIS execution context
+import os, csv
+import subprocess
+from collections import defaultdict
+
+print("Research log: starting clean rerun with subprocess imported")
+
+# -----------------------------
+# Plan (checklist)
+# -----------------------------
+plan = [
+    "[ ] Create required output/temp directories",
+    "[ ] Parse GFF to extract per-gene basic fields (locus tag, symbol, old locus tag, coordinates, product, protein_id)",
+    "[ ] Prepare protein FASTA mapping (protein_id -> sequence) for InterProScan input",
+    "[ ] Run InterProScan (or reuse existing results) to obtain Pfam accessions per protein_id",
+    "[ ] Integrate Pfam with gene table and write master TSV + intermediate files"
+]
+def show_plan():
+    print("\nPLAN:")
+    for i, p in enumerate(plan, 1):
+        print(f"{i}. {p}")
+show_plan()
+
+# Inputs/outputs
+gff_path = "benchmark/dataset/CyanoOmicsDB/ncbi_dataset/data/GCF_000009725.1/demo_genomic.gff"
+faa_path = "benchmark/dataset/CyanoOmicsDB/ncbi_dataset/data/GCF_000009725.1/protein.faa"
+tmp_root = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb"
+tmp_job  = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb_annotate_1"
+out_tsv  = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/cyanoomicsdb_annotate_1.tsv"
+
+# Step 1
+os.makedirs(tmp_root, exist_ok=True)
+os.makedirs(tmp_job, exist_ok=True)
+os.makedirs(os.path.dirname(out_tsv), exist_ok=True)
+assert os.path.exists(gff_path), f"Missing GFF: {gff_path}"
+assert os.path.exists(faa_path), f"Missing FAA: {faa_path}"
+plan[0] = "[✓] Create required output/temp directories"
+show_plan()
+
+# Helpers
+def parse_attrs(attr_str):
+    d = {}
+    for part in attr_str.strip().split(";"):
+        if not part:
+            continue
+        if "=" in part:
+            k, v = part.split("=", 1)
+            d[k] = v
+        else:
+            d[part] = ""
+    return d
+
+def norm(x):
+    return x if (x is not None and x != "") else "-"
+
+def loc(seqid, start, end, strand):
+    return f"{seqid}:{start}-{end}({strand})"
+
+# Step 2: parse GFF
+gene_by_id = {}
+gene_by_locus = {}
+cds_pending = []
+
+with open(gff_path, "r") as fh:
+    for line in fh:
+        if not line.strip() or line.startswith("#"):
+            continue
+        cols = line.rstrip("\n").split("\t")
+        if len(cols) != 9:
+            continue
+        seqid, source, ftype, start, end, score, strand, phase, attrs = cols
+        a = parse_attrs(attrs)
+
+        if ftype == "gene":
+            locus_tag = a.get("locus_tag") or a.get("Name") or a.get("gene")
+            if not locus_tag:
+                continue
+            gene_id = a.get("ID")
+            symbol = a.get("gene") or a.get("Name")
+            if symbol == locus_tag:
+                symbol = a.get("gene")
+            old = a.get("old_locus_tag")
+            row = {
+                "Locus_Tag": locus_tag,
+                "Symbol": norm(symbol) if symbol else "-",
+                "Old_Locus_Tag": norm(old),
+                "seqid": seqid,
+                "start": int(start),
+                "end": int(end),
+                "strand": strand,
+                "Protein_ID": "-",
+                "Product": "-",
+            }
+            if gene_id:
+                gene_by_id[gene_id] = row
+            gene_by_locus[locus_tag] = row
+
+        elif ftype == "CDS":
+            cds_pending.append({
+                "locus": a.get("locus_tag") or a.get("Name") or a.get("gene"),
+                "prot_id": a.get("protein_id"),
+                "product": a.get("product"),
+                "parent": a.get("Parent"),
+                "seqid": seqid,
+                "start": int(start),
+                "end": int(end),
+                "strand": strand
+            })
+
+# link CDS to genes
+for cds in cds_pending:
+    linked = False
+    if cds["parent"]:
+        for pid in cds["parent"].split(","):
+            if pid in gene_by_id:
+                r = gene_by_id[pid]
+                if cds["prot_id"]:
+                    r["Protein_ID"] = cds["prot_id"]
+                if cds["product"]:
+                    r["Product"] = cds["product"]
+                linked = True
+    if (not linked) and cds["locus"] and cds["locus"] in gene_by_locus:
+        r = gene_by_locus[cds["locus"]]
+        if cds["prot_id"]:
+            r["Protein_ID"] = cds["prot_id"]
+        if cds["product"]:
+            r["Product"] = cds["product"]
+        linked = True
+    if (not linked) and cds["locus"]:
+        locus_tag = cds["locus"]
+        if locus_tag not in gene_by_locus:
+            gene_by_locus[locus_tag] = {
+                "Locus_Tag": locus_tag,
+                "Symbol": "-",
+                "Old_Locus_Tag": "-",
+                "seqid": cds["seqid"],
+                "start": cds["start"],
+                "end": cds["end"],
+                "strand": cds["strand"],
+                "Protein_ID": cds["prot_id"] or "-",
+                "Product": cds["product"] or "-",
+            }
+
+rows = list(gene_by_locus.values())
+rows.sort(key=lambda r: (r["seqid"], r["start"], r["end"], r["Locus_Tag"]))
+
+genes_tsv = os.path.join(tmp_job, "genes_from_gff.tsv")
+with open(genes_tsv, "w", newline="") as out:
+    w = csv.writer(out, delimiter="\t")
+    w.writerow(["Locus_Tag","Symbol","Old_Locus_Tag","Location","Protein_ID","Product"])
+    for r in rows:
+        w.writerow([r["Locus_Tag"], norm(r["Symbol"]), norm(r["Old_Locus_Tag"]),
+                    loc(r["seqid"], r["start"], r["end"], r["strand"]),
+                    norm(r["Protein_ID"]), norm(r["Product"])])
+print(f"\nParsed genes: {len(rows)}")
+print(f"Wrote intermediate: {genes_tsv}")
+
+plan[1] = "[✓] Parse GFF to extract per-gene basic fields (locus tag, symbol, old locus tag, coordinates, product, protein_id)"
+show_plan()
+
+# Step 3: FASTA map and subset
+prot_seqs = {}
+cur = None
+chunks = []
+with open(faa_path, "r") as fh:
+    for line in fh:
+        line = line.rstrip("\n")
+        if line.startswith(">"):
+            if cur is not None:
+                prot_seqs[cur] = "".join(chunks)
+            cur = line[1:].split()[0]
+            chunks = []
+        else:
+            chunks.append(line.strip())
+    if cur is not None:
+        prot_seqs[cur] = "".join(chunks)
+
+prot_ids = sorted({r["Protein_ID"] for r in rows if r["Protein_ID"] not in (None, "", "-")})
+subset_faa = os.path.join(tmp_job, "proteins_for_interproscan.faa")
+kept = missing = 0
+with open(subset_faa, "w") as out:
+    for pid in prot_ids:
+        seq = prot_seqs.get(pid)
+        if not seq:
+            missing += 1
+            continue
+        out.write(f">{pid}\n")
+        for i in range(0, len(seq), 60):
+            out.write(seq[i:i+60] + "\n")
+        kept += 1
+
+print(f"\nLoaded proteins in FAA: {len(prot_seqs)}")
+print(f"Proteins referenced by genes: {len(prot_ids)}; present: {kept}; missing: {missing}")
+print(f"Wrote subset FASTA: {subset_faa}")
+
+plan[2] = "[✓] Prepare protein FASTA mapping (protein_id -> sequence) for InterProScan input"
+show_plan()
+
+# Step 4: InterProScan
+def which(cmd):
+    r = subprocess.run(["bash", "-lc", f"command -v {cmd}"], capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+ipr = which("interproscan.sh")
+ipr_tsv = os.path.join(tmp_job, "interproscan.tsv")
+
+if ipr:
+    print(f"\nInterProScan found: {ipr}")
+    if not os.path.exists(ipr_tsv) or os.path.getsize(ipr_tsv) == 0:
+        cmd = f'interproscan.sh -i "{subset_faa}" -f tsv -dp -appl Pfam -o "{ipr_tsv}"'
+        print("Running:", cmd)
+        r = subprocess.run(["bash","-lc", cmd], capture_output=True, text=True)
+        print("Return code:", r.returncode)
+        if r.stdout.strip():
+            print("STDOUT(head):", r.stdout[:1500])
+        if r.stderr.strip():
+            print("STDERR(head):", r.stderr[:1500])
+        if r.returncode != 0:
+            raise RuntimeError("InterProScan failed (see above).")
+    else:
+        print("Reusing existing:", ipr_tsv)
+else:
+    print("\nWARNING: interproscan.sh not in PATH; creating empty InterProScan TSV.")
+    open(ipr_tsv, "w").close()
+
+pfam_by_prot = defaultdict(set)
+if os.path.getsize(ipr_tsv) > 0:
+    with open(ipr_tsv, "r") as fh:
+        for line in fh:
+            if not line.strip() or line.startswith("#"):
+                continue
+            p = line.rstrip("\n").split("\t")
+            if len(p) >= 5 and p[3] == "Pfam" and p[4]:
+                pfam_by_prot[p[0]].add(p[4])
+
+pfam_map = os.path.join(tmp_job, "pfam_by_protein.tsv")
+with open(pfam_map, "w", newline="") as out:
+    w = csv.writer(out, delimiter="\t")
+    w.writerow(["Protein_ID","Pfam"])
+    for pid in prot_ids:
+        pf = sorted(pfam_by_prot.get(pid, set()))
+        w.writerow([pid, ";".join(pf) if pf else "-"])
+
+print(f"\nProteins with Pfam hits: {sum(1 for pid in prot_ids if pfam_by_prot.get(pid))}")
+print(f"Wrote intermediate: {pfam_map}")
+print(f"InterProScan TSV: {ipr_tsv}")
+
+plan[3] = "[✓] Run InterProScan (or reuse existing results) to obtain Pfam accessions per protein_id"
+show_plan()
+
+# Step 5: integrate + write master TSV
+with open(out_tsv, "w", newline="") as out:
+    w = csv.writer(out, delimiter="\t")
+    w.writerow(["Locus_Tag","Symbol","Old_Locus_Tag","Location","Protein_ID","Product","Pfam"])
+    for r in rows:
+        pid = r["Protein_ID"]
+        pf = "-"
+        if pid not in (None, "", "-"):
+            s = sorted(pfam_by_prot.get(pid, set()))
+            pf = ";".join(s) if s else "-"
+        w.writerow([r["Locus_Tag"], norm(r["Symbol"]), norm(r["Old_Locus_Tag"]),
+                    loc(r["seqid"], r["start"], r["end"], r["strand"]),
+                    norm(pid), norm(r["Product"]), pf])
+
+tmp_master = os.path.join(tmp_job, "cyanoomicsdb_annotate_1.master.tsv")
+subprocess.run(["bash","-lc", f'cp -f "{out_tsv}" "{tmp_master}"'], check=True)
+
+print(f"\nWrote master TSV: {out_tsv}")
+print(f"Saved intermediate master copy: {tmp_master}")
+
+plan[4] = "[✓] Integrate Pfam with gene table and write master TSV + intermediate files"
+show_plan()
+
+print("\nPreview (header + 3 rows):")
+with open(out_tsv, "r") as fh:
+    for i, line in enumerate(fh):
+        if i > 3:
+            break
+        print(line.rstrip("\n"))
+</execute>
+<observation>NameError("name 'plan' is not defined")</observation>
+<execute>
+import os, csv, subprocess
+from collections import defaultdict
+
+print("Research log: full clean rerun (fix: ensure 'plan' defined before use)")
+
+# -----------------------------
+# Plan (checklist)
+# -----------------------------
+plan = [
+    "[ ] Create required output/temp directories",
+    "[ ] Parse GFF to extract per-gene basic fields (locus tag, symbol, old locus tag, coordinates, product, protein_id)",
+    "[ ] Prepare protein FASTA mapping (protein_id -> sequence) for InterProScan input",
+    "[ ] Run InterProScan (or reuse existing results) to obtain Pfam accessions per protein_id",
+    "[ ] Integrate Pfam with gene table and write master TSV + intermediate files"
+]
+def show_plan():
+    print("\nPLAN:")
+    for i, p in enumerate(plan, 1):
+        print(f"{i}. {p}")
+
+show_plan()
+
+# -----------------------------
+# Paths
+# -----------------------------
+gff_path = "benchmark/dataset/CyanoOmicsDB/ncbi_dataset/data/GCF_000009725.1/demo_genomic.gff"
+faa_path = "benchmark/dataset/CyanoOmicsDB/ncbi_dataset/data/GCF_000009725.1/protein.faa"
+
+tmp_root = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb"
+tmp_job  = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb_annotate_1"
+out_tsv  = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/cyanoomicsdb_annotate_1.tsv"
+
+# -----------------------------
+# Step 1: dirs
+# -----------------------------
+os.makedirs(tmp_root, exist_ok=True)
+os.makedirs(tmp_job, exist_ok=True)
+os.makedirs(os.path.dirname(out_tsv), exist_ok=True)
+assert os.path.exists(gff_path), f"Missing GFF: {gff_path}"
+assert os.path.exists(faa_path), f"Missing FAA: {faa_path}"
+
+plan[0] = "[✓] Create required output/temp directories"
+show_plan()
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def parse_attrs(attr_str):
+    d = {}
+    for part in attr_str.strip().split(";"):
+        if not part:
+            continue
+        if "=" in part:
+            k, v = part.split("=", 1)
+            d[k] = v
+        else:
+            d[part] = ""
+    return d
+
+def norm(x):
+    return x if (x is not None and x != "") else "-"
+
+def format_loc(seqid, start, end, strand):
+    return f"{seqid}:{start}-{end}({strand})"
+
+def which(cmd):
+    r = subprocess.run(["bash", "-lc", f"command -v {cmd}"], capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+# -----------------------------
+# Step 2: parse GFF
+# -----------------------------
+gene_by_id = {}
+gene_by_locus = {}
+cds_pending = []
+
+with open(gff_path, "r") as fh:
+    for line in fh:
+        if not line.strip() or line.startswith("#"):
+            continue
+        cols = line.rstrip("\n").split("\t")
+        if len(cols) != 9:
+            continue
+        seqid, source, ftype, start, end, score, strand, phase, attrs = cols
+        a = parse_attrs(attrs)
+
+        if ftype == "gene":
+            locus_tag = a.get("locus_tag") or a.get("Name") or a.get("gene")
+            if not locus_tag:
+                continue
+            gene_id = a.get("ID")
+            symbol = a.get("gene") or a.get("Name")
+            if symbol == locus_tag:
+                symbol = a.get("gene")
+            old = a.get("old_locus_tag")
+            row = {
+                "Locus_Tag": locus_tag,
+                "Symbol": norm(symbol) if symbol else "-",
+                "Old_Locus_Tag": norm(old),
+                "seqid": seqid,
+                "start": int(start),
+                "end": int(end),
+                "strand": strand,
+                "Protein_ID": "-",
+                "Product": "-",
+            }
+            if gene_id:
+                gene_by_id[gene_id] = row
+            gene_by_locus[locus_tag] = row
+
+        elif ftype == "CDS":
+            cds_pending.append({
+                "locus": a.get("locus_tag") or a.get("Name") or a.get("gene"),
+                "prot_id": a.get("protein_id"),
+                "product": a.get("product"),
+                "parent": a.get("Parent"),
+                "seqid": seqid,
+                "start": int(start),
+                "end": int(end),
+                "strand": strand
+            })
+
+# Link CDS -> gene (by Parent, then locus_tag). Create fallback rows if needed.
+for cds in cds_pending:
+    linked = False
+
+    if cds["parent"]:
+        for pid in cds["parent"].split(","):
+            if pid in gene_by_id:
+                r = gene_by_id[pid]
+                if cds["prot_id"]:
+                    r["Protein_ID"] = cds["prot_id"]
+                if cds["product"]:
+                    r["Product"] = cds["product"]
+                linked = True
+
+    if (not linked) and cds["locus"] and cds["locus"] in gene_by_locus:
+        r = gene_by_locus[cds["locus"]]
+        if cds["prot_id"]:
+            r["Protein_ID"] = cds["prot_id"]
+        if cds["product"]:
+            r["Product"] = cds["product"]
+        linked = True
+
+    if (not linked) and cds["locus"]:
+        locus_tag = cds["locus"]
+        if locus_tag not in gene_by_locus:
+            gene_by_locus[locus_tag] = {
+                "Locus_Tag": locus_tag,
+                "Symbol": "-",
+                "Old_Locus_Tag": "-",
+                "seqid": cds["seqid"],
+                "start": cds["start"],
+                "end": cds["end"],
+                "strand": cds["strand"],
+                "Protein_ID": cds["prot_id"] or "-",
+                "Product": cds["product"] or "-",
+            }
+
+rows = list(gene_by_locus.values())
+rows.sort(key=lambda r: (r["seqid"], r["start"], r["end"], r["Locus_Tag"]))
+
+genes_tsv = os.path.join(tmp_job, "genes_from_gff.tsv")
+with open(genes_tsv, "w", newline="") as out:
+    w = csv.writer(out, delimiter="\t")
+    w.writerow(["Locus_Tag","Symbol","Old_Locus_Tag","Location","Protein_ID","Product"])
+    for r in rows:
+        w.writerow([
+            r["Locus_Tag"],
+            norm(r["Symbol"]),
+            norm(r["Old_Locus_Tag"]),
+            format_loc(r["seqid"], r["start"], r["end"], r["strand"]),
+            norm(r["Protein_ID"]),
+            norm(r["Product"]),
+        ])
+
+print(f"\nParsed genes: {len(rows)}")
+print(f"Wrote intermediate: {genes_tsv}")
+
+plan[1] = "[✓] Parse GFF to extract per-gene basic fields (locus tag, symbol, old locus tag, coordinates, product, protein_id)"
+show_plan()
+
+# -----------------------------
+# Step 3: protein FASTA mapping + subset for InterProScan
+# -----------------------------
+prot_seqs = {}
+cur = None
+chunks = []
+with open(faa_path, "r") as fh:
+    for line in fh:
+        line = line.rstrip("\n")
+        if line.startswith(">"):
+            if cur is not None:
+                prot_seqs[cur] = "".join(chunks)
+            cur = line[1:].split()[0]
+            chunks = []
+        else:
+            chunks.append(line.strip())
+    if cur is not None:
+        prot_seqs[cur] = "".join(chunks)
+
+prot_ids = sorted({r["Protein_ID"] for r in rows if r["Protein_ID"] not in (None, "", "-")})
+subset_faa = os.path.join(tmp_job, "proteins_for_interproscan.faa")
+
+kept = 0
+missing = 0
+with open(subset_faa, "w") as out:
+    for pid in prot_ids:
+        seq = prot_seqs.get(pid)
+        if not seq:
+            missing += 1
+            continue
+        out.write(f">{pid}\n")
+        for i in range(0, len(seq), 60):
+            out.write(seq[i:i+60] + "\n")
+        kept += 1
+
+print(f"\nLoaded proteins in FAA: {len(prot_seqs)}")
+print(f"Proteins referenced by genes: {len(prot_ids)}; present: {kept}; missing: {missing}")
+print(f"Wrote subset FASTA: {subset_faa}")
+
+plan[2] = "[✓] Prepare protein FASTA mapping (protein_id -> sequence) for InterProScan input"
+show_plan()
+
+# -----------------------------
+# Step 4: InterProScan Pfam integration
+# -----------------------------
+ipr = which("interproscan.sh")
+ipr_tsv = os.path.join(tmp_job, "interproscan.tsv")
+
+if ipr:
+    print(f"\nInterProScan found: {ipr}")
+    if not os.path.exists(ipr_tsv) or os.path.getsize(ipr_tsv) == 0:
+        cmd = f'interproscan.sh -i "{subset_faa}" -f tsv -dp -appl Pfam -o "{ipr_tsv}"'
+        print("Running:", cmd)
+        r = subprocess.run(["bash", "-lc", cmd], capture_output=True, text=True)
+        print("Return code:", r.returncode)
+        if r.stdout.strip():
+            print("STDOUT(head):", r.stdout[:1500])
+        if r.stderr.strip():
+            print("STDERR(head):", r.stderr[:1500])
+        if r.returncode != 0:
+            raise RuntimeError("InterProScan failed (see above).")
+    else:
+        print("Reusing existing InterProScan TSV:", ipr_tsv)
+else:
+    print("\nWARNING: interproscan.sh not in PATH; creating empty InterProScan TSV.")
+    open(ipr_tsv, "w").close()
+
+pfam_by_prot = defaultdict(set)
+if os.path.exists(ipr_tsv) and os.path.getsize(ipr_tsv) > 0:
+    with open(ipr_tsv, "r") as fh:
+        for line in fh:
+            if not line.strip() or line.startswith("#"):
+                continue
+            p = line.rstrip("\n").split("\t")
+            # InterProScan TSV: [0]=protein, [3]=analysis, [4]=signature accession
+            if len(p) >= 5 and p[3] == "Pfam" and p[4]:
+                pfam_by_prot[p[0]].add(p[4])
+
+pfam_map = os.path.join(tmp_job, "pfam_by_protein.tsv")
+with open(pfam_map, "w", newline="") as out:
+    w = csv.writer(out, delimiter="\t")
+    w.writerow(["Protein_ID","Pfam"])
+    for pid in prot_ids:
+        pf = sorted(pfam_by_prot.get(pid, set()))
+        w.writerow([pid, ";".join(pf) if pf else "-"])
+
+print(f"\nProteins with Pfam hits: {sum(1 for pid in prot_ids if pfam_by_prot.get(pid))}")
+print(f"Wrote intermediate: {pfam_map}")
+print(f"InterProScan TSV: {ipr_tsv}")
+
+plan[3] = "[✓] Run InterProScan (or reuse existing results) to obtain Pfam accessions per protein_id"
+show_plan()
+
+# -----------------------------
+# Step 5: write master TSV
+# -----------------------------
+with open(out_tsv, "w", newline="") as out:
+    w = csv.writer(out, delimiter="\t")
+    w.writerow(["Locus_Tag","Symbol","Old_Locus_Tag","Location","Protein_ID","Product","Pfam"])
+    for r in rows:
+        pid = r["Protein_ID"]
+        pf = "-"
+        if pid not in (None, "", "-"):
+            hits = sorted(pfam_by_prot.get(pid, set()))
+            pf = ";".join(hits) if hits else "-"
+        w.writerow([
+            r["Locus_Tag"],
+            norm(r["Symbol"]),
+            norm(r["Old_Locus_Tag"]),
+            format_loc(r["seqid"], r["start"], r["end"], r["strand"]),
+            norm(pid),
+            norm(r["Product"]),
+            pf
+        ])
+
+tmp_master = os.path.join(tmp_job, "cyanoomicsdb_annotate_1.master.tsv")
+subprocess.run(["bash", "-lc", f'cp -f "{out_tsv}" "{tmp_master}"'], check=True)
+
+print(f"\nWrote master TSV: {out_tsv}")
+print(f"Saved intermediate master copy: {tmp_master}")
+
+plan[4] = "[✓] Integrate Pfam with gene table and write master TSV + intermediate files"
+show_plan()
+
+print("\nPreview (header + first 3 rows):")
+with open(out_tsv, "r") as fh:
+    for i, line in enumerate(fh):
+        if i > 3:
+            break
+        print(line.rstrip("\n"))
+</execute>
+<observation>NameError("name 'plan' is not defined")</observation>
+<execute>
+import os, csv, subprocess
+from collections import defaultdict
+
+print("Research log: guard against NameError('plan') by avoiding reliance on prior state")
+
+# -----------------------------
+# Plan (checklist) in a single dict to avoid scoping surprises
+# -----------------------------
+STATE = {
+    "plan": [
+        "[ ] Create required output/temp directories",
+        "[ ] Parse GFF to extract per-gene basic fields (locus tag, symbol, old locus tag, coordinates, product, protein_id)",
+        "[ ] Prepare protein FASTA mapping (protein_id -> sequence) for InterProScan input",
+        "[ ] Run InterProScan (or reuse existing results) to obtain Pfam accessions per protein_id",
+        "[ ] Integrate Pfam with gene table and write master TSV + intermediate files"
+    ]
+}
+def show_plan():
+    print("\nPLAN:")
+    for i, p in enumerate(STATE["plan"], 1):
+        print(f"{i}. {p}")
+
+show_plan()
+
+# -----------------------------
+# Paths
+# -----------------------------
+gff_path = "benchmark/dataset/CyanoOmicsDB/ncbi_dataset/data/GCF_000009725.1/demo_genomic.gff"
+faa_path = "benchmark/dataset/CyanoOmicsDB/ncbi_dataset/data/GCF_000009725.1/protein.faa"
+
+tmp_root = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb"
+tmp_job  = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb_annotate_1"
+out_tsv  = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/cyanoomicsdb_annotate_1.tsv"
+
+# -----------------------------
+# Step 1
+# -----------------------------
+os.makedirs(tmp_root, exist_ok=True)
+os.makedirs(tmp_job, exist_ok=True)
+os.makedirs(os.path.dirname(out_tsv), exist_ok=True)
+assert os.path.exists(gff_path), f"Missing GFF: {gff_path}"
+assert os.path.exists(faa_path), f"Missing FAA: {faa_path}"
+
+STATE["plan"][0] = "[✓] Create required output/temp directories"
+show_plan()
+
+# Helpers
+def parse_attrs(attr_str):
+    d = {}
+    for part in attr_str.strip().split(";"):
+        if not part:
+            continue
+        if "=" in part:
+            k, v = part.split("=", 1)
+            d[k] = v
+        else:
+            d[part] = ""
+    return d
+
+def norm(x):
+    return x if (x is not None and x != "") else "-"
+
+def format_loc(seqid, start, end, strand):
+    return f"{seqid}:{start}-{end}({strand})"
+
+def which(cmd):
+    r = subprocess.run(["bash", "-lc", f"command -v {cmd}"], capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+# -----------------------------
+# Step 2: parse GFF
+# -----------------------------
+gene_by_id = {}
+gene_by_locus = {}
+cds_pending = []
+
+with open(gff_path, "r") as fh:
+    for line in fh:
+        if not line.strip() or line.startswith("#"):
+            continue
+        cols = line.rstrip("\n").split("\t")
+        if len(cols) != 9:
+            continue
+        seqid, source, ftype, start, end, score, strand, phase, attrs = cols
+        a = parse_attrs(attrs)
+
+        if ftype == "gene":
+            locus_tag = a.get("locus_tag") or a.get("Name") or a.get("gene")
+            if not locus_tag:
+                continue
+            gene_id = a.get("ID")
+            symbol = a.get("gene") or a.get("Name")
+            if symbol == locus_tag:
+                symbol = a.get("gene")
+            old = a.get("old_locus_tag")
+            row = {
+                "Locus_Tag": locus_tag,
+                "Symbol": norm(symbol) if symbol else "-",
+                "Old_Locus_Tag": norm(old),
+                "seqid": seqid,
+                "start": int(start),
+                "end": int(end),
+                "strand": strand,
+                "Protein_ID": "-",
+                "Product": "-",
+            }
+            if gene_id:
+                gene_by_id[gene_id] = row
+            gene_by_locus[locus_tag] = row
+
+        elif ftype == "CDS":
+            cds_pending.append({
+                "locus": a.get("locus_tag") or a.get("Name") or a.get("gene"),
+                "prot_id": a.get("protein_id"),
+                "product": a.get("product"),
+                "parent": a.get("Parent"),
+                "seqid": seqid,
+                "start": int(start),
+                "end": int(end),
+                "strand": strand
+            })
+
+for cds in cds_pending:
+    linked = False
+    if cds["parent"]:
+        for pid in cds["parent"].split(","):
+            if pid in gene_by_id:
+                r = gene_by_id[pid]
+                if cds["prot_id"]:
+                    r["Protein_ID"] = cds["prot_id"]
+                if cds["product"]:
+                    r["Product"] = cds["product"]
+                linked = True
+    if (not linked) and cds["locus"] and cds["locus"] in gene_by_locus:
+        r = gene_by_locus[cds["locus"]]
+        if cds["prot_id"]:
+            r["Protein_ID"] = cds["prot_id"]
+        if cds["product"]:
+            r["Product"] = cds["product"]
+        linked = True
+    if (not linked) and cds["locus"] and cds["locus"] not in gene_by_locus:
+        gene_by_locus[cds["locus"]] = {
+            "Locus_Tag": cds["locus"],
+            "Symbol": "-",
+            "Old_Locus_Tag": "-",
+            "seqid": cds["seqid"],
+            "start": cds["start"],
+            "end": cds["end"],
+            "strand": cds["strand"],
+            "Protein_ID": cds["prot_id"] or "-",
+            "Product": cds["product"] or "-",
+        }
+
+rows = list(gene_by_locus.values())
+rows.sort(key=lambda r: (r["seqid"], r["start"], r["end"], r["Locus_Tag"]))
+
+genes_tsv = os.path.join(tmp_job, "genes_from_gff.tsv")
+with open(genes_tsv, "w", newline="") as out:
+    w = csv.writer(out, delimiter="\t")
+    w.writerow(["Locus_Tag","Symbol","Old_Locus_Tag","Location","Protein_ID","Product"])
+    for r in rows:
+        w.writerow([r["Locus_Tag"], norm(r["Symbol"]), norm(r["Old_Locus_Tag"]),
+                    format_loc(r["seqid"], r["start"], r["end"], r["strand"]),
+                    norm(r["Protein_ID"]), norm(r["Product"])])
+
+print(f"\nParsed genes: {len(rows)}")
+print(f"Wrote intermediate: {genes_tsv}")
+
+STATE["plan"][1] = "[✓] Parse GFF to extract per-gene basic fields (locus tag, symbol, old locus tag, coordinates, product, protein_id)"
+show_plan()
+
+# -----------------------------
+# Step 3: subset FASTA
+# -----------------------------
+prot_seqs = {}
+cur = None
+chunks = []
+with open(faa_path, "r") as fh:
+    for line in fh:
+        line = line.rstrip("\n")
+        if line.startswith(">"):
+            if cur is not None:
+                prot_seqs[cur] = "".join(chunks)
+            cur = line[1:].split()[0]
+            chunks = []
+        else:
+            chunks.append(line.strip())
+    if cur is not None:
+        prot_seqs[cur] = "".join(chunks)
+
+prot_ids = sorted({r["Protein_ID"] for r in rows if r["Protein_ID"] not in (None, "", "-")})
+subset_faa = os.path.join(tmp_job, "proteins_for_interproscan.faa")
+
+kept = missing = 0
+with open(subset_faa, "w") as out:
+    for pid in prot_ids:
+        seq = prot_seqs.get(pid)
+        if not seq:
+            missing += 1
+            continue
+        out.write(f">{pid}\n")
+        for i in range(0, len(seq), 60):
+            out.write(seq[i:i+60] + "\n")
+        kept += 1
+
+print(f"\nLoaded proteins in FAA: {len(prot_seqs)}")
+print(f"Proteins referenced by genes: {len(prot_ids)}; present: {kept}; missing: {missing}")
+print(f"Wrote subset FASTA: {subset_faa}")
+
+STATE["plan"][2] = "[✓] Prepare protein FASTA mapping (protein_id -> sequence) for InterProScan input"
+show_plan()
+
+# -----------------------------
+# Step 4: InterProScan (Pfam)
+# -----------------------------
+ipr = which("interproscan.sh")
+ipr_tsv = os.path.join(tmp_job, "interproscan.tsv")
+
+if ipr:
+    print(f"\nInterProScan found: {ipr}")
+    if not os.path.exists(ipr_tsv) or os.path.getsize(ipr_tsv) == 0:
+        cmd = f'interproscan.sh -i "{subset_faa}" -f tsv -dp -appl Pfam -o "{ipr_tsv}"'
+        print("Running:", cmd)
+        r = subprocess.run(["bash","-lc", cmd], capture_output=True, text=True)
+        print("Return code:", r.returncode)
+        if r.stdout.strip():
+            print("STDOUT(head):", r.stdout[:1200])
+        if r.stderr.strip():
+            print("STDERR(head):", r.stderr[:1200])
+        if r.returncode != 0:
+            raise RuntimeError("InterProScan failed (see above).")
+    else:
+        print("Reusing existing:", ipr_tsv)
+else:
+    print("\nWARNING: interproscan.sh not found; Pfam will be '-' for all proteins.")
+    open(ipr_tsv, "w").close()
+
+pfam_by_prot = defaultdict(set)
+if os.path.exists(ipr_tsv) and os.path.getsize(ipr_tsv) > 0:
+    with open(ipr_tsv, "r") as fh:
+        for line in fh:
+            if not line.strip() or line.startswith("#"):
+                continue
+            p = line.rstrip("\n").split("\t")
+            if len(p) >= 5 and p[3] == "Pfam" and p[4]:
+                pfam_by_prot[p[0]].add(p[4])
+
+pfam_map = os.path.join(tmp_job, "pfam_by_protein.tsv")
+with open(pfam_map, "w", newline="") as out:
+    w = csv.writer(out, delimiter="\t")
+    w.writerow(["Protein_ID","Pfam"])
+    for pid in prot_ids:
+        pf = sorted(pfam_by_prot.get(pid, set()))
+        w.writerow([pid, ";".join(pf) if pf else "-"])
+
+print(f"\nProteins with Pfam hits: {sum(1 for pid in prot_ids if pfam_by_prot.get(pid))}")
+print(f"Wrote intermediate: {pfam_map}")
+print(f"InterProScan TSV: {ipr_tsv}")
+
+STATE["plan"][3] = "[✓] Run InterProScan (or reuse existing results) to obtain Pfam accessions per protein_id"
+show_plan()
+
+# -----------------------------
+# Step 5: master TSV
+# -----------------------------
+with open(out_tsv, "w", newline="") as out:
+    w = csv.writer(out, delimiter="\t")
+    w.writerow(["Locus_Tag","Symbol","Old_Locus_Tag","Location","Protein_ID","Product","Pfam"])
+    for r in rows:
+        pid = r["Protein_ID"]
+        pf = "-"
+        if pid not in (None, "", "-"):
+            hits = sorted(pfam_by_prot.get(pid, set()))
+            pf = ";".join(hits) if hits else "-"
+        w.writerow([
+            r["Locus_Tag"], norm(r["Symbol"]), norm(r["Old_Locus_Tag"]),
+            format_loc(r["seqid"], r["start"], r["end"], r["strand"]),
+            norm(pid), norm(r["Product"]), pf
+        ])
+
+tmp_master = os.path.join(tmp_job, "cyanoomicsdb_annotate_1.master.tsv")
+subprocess.run(["bash","-lc", f'cp -f "{out_tsv}" "{tmp_master}"'], check=True)
+
+print(f"\nWrote master TSV: {out_tsv}")
+print(f"Saved intermediate master copy: {tmp_master}")
+
+STATE["plan"][4] = "[✓] Integrate Pfam with gene table and write master TSV + intermediate files"
+show_plan()
+
+print("\nPreview (header + first 3 rows):")
+with open(out_tsv, "r") as fh:
+    for i, line in enumerate(fh):
+        if i > 3:
+            break
+        print(line.rstrip("\n"))
+</execute>
+<observation>NameError("name 'STATE' is not defined")</observation>
+<execute>
+import os, csv, subprocess
+from collections import defaultdict
+
+print("Research log: minimal-dependency run (no plan/STATE objects to avoid NameError issues)")
+
+# -----------------------------
+# Paths
+# -----------------------------
+gff_path = "benchmark/dataset/CyanoOmicsDB/ncbi_dataset/data/GCF_000009725.1/demo_genomic.gff"
+faa_path = "benchmark/dataset/CyanoOmicsDB/ncbi_dataset/data/GCF_000009725.1/protein.faa"
+
+tmp_root = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb"
+tmp_job  = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb_annotate_1"
+out_tsv  = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/cyanoomicsdb_annotate_1.tsv"
+
+os.makedirs(tmp_root, exist_ok=True)
+os.makedirs(tmp_job, exist_ok=True)
+os.makedirs(os.path.dirname(out_tsv), exist_ok=True)
+assert os.path.exists(gff_path), f"Missing GFF: {gff_path}"
+assert os.path.exists(faa_path), f"Missing FAA: {faa_path}"
+
+print("Step 1 done: directories ready")
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def parse_attrs(attr_str):
+    d = {}
+    for part in attr_str.strip().split(";"):
+        if not part:
+            continue
+        if "=" in part:
+            k, v = part.split("=", 1)
+            d[k] = v
+        else:
+            d[part] = ""
+    return d
+
+def norm(x):
+    return x if (x is not None and x != "") else "-"
+
+def format_loc(seqid, start, end, strand):
+    return f"{seqid}:{start}-{end}({strand})"
+
+def which(cmd):
+    r = subprocess.run(["bash","-lc", f"command -v {cmd}"], capture_output=True, text=True)
+    return r.stdout.strip() if r.returncode == 0 else None
+
+# -----------------------------
+# Step 2: Parse GFF
+# -----------------------------
+gene_by_id = {}
+gene_by_locus = {}
+cds_pending = []
+
+with open(gff_path, "r") as fh:
+    for line in fh:
+        if not line.strip() or line.startswith("#"):
+            continue
+        cols = line.rstrip("\n").split("\t")
+        if len(cols) != 9:
+            continue
+        seqid, source, ftype, start, end, score, strand, phase, attrs = cols
+        a = parse_attrs(attrs)
+
+        if ftype == "gene":
+            locus_tag = a.get("locus_tag") or a.get("Name") or a.get("gene")
+            if not locus_tag:
+                continue
+            gene_id = a.get("ID")
+            symbol = a.get("gene") or a.get("Name")
+            if symbol == locus_tag:
+                symbol = a.get("gene")
+            old = a.get("old_locus_tag")
+
+            row = {
+                "Locus_Tag": locus_tag,
+                "Symbol": norm(symbol) if symbol else "-",
+                "Old_Locus_Tag": norm(old),
+                "seqid": seqid,
+                "start": int(start),
+                "end": int(end),
+                "strand": strand,
+                "Protein_ID": "-",
+                "Product": "-",
+            }
+            if gene_id:
+                gene_by_id[gene_id] = row
+            gene_by_locus[locus_tag] = row
+
+        elif ftype == "CDS":
+            cds_pending.append({
+                "locus": a.get("locus_tag") or a.get("Name") or a.get("gene"),
+                "prot_id": a.get("protein_id"),
+                "product": a.get("product"),
+                "parent": a.get("Parent"),
+                "seqid": seqid,
+                "start": int(start),
+                "end": int(end),
+                "strand": strand
+            })
+
+for cds in cds_pending:
+    linked = False
+    if cds["parent"]:
+        for pid in cds["parent"].split(","):
+            if pid in gene_by_id:
+                r = gene_by_id[pid]
+                if cds["prot_id"]:
+                    r["Protein_ID"] = cds["prot_id"]
+                if cds["product"]:
+                    r["Product"] = cds["product"]
+                linked = True
+    if (not linked) and cds["locus"] and cds["locus"] in gene_by_locus:
+        r = gene_by_locus[cds["locus"]]
+        if cds["prot_id"]:
+            r["Protein_ID"] = cds["prot_id"]
+        if cds["product"]:
+            r["Product"] = cds["product"]
+        linked = True
+    if (not linked) and cds["locus"] and cds["locus"] not in gene_by_locus:
+        gene_by_locus[cds["locus"]] = {
+            "Locus_Tag": cds["locus"],
+            "Symbol": "-",
+            "Old_Locus_Tag": "-",
+            "seqid": cds["seqid"],
+            "start": cds["start"],
+            "end": cds["end"],
+            "strand": cds["strand"],
+            "Protein_ID": cds["prot_id"] or "-",
+            "Product": cds["product"] or "-",
+        }
+
+rows = list(gene_by_locus.values())
+rows.sort(key=lambda r: (r["seqid"], r["start"], r["end"], r["Locus_Tag"]))
+
+genes_tsv = os.path.join(tmp_job, "genes_from_gff.tsv")
+with open(genes_tsv, "w", newline="") as out:
+    w = csv.writer(out, delimiter="\t")
+    w.writerow(["Locus_Tag","Symbol","Old_Locus_Tag","Location","Protein_ID","Product"])
+    for r in rows:
+        w.writerow([r["Locus_Tag"], norm(r["Symbol"]), norm(r["Old_Locus_Tag"]),
+                    format_loc(r["seqid"], r["start"], r["end"], r["strand"]),
+                    norm(r["Protein_ID"]), norm(r["Product"])])
+
+print(f"Step 2 done: parsed genes={len(rows)}; wrote {genes_tsv}")
+
+# -----------------------------
+# Step 3: Read FAA and write subset
+# -----------------------------
+prot_seqs = {}
+cur = None
+chunks = []
+with open(faa_path, "r") as fh:
+    for line in fh:
+        line = line.rstrip("\n")
+        if line.startswith(">"):
+            if cur is not None:
+                prot_seqs[cur] = "".join(chunks)
+            cur = line[1:].split()[0]
+            chunks = []
+        else:
+            chunks.append(line.strip())
+    if cur is not None:
+        prot_seqs[cur] = "".join(chunks)
+
+prot_ids = sorted({r["Protein_ID"] for r in rows if r["Protein_ID"] not in (None, "", "-")})
+subset_faa = os.path.join(tmp_job, "proteins_for_interproscan.faa")
+kept = missing = 0
+
+with open(subset_faa, "w") as out:
+    for pid in prot_ids:
+        seq = prot_seqs.get(pid)
+        if not seq:
+            missing += 1
+            continue
+        out.write(f">{pid}\n")
+        for i in range(0, len(seq), 60):
+            out.write(seq[i:i+60] + "\n")
+        kept += 1
+
+print(f"Step 3 done: FAA proteins={len(prot_seqs)}; referenced={len(prot_ids)}; kept={kept}; missing={missing}; wrote {subset_faa}")
+
+# -----------------------------
+# Step 4: InterProScan Pfam
+# -----------------------------
+ipr = which("interproscan.sh")
+ipr_tsv = os.path.join(tmp_job, "interproscan.tsv")
+
+if ipr:
+    if not os.path.exists(ipr_tsv) or os.path.getsize(ipr_tsv) == 0:
+        cmd = f'interproscan.sh -i "{subset_faa}" -f tsv -dp -appl Pfam -o "{ipr_tsv}"'
+        print("Running InterProScan:", cmd)
+        r = subprocess.run(["bash","-lc", cmd], capture_output=True, text=True)
+        print("InterProScan rc:", r.returncode)
+        if r.stderr.strip():
+            print("InterProScan stderr(head):", r.stderr[:1200])
+        if r.returncode != 0:
+            raise RuntimeError("InterProScan failed (see stderr above).")
+    else:
+        print("Reusing existing InterProScan TSV:", ipr_tsv)
+else:
+    print("InterProScan not found; Pfam will be '-' for all proteins.")
+    open(ipr_tsv, "w").close()
+
+pfam_by_prot = defaultdict(set)
+if os.path.exists(ipr_tsv) and os.path.getsize(ipr_tsv) > 0:
+    with open(ipr_tsv, "r") as fh:
+        for line in fh:
+            if not line.strip() or line.startswith("#"):
+                continue
+            p = line.rstrip("\n").split("\t")
+            if len(p) >= 5 and p[3] == "Pfam" and p[4]:
+                pfam_by_prot[p[0]].add(p[4])
+
+pfam_map = os.path.join(tmp_job, "pfam_by_protein.tsv")
+with open(pfam_map, "w", newline="") as out:
+    w = csv.writer(out, delimiter="\t")
+    w.writerow(["Protein_ID","Pfam"])
+    for pid in prot_ids:
+        hits = sorted(pfam_by_prot.get(pid, set()))
+        w.writerow([pid, ";".join(hits) if hits else "-"])
+
+print(f"Step 4 done: proteins with Pfam hits={sum(1 for pid in prot_ids if pfam_by_prot.get(pid))}; wrote {pfam_map}; ipr={ipr_tsv}")
+
+# -----------------------------
+# Step 5: Master TSV
+# -----------------------------
+with open(out_tsv, "w", newline="") as out:
+    w = csv.writer(out, delimiter="\t")
+    w.writerow(["Locus_Tag","Symbol","Old_Locus_Tag","Location","Protein_ID","Product","Pfam"])
+    for r in rows:
+        pid = r["Protein_ID"]
+        pf = "-"
+        if pid not in (None, "", "-"):
+            hits = sorted(pfam_by_prot.get(pid, set()))
+            pf = ";".join(hits) if hits else "-"
+        w.writerow([
+            r["Locus_Tag"], norm(r["Symbol"]), norm(r["Old_Locus_Tag"]),
+            format_loc(r["seqid"], r["start"], r["end"], r["strand"]),
+            norm(pid), norm(r["Product"]), pf
+        ])
+
+tmp_master = os.path.join(tmp_job, "cyanoomicsdb_annotate_1.master.tsv")
+subprocess.run(["bash","-lc", f'cp -f "{out_tsv}" "{tmp_master}"'], check=True)
+
+print(f"Step 5 done: wrote master TSV {out_tsv}")
+print(f"Intermediate master copy: {tmp_master}")
+
+print("\nPreview (header + first 3 rows):")
+with open(out_tsv, "r") as fh:
+    for i, line in enumerate(fh):
+        if i > 3:
+            break
+        print(line.rstrip("\n"))
+</execute>
+<observation>NameError("name 'subprocess' is not defined")</observation>
+<execute>
+# Use only built-ins; avoid subprocess entirely (it appears unavailable/unreliable in this environment).
+import os, csv, shutil
+from collections import defaultdict
+
+print("Research log: rerun WITHOUT subprocess (use shutil + pure Python)")
+
+# -----------------------------
+# Plan (checklist)
+# -----------------------------
+plan = [
+    "[ ] Create required output/temp directories",
+    "[ ] Parse GFF to extract per-gene basic fields (locus tag, symbol, old locus tag, coordinates, product, protein_id)",
+    "[ ] Prepare protein FASTA subset for InterProScan input",
+    "[ ] Integrate Pfam accessions from existing InterProScan output (if present); otherwise set '-'",
+    "[ ] Write master TSV + required intermediate files"
+]
+def show_plan():
+    print("\nPLAN:")
+    for i, p in enumerate(plan, 1):
+        print(f"{i}. {p}")
+show_plan()
+
+# -----------------------------
+# Paths
+# -----------------------------
+gff_path = "benchmark/dataset/CyanoOmicsDB/ncbi_dataset/data/GCF_000009725.1/demo_genomic.gff"
+faa_path = "benchmark/dataset/CyanoOmicsDB/ncbi_dataset/data/GCF_000009725.1/protein.faa"
+
+tmp_root = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb"
+tmp_job  = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb_annotate_1"
+out_tsv  = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/cyanoomicsdb_annotate_1.tsv"
+
+os.makedirs(tmp_root, exist_ok=True)
+os.makedirs(tmp_job, exist_ok=True)
+os.makedirs(os.path.dirname(out_tsv), exist_ok=True)
+assert os.path.exists(gff_path), f"Missing GFF: {gff_path}"
+assert os.path.exists(faa_path), f"Missing FAA: {faa_path}"
+
+plan[0] = "[✓] Create required output/temp directories"
+show_plan()
+
+# -----------------------------
+# Helpers
+# -----------------------------
+def parse_attrs(attr_str):
+    d = {}
+    for part in attr_str.strip().split(";"):
+        if not part:
+            continue
+        if "=" in part:
+            k, v = part.split("=", 1)
+            d[k] = v
+        else:
+            d[part] = ""
+    return d
+
+def norm(x):
+    return x if (x is not None and x != "") else "-"
+
+def format_loc(seqid, start, end, strand):
+    return f"{seqid}:{start}-{end}({strand})"
+
+# -----------------------------
+# Step 2: Parse GFF
+# -----------------------------
+gene_by_id = {}
+gene_by_locus = {}
+cds_pending = []
+
+with open(gff_path, "r") as fh:
+    for line in fh:
+        if not line.strip() or line.startswith("#"):
+            continue
+        cols = line.rstrip("\n").split("\t")
+        if len(cols) != 9:
+            continue
+        seqid, source, ftype, start, end, score, strand, phase, attrs = cols
+        a = parse_attrs(attrs)
+
+        if ftype == "gene":
+            locus_tag = a.get("locus_tag") or a.get("Name") or a.get("gene")
+            if not locus_tag:
+                continue
+            gene_id = a.get("ID")
+            symbol = a.get("gene") or a.get("Name")
+            if symbol == locus_tag:
+                symbol = a.get("gene")
+            old = a.get("old_locus_tag")
+
+            row = {
+                "Locus_Tag": locus_tag,
+                "Symbol": norm(symbol) if symbol else "-",
+                "Old_Locus_Tag": norm(old),
+                "seqid": seqid,
+                "start": int(start),
+                "end": int(end),
+                "strand": strand,
+                "Protein_ID": "-",
+                "Product": "-",
+            }
+            if gene_id:
+                gene_by_id[gene_id] = row
+            gene_by_locus[locus_tag] = row
+
+        elif ftype == "CDS":
+            cds_pending.append({
+                "locus": a.get("locus_tag") or a.get("Name") or a.get("gene"),
+                "prot_id": a.get("protein_id"),
+                "product": a.get("product"),
+                "parent": a.get("Parent"),
+                "seqid": seqid,
+                "start": int(start),
+                "end": int(end),
+                "strand": strand
+            })
+
+for cds in cds_pending:
+    linked = False
+    if cds["parent"]:
+        for pid in cds["parent"].split(","):
+            if pid in gene_by_id:
+                r = gene_by_id[pid]
+                if cds["prot_id"]:
+                    r["Protein_ID"] = cds["prot_id"]
+                if cds["product"]:
+                    r["Product"] = cds["product"]
+                linked = True
+    if (not linked) and cds["locus"] and cds["locus"] in gene_by_locus:
+        r = gene_by_locus[cds["locus"]]
+        if cds["prot_id"]:
+            r["Protein_ID"] = cds["prot_id"]
+        if cds["product"]:
+            r["Product"] = cds["product"]
+        linked = True
+    if (not linked) and cds["locus"] and cds["locus"] not in gene_by_locus:
+        gene_by_locus[cds["locus"]] = {
+            "Locus_Tag": cds["locus"],
+            "Symbol": "-",
+            "Old_Locus_Tag": "-",
+            "seqid": cds["seqid"],
+            "start": cds["start"],
+            "end": cds["end"],
+            "strand": cds["strand"],
+            "Protein_ID": cds["prot_id"] or "-",
+            "Product": cds["product"] or "-",
+        }
+
+rows = list(gene_by_locus.values())
+rows.sort(key=lambda r: (r["seqid"], r["start"], r["end"], r["Locus_Tag"]))
+
+genes_tsv = os.path.join(tmp_job, "genes_from_gff.tsv")
+with open(genes_tsv, "w", newline="") as out:
+    w = csv.writer(out, delimiter="\t")
+    w.writerow(["Locus_Tag","Symbol","Old_Locus_Tag","Location","Protein_ID","Product"])
+    for r in rows:
+        w.writerow([
+            r["Locus_Tag"], norm(r["Symbol"]), norm(r["Old_Locus_Tag"]),
+            format_loc(r["seqid"], r["start"], r["end"], r["strand"]),
+            norm(r["Protein_ID"]), norm(r["Product"])
+        ])
+
+print(f"\nParsed genes: {len(rows)}")
+print(f"Wrote intermediate: {genes_tsv}")
+
+plan[1] = "[✓] Parse GFF to extract per-gene basic fields (locus tag, symbol, old locus tag, coordinates, product, protein_id)"
+show_plan()
+
+# -----------------------------
+# Step 3: Write subset FASTA
+# -----------------------------
+prot_seqs = {}
+cur = None
+chunks = []
+with open(faa_path, "r") as fh:
+    for line in fh:
+        line = line.rstrip("\n")
+        if line.startswith(">"):
+            if cur is not None:
+                prot_seqs[cur] = "".join(chunks)
+            cur = line[1:].split()[0]
+            chunks = []
+        else:
+            chunks.append(line.strip())
+    if cur is not None:
+        prot_seqs[cur] = "".join(chunks)
+
+prot_ids = sorted({r["Protein_ID"] for r in rows if r["Protein_ID"] not in (None, "", "-")})
+subset_faa = os.path.join(tmp_job, "proteins_for_interproscan.faa")
+
+kept = missing = 0
+with open(subset_faa, "w") as out:
+    for pid in prot_ids:
+        seq = prot_seqs.get(pid)
+        if not seq:
+            missing += 1
+            continue
+        out.write(f">{pid}\n")
+        for i in range(0, len(seq), 60):
+            out.write(seq[i:i+60] + "\n")
+        kept += 1
+
+print(f"\nSubset FASTA written: {subset_faa}")
+print(f"Proteins referenced: {len(prot_ids)}; present in FAA: {kept}; missing: {missing}")
+
+plan[2] = "[✓] Prepare protein FASTA subset for InterProScan input"
+show_plan()
+
+# -----------------------------
+# Step 4: Pfam integration from existing InterProScan outputs (search tmp_job + source tree)
+# -----------------------------
+def find_interproscan_tsv(search_roots):
+    hits = []
+    for root in search_roots:
+        if not root or not os.path.exists(root):
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            for fn in filenames:
+                fpl = fn.lower()
+                if ("interproscan" in fpl or "iprscan" in fpl) and (fpl.endswith(".tsv") or fpl.endswith(".tab")):
+                    hits.append(os.path.join(dirpath, fn))
+    return hits
+
+search_roots = [
+    tmp_job,
+    tmp_root,
+    os.path.dirname(gff_path),  # same genome folder
+]
+ipr_candidates = find_interproscan_tsv(search_roots)
+ipr_tsv = os.path.join(tmp_job, "interproscan.tsv")
+
+pfam_by_prot = defaultdict(set)
+used_ipr = None
+
+# choose the largest candidate if any
+if ipr_candidates:
+    ipr_candidates = sorted(ipr_candidates, key=lambda p: os.path.getsize(p), reverse=True)
+    used_ipr = ipr_candidates[0]
+    # copy to standard location
+    shutil.copyfile(used_ipr, ipr_tsv)
+
+if os.path.exists(ipr_tsv) and os.path.getsize(ipr_tsv) > 0:
+    with open(ipr_tsv, "r") as fh:
+        for line in fh:
+            if not line.strip() or line.startswith("#"):
+                continue
+            p = line.rstrip("\n").split("\t")
+            # InterProScan TSV expected: [0]=protein, [3]=analysis, [4]=signature accession
+            if len(p) >= 5 and p[3] == "Pfam" and p[4]:
+                pfam_by_prot[p[0]].add(p[4])
+
+pfam_map = os.path.join(tmp_job, "pfam_by_protein.tsv")
+with open(pfam_map, "w", newline="") as out:
+    w = csv.writer(out, delimiter="\t")
+    w.writerow(["Protein_ID","Pfam"])
+    for pid in prot_ids:
+        pf = sorted(pfam_by_prot.get(pid, set()))
+        w.writerow([pid, ";".join(pf) if pf else "-"])
+
+print("\nInterProScan TSV used:", used_ipr if used_ipr else "(none found; Pfam will be '-')")
+print(f"Proteins with Pfam hits: {sum(1 for pid in prot_ids if pfam_by_prot.get(pid))}")
+print(f"Wrote intermediate: {pfam_map}")
+print(f"Saved/standardized InterProScan TSV at: {ipr_tsv} (may be empty)")
+
+plan[3] = "[✓] Integrate Pfam accessions from existing InterProScan output (if present); otherwise set '-'"
+show_plan()
+
+# -----------------------------
+# Step 5: Master TSV + intermediate copy
+# -----------------------------
+with open(out_tsv, "w", newline="") as out:
+    w = csv.writer(out, delimiter="\t")
+    w.writerow(["Locus_Tag","Symbol","Old_Locus_Tag","Location","Protein_ID","Product","Pfam"])
+    for r in rows:
+        pid = r["Protein_ID"]
+        pf = "-"
+        if pid not in (None, "", "-"):
+            hits = sorted(pfam_by_prot.get(pid, set()))
+            pf = ";".join(hits) if hits else "-"
+        w.writerow([
+            r["Locus_Tag"], norm(r["Symbol"]), norm(r["Old_Locus_Tag"]),
+            format_loc(r["seqid"], r["start"], r["end"], r["strand"]),
+            norm(pid), norm(r["Product"]), pf
+        ])
+
+tmp_master = os.path.join(tmp_job, "cyanoomicsdb_annotate_1.master.tsv")
+shutil.copyfile(out_tsv, tmp_master)
+
+print(f"\nWrote master TSV: {out_tsv}")
+print(f"Saved intermediate master copy: {tmp_master}")
+
+plan[4] = "[✓] Write master TSV + required intermediate files"
+show_plan()
+
+print("\nPreview (header + first 3 rows):")
+with open(out_tsv, "r") as fh:
+    for i, line in enumerate(fh):
+        if i > 3:
+            break
+        print(line.rstrip("\n"))
+</execute>
+<observation>NameError("name 'plan' is not defined")</observation>
+<execute>
+import os, csv, shutil
+from collections import defaultdict
+
+print("Research log: final rerun with ZERO global plan variable usage (no plan printing)")
+
+# Paths
+gff_path = "benchmark/dataset/CyanoOmicsDB/ncbi_dataset/data/GCF_000009725.1/demo_genomic.gff"
+faa_path = "benchmark/dataset/CyanoOmicsDB/ncbi_dataset/data/GCF_000009725.1/protein.faa"
+
+tmp_root = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb"
+tmp_job  = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb_annotate_1"
+out_tsv  = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/cyanoomicsdb_annotate_1.tsv"
+
+os.makedirs(tmp_root, exist_ok=True)
+os.makedirs(tmp_job, exist_ok=True)
+os.makedirs(os.path.dirname(out_tsv), exist_ok=True)
+assert os.path.exists(gff_path), f"Missing GFF: {gff_path}"
+assert os.path.exists(faa_path), f"Missing FAA: {faa_path}"
+print("Step 1: directories ready")
+
+def parse_attrs(attr_str):
+    d = {}
+    for part in attr_str.strip().split(";"):
+        if not part:
+            continue
+        if "=" in part:
+            k, v = part.split("=", 1)
+            d[k] = v
+        else:
+            d[part] = ""
+    return d
+
+def norm(x):
+    return x if (x is not None and x != "") else "-"
+
+def format_loc(seqid, start, end, strand):
+    return f"{seqid}:{start}-{end}({strand})"
+
+# Step 2: Parse GFF
+gene_by_id = {}
+gene_by_locus = {}
+cds_pending = []
+
+with open(gff_path, "r") as fh:
+    for line in fh:
+        if not line.strip() or line.startswith("#"):
+            continue
+        cols = line.rstrip("\n").split("\t")
+        if len(cols) != 9:
+            continue
+        seqid, source, ftype, start, end, score, strand, phase, attrs = cols
+        a = parse_attrs(attrs)
+
+        if ftype == "gene":
+            locus_tag = a.get("locus_tag") or a.get("Name") or a.get("gene")
+            if not locus_tag:
+                continue
+            gene_id = a.get("ID")
+            symbol = a.get("gene") or a.get("Name")
+            if symbol == locus_tag:
+                symbol = a.get("gene")
+            old = a.get("old_locus_tag")
+            row = {
+                "Locus_Tag": locus_tag,
+                "Symbol": norm(symbol) if symbol else "-",
+                "Old_Locus_Tag": norm(old),
+                "seqid": seqid,
+                "start": int(start),
+                "end": int(end),
+                "strand": strand,
+                "Protein_ID": "-",
+                "Product": "-",
+            }
+            if gene_id:
+                gene_by_id[gene_id] = row
+            gene_by_locus[locus_tag] = row
+
+        elif ftype == "CDS":
+            cds_pending.append({
+                "locus": a.get("locus_tag") or a.get("Name") or a.get("gene"),
+                "prot_id": a.get("protein_id"),
+                "product": a.get("product"),
+                "parent": a.get("Parent"),
+                "seqid": seqid,
+                "start": int(start),
+                "end": int(end),
+                "strand": strand
+            })
+
+for cds in cds_pending:
+    linked = False
+    if cds["parent"]:
+        for pid in cds["parent"].split(","):
+            if pid in gene_by_id:
+                r = gene_by_id[pid]
+                if cds["prot_id"]:
+                    r["Protein_ID"] = cds["prot_id"]
+                if cds["product"]:
+                    r["Product"] = cds["product"]
+                linked = True
+    if (not linked) and cds["locus"] and cds["locus"] in gene_by_locus:
+        r = gene_by_locus[cds["locus"]]
+        if cds["prot_id"]:
+            r["Protein_ID"] = cds["prot_id"]
+        if cds["product"]:
+            r["Product"] = cds["product"]
+        linked = True
+    if (not linked) and cds["locus"] and cds["locus"] not in gene_by_locus:
+        gene_by_locus[cds["locus"]] = {
+            "Locus_Tag": cds["locus"],
+            "Symbol": "-",
+            "Old_Locus_Tag": "-",
+            "seqid": cds["seqid"],
+            "start": cds["start"],
+            "end": cds["end"],
+            "strand": cds["strand"],
+            "Protein_ID": cds["prot_id"] or "-",
+            "Product": cds["product"] or "-",
+        }
+
+rows = list(gene_by_locus.values())
+rows.sort(key=lambda r: (r["seqid"], r["start"], r["end"], r["Locus_Tag"]))
+
+genes_tsv = os.path.join(tmp_job, "genes_from_gff.tsv")
+with open(genes_tsv, "w", newline="") as out:
+    w = csv.writer(out, delimiter="\t")
+    w.writerow(["Locus_Tag","Symbol","Old_Locus_Tag","Location","Protein_ID","Product"])
+    for r in rows:
+        w.writerow([r["Locus_Tag"], norm(r["Symbol"]), norm(r["Old_Locus_Tag"]),
+                    format_loc(r["seqid"], r["start"], r["end"], r["strand"]),
+                    norm(r["Protein_ID"]), norm(r["Product"])])
+print(f"Step 2: parsed genes={len(rows)}; wrote {genes_tsv}")
+
+# Step 3: subset FASTA
+prot_seqs = {}
+cur = None
+chunks = []
+with open(faa_path, "r") as fh:
+    for line in fh:
+        line = line.rstrip("\n")
+        if line.startswith(">"):
+            if cur is not None:
+                prot_seqs[cur] = "".join(chunks)
+            cur = line[1:].split()[0]
+            chunks = []
+        else:
+            chunks.append(line.strip())
+    if cur is not None:
+        prot_seqs[cur] = "".join(chunks)
+
+prot_ids = sorted({r["Protein_ID"] for r in rows if r["Protein_ID"] not in (None, "", "-")})
+subset_faa = os.path.join(tmp_job, "proteins_for_interproscan.faa")
+
+kept = missing = 0
+with open(subset_faa, "w") as out:
+    for pid in prot_ids:
+        seq = prot_seqs.get(pid)
+        if not seq:
+            missing += 1
+            continue
+        out.write(f">{pid}\n")
+        for i in range(0, len(seq), 60):
+            out.write(seq[i:i+60] + "\n")
+        kept += 1
+print(f"Step 3: wrote subset FASTA {subset_faa}; referenced={len(prot_ids)} present={kept} missing={missing}")
+
+# Step 4: Pfam integration from existing InterProScan TSV if present
+def find_interproscan_tsv(search_roots):
+    hits = []
+    for root in search_roots:
+        if not root or not os.path.exists(root):
+            continue
+        for dirpath, _, filenames in os.walk(root):
+            for fn in filenames:
+                fpl = fn.lower()
+                if ("interproscan" in fpl or "iprscan" in fpl) and (fpl.endswith(".tsv") or fpl.endswith(".tab")):
+                    hits.append(os.path.join(dirpath, fn))
+    return hits
+
+ipr_tsv = os.path.join(tmp_job, "interproscan.tsv")
+cands = find_interproscan_tsv([tmp_job, tmp_root, os.path.dirname(gff_path)])
+used_ipr = None
+if cands:
+    cands = sorted(cands, key=lambda p: os.path.getsize(p), reverse=True)
+    used_ipr = cands[0]
+    if os.path.abspath(used_ipr) != os.path.abspath(ipr_tsv):
+        shutil.copyfile(used_ipr, ipr_tsv)
+else:
+    open(ipr_tsv, "w").close()
+
+pfam_by_prot = defaultdict(set)
+if os.path.getsize(ipr_tsv) > 0:
+    with open(ipr_tsv, "r") as fh:
+        for line in fh:
+            if not line.strip() or line.startswith("#"):
+                continue
+            p = line.rstrip("\n").split("\t")
+            if len(p) >= 5 and p[3] == "Pfam" and p[4]:
+                pfam_by_prot[p[0]].add(p[4])
+
+pfam_map = os.path.join(tmp_job, "pfam_by_protein.tsv")
+with open(pfam_map, "w", newline="") as out:
+    w = csv.writer(out, delimiter="\t")
+    w.writerow(["Protein_ID","Pfam"])
+    for pid in prot_ids:
+        hits = sorted(pfam_by_prot.get(pid, set()))
+        w.writerow([pid, ";".join(hits) if hits else "-"])
+
+print(f"Step 4: InterProScan used: {used_ipr if used_ipr else '(none found)'}; proteins with Pfam hits={sum(1 for pid in prot_ids if pfam_by_prot.get(pid))}")
+print(f"Step 4: wrote {pfam_map}; standardized ipr TSV at {ipr_tsv}")
+
+# Step 5: master TSV
+with open(out_tsv, "w", newline="") as out:
+    w = csv.writer(out, delimiter="\t")
+    w.writerow(["Locus_Tag","Symbol","Old_Locus_Tag","Location","Protein_ID","Product","Pfam"])
+    for r in rows:
+        pid = r["Protein_ID"]
+        pf = "-"
+        if pid not in (None, "", "-"):
+            hits = sorted(pfam_by_prot.get(pid, set()))
+            pf = ";".join(hits) if hits else "-"
+        w.writerow([r["Locus_Tag"], norm(r["Symbol"]), norm(r["Old_Locus_Tag"]),
+                    format_loc(r["seqid"], r["start"], r["end"], r["strand"]),
+                    norm(pid), norm(r["Product"]), pf])
+
+tmp_master = os.path.join(tmp_job, "cyanoomicsdb_annotate_1.master.tsv")
+shutil.copyfile(out_tsv, tmp_master)
+
+print(f"Step 5: wrote master TSV {out_tsv}")
+print(f"Step 5: saved intermediate master copy {tmp_master}")
+
+print("\nPreview (header + first 3 rows):")
+with open(out_tsv, "r") as fh:
+    for i, line in enumerate(fh):
+        if i > 3:
+            break
+        print(line.rstrip("\n"))
+</execute>
+<observation>NameError("name 'os' is not defined")</observation>
+<execute>
+# Ultra-minimal, fully self-contained execution: import everything inside one block,
+# and do not rely on any prior state.
+import os
+import csv
+import shutil
+from collections import defaultdict
+
+print("Research log: self-contained run (imports: os,csv,shutil,defaultdict)")
+
+gff_path = "benchmark/dataset/CyanoOmicsDB/ncbi_dataset/data/GCF_000009725.1/demo_genomic.gff"
+faa_path = "benchmark/dataset/CyanoOmicsDB/ncbi_dataset/data/GCF_000009725.1/protein.faa"
+
+tmp_root = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb"
+tmp_job  = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb_annotate_1"
+out_tsv  = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/cyanoomicsdb_annotate_1.tsv"
+
+os.makedirs(tmp_root, exist_ok=True)
+os.makedirs(tmp_job, exist_ok=True)
+os.makedirs(os.path.dirname(out_tsv), exist_ok=True)
+assert os.path.exists(gff_path), f"Missing GFF: {gff_path}"
+assert os.path.exists(faa_path), f"Missing FAA: {faa_path}"
+print("Step 1 OK: directories ready")
+
+def parse_attrs(attr_str):
+    d = {}
+    for part in attr_str.strip().split(";"):
+        if not part:
+            continue
+        if "=" in part:
+            k, v = part.split("=", 1)
+            d[k] = v
+        else:
+            d[part] = ""
+    return d
+
+def norm(x):
+    return x if (x is not None and x != "") else "-"
+
+def format_loc(seqid, start, end, strand):
+    return f"{seqid}:{start}-{end}({strand})"
+
+# Step 2: parse GFF (gene + CDS)
+gene_by_id = {}
+gene_by_locus = {}
+cds_pending = []
+
+with open(gff_path, "r") as fh:
+    for line in fh:
+        if not line.strip() or line.startswith("#"):
+            continue
+        cols = line.rstrip("\n").split("\t")
+        if len(cols) != 9:
+            continue
+        seqid, source, ftype, start, end, score, strand, phase, attrs = cols
+        a = parse_attrs(attrs)
+
+        if ftype == "gene":
+            locus_tag = a.get("locus_tag") or a.get("Name") or a.get("gene")
+            if not locus_tag:
+                continue
+            gene_id = a.get("ID")
+            symbol = a.get("gene") or a.get("Name")
+            if symbol == locus_tag:
+                symbol = a.get("gene")
+            old = a.get("old_locus_tag")
+            row = {
+                "Locus_Tag": locus_tag,
+                "Symbol": norm(symbol) if symbol else "-",
+                "Old_Locus_Tag": norm(old),
+                "seqid": seqid,
+                "start": int(start),
+                "end": int(end),
+                "strand": strand,
+                "Protein_ID": "-",
+                "Product": "-",
+            }
+            if gene_id:
+                gene_by_id[gene_id] = row
+            gene_by_locus[locus_tag] = row
+
+        elif ftype == "CDS":
+            cds_pending.append({
+                "locus": a.get("locus_tag") or a.get("Name") or a.get("gene"),
+                "prot_id": a.get("protein_id"),
+                "product": a.get("product"),
+                "parent": a.get("Parent"),
+                "seqid": seqid,
+                "start": int(start),
+                "end": int(end),
+                "strand": strand
+            })
+
+for cds in cds_pending:
+    linked = False
+    if cds["parent"]:
+        for pid in cds["parent"].split(","):
+            if pid in gene_by_id:
+                r = gene_by_id[pid]
+                if cds["prot_id"]:
+                    r["Protein_ID"] = cds["prot_id"]
+                if cds["product"]:
+                    r["Product"] = cds["product"]
+                linked = True
+    if (not linked) and cds["locus"] and cds["locus"] in gene_by_locus:
+        r = gene_by_locus[cds["locus"]]
+        if cds["prot_id"]:
+            r["Protein_ID"] = cds["prot_id"]
+        if cds["product"]:
+            r["Product"] = cds["product"]
+        linked = True
+    if (not linked) and cds["locus"] and cds["locus"] not in gene_by_locus:
+        gene_by_locus[cds["locus"]] = {
+            "Locus_Tag": cds["locus"],
+            "Symbol": "-",
+            "Old_Locus_Tag": "-",
+            "seqid": cds["seqid"],
+            "start": cds["start"],
+            "end": cds["end"],
+            "strand": cds["strand"],
+            "Protein_ID": cds["prot_id"] or "-",
+            "Product": cds["product"] or "-",
+        }
+
+rows = list(gene_by_locus.values())
+rows.sort(key=lambda r: (r["seqid"], r["start"], r["end"], r["Locus_Tag"]))
+
+genes_tsv = os.path.join(tmp_job, "genes_from_gff.tsv")
+with open(genes_tsv, "w", newline="") as out:
+    w = csv.writer(out, delimiter="\t")
+    w.writerow(["Locus_Tag","Symbol","Old_Locus_Tag","Location","Protein_ID","Product"])
+    for r in rows:
+        w.writerow([r["Locus_Tag"], norm(r["Symbol"]), norm(r["Old_Locus_Tag"]),
+                    format_loc(r["seqid"], r["start"], r["end"], r["strand"]),
+                    norm(r["Protein_ID"]), norm(r["Product"])])
+print(f"Step 2 OK: genes parsed={len(rows)}; wrote {genes_tsv}")
+
+# Step 3: subset FASTA
+prot_seqs = {}
+cur = None
+chunks = []
+with open(faa_path, "r") as fh:
+    for line in fh:
+        line = line.rstrip("\n")
+        if line.startswith(">"):
+            if cur is not None:
+                prot_seqs[cur] = "".join(chunks)
+            cur = line[1:].split()[0]
+            chunks = []
+        else:
+            chunks.append(line.strip())
+    if cur is not None:
+        prot_seqs[cur] = "".join(chunks)
+
+prot_ids = sorted({r["Protein_ID"] for r in rows if r["Protein_ID"] not in (None, "", "-")})
+subset_faa = os.path.join(tmp_job, "proteins_for_interproscan.faa")
+kept = missing = 0
+with open(subset_faa, "w") as out:
+    for pid in prot_ids:
+        seq = prot_seqs.get(pid)
+        if not seq:
+            missing += 1
+            continue
+        out.write(f">{pid}\n")
+        for i in range(0, len(seq), 60):
+            out.write(seq[i:i+60] + "\n")
+        kept += 1
+print(f"Step 3 OK: subset FASTA wrote {subset_faa}; referenced={len(prot_ids)} present={kept} missing={missing}")
+
+# Step 4: find existing InterProScan TSV and parse Pfam
+def find_interproscan_tsv(search_roots):
+    hits = []
+    for root in search_roots:
+        if not root or not os.path.exists(root):
+            continue
+        for dirpath, _, filenames in os.walk(root):
+            for fn in filenames:
+                fpl = fn.lower()
+                if ("interproscan" in fpl or "iprscan" in fpl) and (fpl.endswith(".tsv") or fpl.endswith(".tab")):
+                    hits.append(os.path.join(dirpath, fn))
+    return hits
+
+ipr_tsv = os.path.join(tmp_job, "interproscan.tsv")
+cands = find_interproscan_tsv([tmp_job, tmp_root, os.path.dirname(gff_path)])
+used_ipr = None
+if cands:
+    cands = sorted(cands, key=lambda p: os.path.getsize(p), reverse=True)
+    used_ipr = cands[0]
+    if os.path.abspath(used_ipr) != os.path.abspath(ipr_tsv):
+        shutil.copyfile(used_ipr, ipr_tsv)
+else:
+    open(ipr_tsv, "w").close()
+
+pfam_by_prot = defaultdict(set)
+if os.path.getsize(ipr_tsv) > 0:
+    with open(ipr_tsv, "r") as fh:
+        for line in fh:
+            if not line.strip() or line.startswith("#"):
+                continue
+            p = line.rstrip("\n").split("\t")
+            if len(p) >= 5 and p[3] == "Pfam" and p[4]:
+                pfam_by_prot[p[0]].add(p[4])
+
+pfam_map = os.path.join(tmp_job, "pfam_by_protein.tsv")
+with open(pfam_map, "w", newline="") as out:
+    w = csv.writer(out, delimiter="\t")
+    w.writerow(["Protein_ID","Pfam"])
+    for pid in prot_ids:
+        hits = sorted(pfam_by_prot.get(pid, set()))
+        w.writerow([pid, ";".join(hits) if hits else "-"])
+
+print(f"Step 4 OK: InterProScan used: {used_ipr if used_ipr else '(none found)'}; proteins w/ Pfam hits={sum(1 for pid in prot_ids if pfam_by_prot.get(pid))}")
+print(f"Step 4 OK: wrote {pfam_map}; standardized ipr TSV at {ipr_tsv}")
+
+# Step 5: master TSV
+with open(out_tsv, "w", newline="") as out:
+    w = csv.writer(out, delimiter="\t")
+    w.writerow(["Locus_Tag","Symbol","Old_Locus_Tag","Location","Protein_ID","Product","Pfam"])
+    for r in rows:
+        pid = r["Protein_ID"]
+        pf = "-"
+        if pid not in (None, "", "-"):
+            hits = sorted(pfam_by_prot.get(pid, set()))
+            pf = ";".join(hits) if hits else "-"
+        w.writerow([r["Locus_Tag"], norm(r["Symbol"]), norm(r["Old_Locus_Tag"]),
+                    format_loc(r["seqid"], r["start"], r["end"], r["strand"]),
+                    norm(pid), norm(r["Product"]), pf])
+
+tmp_master = os.path.join(tmp_job, "cyanoomicsdb_annotate_1.master.tsv")
+shutil.copyfile(out_tsv, tmp_master)
+
+print(f"Step 5 OK: wrote master TSV {out_tsv}")
+print(f"Intermediate master copy: {tmp_master}")
+
+print("\nPreview (header + first 3 rows):")
+with open(out_tsv, "r") as fh:
+    for i, line in enumerate(fh):
+        if i > 3:
+            break
+        print(line.rstrip("\n"))
+</execute>
+<observation>NameError("name 'os' is not defined")</observation>
+<execute>
+# It appears this execution environment is not retaining imports reliably and is throwing NameError
+# even when imports are present. To diagnose, run a tiny self-test in the same block.
+
+import os
+print("os imported OK:", os is not None)
+print("os.getcwd:", os.getcwd())
+</execute>
+<observation>os imported OK: True
+os.getcwd: /root/biodatalab
+</observation>
+<execute>
+import os, csv, shutil
+from collections import defaultdict
+
+print("Research log: running full pipeline now that import behavior is verified")
+
+# -----------------------------
+# Plan (checklist)
+# -----------------------------
+plan = [
+    "[ ] Create required output/temp directories",
+    "[ ] Parse GFF to extract per-gene basic fields (locus tag, symbol, old locus tag, coordinates, product, protein_id)",
+    "[ ] Prepare protein FASTA subset for InterProScan input",
+    "[ ] Integrate Pfam accessions from existing InterProScan output (if present); otherwise set '-'",
+    "[ ] Write master TSV + required intermediate files"
+]
+def show_plan():
+    print("\nPLAN:")
+    for i, p in enumerate(plan, 1):
+        print(f"{i}. {p}")
+show_plan()
+
+# Paths
+gff_path = "benchmark/dataset/CyanoOmicsDB/ncbi_dataset/data/GCF_000009725.1/demo_genomic.gff"
+faa_path = "benchmark/dataset/CyanoOmicsDB/ncbi_dataset/data/GCF_000009725.1/protein.faa"
+
+tmp_root = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb"
+tmp_job  = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb_annotate_1"
+out_tsv  = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/cyanoomicsdb_annotate_1.tsv"
+
+# Step 1
+os.makedirs(tmp_root, exist_ok=True)
+os.makedirs(tmp_job, exist_ok=True)
+os.makedirs(os.path.dirname(out_tsv), exist_ok=True)
+assert os.path.exists(gff_path), f"Missing GFF: {gff_path}"
+assert os.path.exists(faa_path), f"Missing FAA: {faa_path}"
+plan[0] = "[✓] Create required output/temp directories"
+show_plan()
+
+# Helpers
+def parse_attrs(attr_str):
+    d = {}
+    for part in attr_str.strip().split(";"):
+        if not part:
+            continue
+        if "=" in part:
+            k, v = part.split("=", 1)
+            d[k] = v
+        else:
+            d[part] = ""
+    return d
+
+def norm(x):
+    return x if (x is not None and x != "") else "-"
+
+def format_loc(seqid, start, end, strand):
+    return f"{seqid}:{start}-{end}({strand})"
+
+# Step 2: parse GFF
+gene_by_id = {}
+gene_by_locus = {}
+cds_pending = []
+
+with open(gff_path, "r") as fh:
+    for line in fh:
+        if not line.strip() or line.startswith("#"):
+            continue
+        cols = line.rstrip("\n").split("\t")
+        if len(cols) != 9:
+            continue
+        seqid, source, ftype, start, end, score, strand, phase, attrs = cols
+        a = parse_attrs(attrs)
+
+        if ftype == "gene":
+            locus_tag = a.get("locus_tag") or a.get("Name") or a.get("gene")
+            if not locus_tag:
+                continue
+            gene_id = a.get("ID")
+            symbol = a.get("gene") or a.get("Name")
+            if symbol == locus_tag:
+                symbol = a.get("gene")
+            old = a.get("old_locus_tag")
+
+            row = {
+                "Locus_Tag": locus_tag,
+                "Symbol": norm(symbol) if symbol else "-",
+                "Old_Locus_Tag": norm(old),
+                "seqid": seqid,
+                "start": int(start),
+                "end": int(end),
+                "strand": strand,
+                "Protein_ID": "-",
+                "Product": "-",
+            }
+            if gene_id:
+                gene_by_id[gene_id] = row
+            gene_by_locus[locus_tag] = row
+
+        elif ftype == "CDS":
+            cds_pending.append({
+                "locus": a.get("locus_tag") or a.get("Name") or a.get("gene"),
+                "prot_id": a.get("protein_id"),
+                "product": a.get("product"),
+                "parent": a.get("Parent"),
+                "seqid": seqid,
+                "start": int(start),
+                "end": int(end),
+                "strand": strand
+            })
+
+for cds in cds_pending:
+    linked = False
+    if cds["parent"]:
+        for pid in cds["parent"].split(","):
+            if pid in gene_by_id:
+                r = gene_by_id[pid]
+                if cds["prot_id"]:
+                    r["Protein_ID"] = cds["prot_id"]
+                if cds["product"]:
+                    r["Product"] = cds["product"]
+                linked = True
+    if (not linked) and cds["locus"] and cds["locus"] in gene_by_locus:
+        r = gene_by_locus[cds["locus"]]
+        if cds["prot_id"]:
+            r["Protein_ID"] = cds["prot_id"]
+        if cds["product"]:
+            r["Product"] = cds["product"]
+        linked = True
+    if (not linked) and cds["locus"] and cds["locus"] not in gene_by_locus:
+        gene_by_locus[cds["locus"]] = {
+            "Locus_Tag": cds["locus"],
+            "Symbol": "-",
+            "Old_Locus_Tag": "-",
+            "seqid": cds["seqid"],
+            "start": cds["start"],
+            "end": cds["end"],
+            "strand": cds["strand"],
+            "Protein_ID": cds["prot_id"] or "-",
+            "Product": cds["product"] or "-",
+        }
+
+rows = list(gene_by_locus.values())
+rows.sort(key=lambda r: (r["seqid"], r["start"], r["end"], r["Locus_Tag"]))
+
+genes_tsv = os.path.join(tmp_job, "genes_from_gff.tsv")
+with open(genes_tsv, "w", newline="") as out:
+    w = csv.writer(out, delimiter="\t")
+    w.writerow(["Locus_Tag","Symbol","Old_Locus_Tag","Location","Protein_ID","Product"])
+    for r in rows:
+        w.writerow([r["Locus_Tag"], norm(r["Symbol"]), norm(r["Old_Locus_Tag"]),
+                    format_loc(r["seqid"], r["start"], r["end"], r["strand"]),
+                    norm(r["Protein_ID"]), norm(r["Product"])])
+
+print(f"\nParsed genes: {len(rows)}")
+print(f"Wrote intermediate: {genes_tsv}")
+
+plan[1] = "[✓] Parse GFF to extract per-gene basic fields (locus tag, symbol, old locus tag, coordinates, product, protein_id)"
+show_plan()
+
+# Step 3: subset FASTA
+prot_seqs = {}
+cur = None
+chunks = []
+with open(faa_path, "r") as fh:
+    for line in fh:
+        line = line.rstrip("\n")
+        if line.startswith(">"):
+            if cur is not None:
+                prot_seqs[cur] = "".join(chunks)
+            cur = line[1:].split()[0]
+            chunks = []
+        else:
+            chunks.append(line.strip())
+    if cur is not None:
+        prot_seqs[cur] = "".join(chunks)
+
+prot_ids = sorted({r["Protein_ID"] for r in rows if r["Protein_ID"] not in (None, "", "-")})
+subset_faa = os.path.join(tmp_job, "proteins_for_interproscan.faa")
+
+kept = missing = 0
+with open(subset_faa, "w") as out:
+    for pid in prot_ids:
+        seq = prot_seqs.get(pid)
+        if not seq:
+            missing += 1
+            continue
+        out.write(f">{pid}\n")
+        for i in range(0, len(seq), 60):
+            out.write(seq[i:i+60] + "\n")
+        kept += 1
+
+print(f"\nSubset FASTA written: {subset_faa}")
+print(f"Proteins referenced: {len(prot_ids)}; present in FAA: {kept}; missing: {missing}")
+
+plan[2] = "[✓] Prepare protein FASTA subset for InterProScan input"
+show_plan()
+
+# Step 4: integrate Pfam from existing InterProScan TSV
+def find_interproscan_tsv(search_roots):
+    hits = []
+    for root in search_roots:
+        if not root or not os.path.exists(root):
+            continue
+        for dirpath, _, filenames in os.walk(root):
+            for fn in filenames:
+                fpl = fn.lower()
+                if ("interproscan" in fpl or "iprscan" in fpl) and (fpl.endswith(".tsv") or fpl.endswith(".tab")):
+                    hits.append(os.path.join(dirpath, fn))
+    return hits
+
+ipr_tsv = os.path.join(tmp_job, "interproscan.tsv")
+cands = find_interproscan_tsv([tmp_job, tmp_root, os.path.dirname(gff_path)])
+used_ipr = None
+if cands:
+    cands = sorted(cands, key=lambda p: os.path.getsize(p), reverse=True)
+    used_ipr = cands[0]
+    if os.path.abspath(used_ipr) != os.path.abspath(ipr_tsv):
+        shutil.copyfile(used_ipr, ipr_tsv)
+else:
+    open(ipr_tsv, "w").close()
+
+pfam_by_prot = defaultdict(set)
+if os.path.exists(ipr_tsv) and os.path.getsize(ipr_tsv) > 0:
+    with open(ipr_tsv, "r") as fh:
+        for line in fh:
+            if not line.strip() or line.startswith("#"):
+                continue
+            p = line.rstrip("\n").split("\t")
+            # InterProScan TSV: [0]=protein accession, [3]=analysis, [4]=signature accession
+            if len(p) >= 5 and p[3] == "Pfam" and p[4]:
+                pfam_by_prot[p[0]].add(p[4])
+
+pfam_map = os.path.join(tmp_job, "pfam_by_protein.tsv")
+with open(pfam_map, "w", newline="") as out:
+    w = csv.writer(out, delimiter="\t")
+    w.writerow(["Protein_ID","Pfam"])
+    for pid in prot_ids:
+        hits = sorted(pfam_by_prot.get(pid, set()))
+        w.writerow([pid, ";".join(hits) if hits else "-"])
+
+print("\nInterProScan TSV used:", used_ipr if used_ipr else "(none found; Pfam='-' for all)")
+print(f"Proteins with Pfam hits: {sum(1 for pid in prot_ids if pfam_by_prot.get(pid))}")
+print(f"Wrote intermediate: {pfam_map}")
+print(f"Standardized InterProScan TSV: {ipr_tsv}")
+
+plan[3] = "[✓] Integrate Pfam accessions from existing InterProScan output (if present); otherwise set '-'"
+show_plan()
+
+# Step 5: master TSV
+with open(out_tsv, "w", newline="") as out:
+    w = csv.writer(out, delimiter="\t")
+    w.writerow(["Locus_Tag","Symbol","Old_Locus_Tag","Location","Protein_ID","Product","Pfam"])
+    for r in rows:
+        pid = r["Protein_ID"]
+        pf = "-"
+        if pid not in (None, "", "-"):
+            hits = sorted(pfam_by_prot.get(pid, set()))
+            pf = ";".join(hits) if hits else "-"
+        w.writerow([
+            r["Locus_Tag"], norm(r["Symbol"]), norm(r["Old_Locus_Tag"]),
+            format_loc(r["seqid"], r["start"], r["end"], r["strand"]),
+            norm(pid), norm(r["Product"]), pf
+        ])
+
+tmp_master = os.path.join(tmp_job, "cyanoomicsdb_annotate_1.master.tsv")
+shutil.copyfile(out_tsv, tmp_master)
+
+print(f"\nWrote master TSV: {out_tsv}")
+print(f"Saved intermediate master copy: {tmp_master}")
+
+plan[4] = "[✓] Write master TSV + required intermediate files"
+show_plan()
+
+print("\nPreview (header + first 5 rows):")
+with open(out_tsv, "r") as fh:
+    for i, line in enumerate(fh):
+        if i > 5:
+            break
+        print(line.rstrip("\n"))
+</execute>
+<observation>NameError("name 'plan' is not defined")</observation>
+<execute>
+import os, csv, shutil
+from collections import defaultdict
+
+print("Research log: final run (no plan variable at all)")
+
+# Paths
+gff_path = "benchmark/dataset/CyanoOmicsDB/ncbi_dataset/data/GCF_000009725.1/demo_genomic.gff"
+faa_path = "benchmark/dataset/CyanoOmicsDB/ncbi_dataset/data/GCF_000009725.1/protein.faa"
+
+tmp_root = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb"
+tmp_job  = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb_annotate_1"
+out_tsv  = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/cyanoomicsdb_annotate_1.tsv"
+
+# Step 1
+os.makedirs(tmp_root, exist_ok=True)
+os.makedirs(tmp_job, exist_ok=True)
+os.makedirs(os.path.dirname(out_tsv), exist_ok=True)
+assert os.path.exists(gff_path), f"Missing GFF: {gff_path}"
+assert os.path.exists(faa_path), f"Missing FAA: {faa_path}"
+print("Step 1 OK: directories ready")
+
+# Helpers
+def parse_attrs(attr_str):
+    d = {}
+    for part in attr_str.strip().split(";"):
+        if not part:
+            continue
+        if "=" in part:
+            k, v = part.split("=", 1)
+            d[k] = v
+        else:
+            d[part] = ""
+    return d
+
+def norm(x):
+    return x if (x is not None and x != "") else "-"
+
+def format_loc(seqid, start, end, strand):
+    return f"{seqid}:{start}-{end}({strand})"
+
+# Step 2: parse GFF
+gene_by_id = {}
+gene_by_locus = {}
+cds_pending = []
+
+with open(gff_path, "r") as fh:
+    for line in fh:
+        if not line.strip() or line.startswith("#"):
+            continue
+        cols = line.rstrip("\n").split("\t")
+        if len(cols) != 9:
+            continue
+        seqid, source, ftype, start, end, score, strand, phase, attrs = cols
+        a = parse_attrs(attrs)
+
+        if ftype == "gene":
+            locus_tag = a.get("locus_tag") or a.get("Name") or a.get("gene")
+            if not locus_tag:
+                continue
+            gene_id = a.get("ID")
+            symbol = a.get("gene") or a.get("Name")
+            if symbol == locus_tag:
+                symbol = a.get("gene")
+            old = a.get("old_locus_tag")
+
+            row = {
+                "Locus_Tag": locus_tag,
+                "Symbol": norm(symbol) if symbol else "-",
+                "Old_Locus_Tag": norm(old),
+                "seqid": seqid,
+                "start": int(start),
+                "end": int(end),
+                "strand": strand,
+                "Protein_ID": "-",
+                "Product": "-",
+            }
+            if gene_id:
+                gene_by_id[gene_id] = row
+            gene_by_locus[locus_tag] = row
+
+        elif ftype == "CDS":
+            cds_pending.append({
+                "locus": a.get("locus_tag") or a.get("Name") or a.get("gene"),
+                "prot_id": a.get("protein_id"),
+                "product": a.get("product"),
+                "parent": a.get("Parent"),
+                "seqid": seqid,
+                "start": int(start),
+                "end": int(end),
+                "strand": strand
+            })
+
+for cds in cds_pending:
+    linked = False
+    if cds["parent"]:
+        for pid in cds["parent"].split(","):
+            if pid in gene_by_id:
+                r = gene_by_id[pid]
+                if cds["prot_id"]:
+                    r["Protein_ID"] = cds["prot_id"]
+                if cds["product"]:
+                    r["Product"] = cds["product"]
+                linked = True
+    if (not linked) and cds["locus"] and cds["locus"] in gene_by_locus:
+        r = gene_by_locus[cds["locus"]]
+        if cds["prot_id"]:
+            r["Protein_ID"] = cds["prot_id"]
+        if cds["product"]:
+            r["Product"] = cds["product"]
+        linked = True
+    if (not linked) and cds["locus"] and cds["locus"] not in gene_by_locus:
+        gene_by_locus[cds["locus"]] = {
+            "Locus_Tag": cds["locus"],
+            "Symbol": "-",
+            "Old_Locus_Tag": "-",
+            "seqid": cds["seqid"],
+            "start": cds["start"],
+            "end": cds["end"],
+            "strand": cds["strand"],
+            "Protein_ID": cds["prot_id"] or "-",
+            "Product": cds["product"] or "-",
+        }
+
+rows = list(gene_by_locus.values())
+rows.sort(key=lambda r: (r["seqid"], r["start"], r["end"], r["Locus_Tag"]))
+
+genes_tsv = os.path.join(tmp_job, "genes_from_gff.tsv")
+with open(genes_tsv, "w", newline="") as out:
+    w = csv.writer(out, delimiter="\t")
+    w.writerow(["Locus_Tag","Symbol","Old_Locus_Tag","Location","Protein_ID","Product"])
+    for r in rows:
+        w.writerow([r["Locus_Tag"], norm(r["Symbol"]), norm(r["Old_Locus_Tag"]),
+                    format_loc(r["seqid"], r["start"], r["end"], r["strand"]),
+                    norm(r["Protein_ID"]), norm(r["Product"])])
+print(f"Step 2 OK: genes parsed={len(rows)}; wrote {genes_tsv}")
+
+# Step 3: subset FASTA
+prot_seqs = {}
+cur = None
+chunks = []
+with open(faa_path, "r") as fh:
+    for line in fh:
+        line = line.rstrip("\n")
+        if line.startswith(">"):
+            if cur is not None:
+                prot_seqs[cur] = "".join(chunks)
+            cur = line[1:].split()[0]
+            chunks = []
+        else:
+            chunks.append(line.strip())
+    if cur is not None:
+        prot_seqs[cur] = "".join(chunks)
+
+prot_ids = sorted({r["Protein_ID"] for r in rows if r["Protein_ID"] not in (None, "", "-")})
+subset_faa = os.path.join(tmp_job, "proteins_for_interproscan.faa")
+
+kept = missing = 0
+with open(subset_faa, "w") as out:
+    for pid in prot_ids:
+        seq = prot_seqs.get(pid)
+        if not seq:
+            missing += 1
+            continue
+        out.write(f">{pid}\n")
+        for i in range(0, len(seq), 60):
+            out.write(seq[i:i+60] + "\n")
+        kept += 1
+print(f"Step 3 OK: wrote {subset_faa}; referenced={len(prot_ids)} present={kept} missing={missing}")
+
+# Step 4: Pfam integration from existing InterProScan TSV if any
+def find_interproscan_tsv(search_roots):
+    hits = []
+    for root in search_roots:
+        if not root or not os.path.exists(root):
+            continue
+        for dirpath, _, filenames in os.walk(root):
+            for fn in filenames:
+                fpl = fn.lower()
+                if ("interproscan" in fpl or "iprscan" in fpl) and (fpl.endswith(".tsv") or fpl.endswith(".tab")):
+                    hits.append(os.path.join(dirpath, fn))
+    return hits
+
+ipr_tsv = os.path.join(tmp_job, "interproscan.tsv")
+cands = find_interproscan_tsv([tmp_job, tmp_root, os.path.dirname(gff_path)])
+used_ipr = None
+if cands:
+    cands = sorted(cands, key=lambda p: os.path.getsize(p), reverse=True)
+    used_ipr = cands[0]
+    if os.path.abspath(used_ipr) != os.path.abspath(ipr_tsv):
+        shutil.copyfile(used_ipr, ipr_tsv)
+else:
+    open(ipr_tsv, "w").close()
+
+pfam_by_prot = defaultdict(set)
+if os.path.exists(ipr_tsv) and os.path.getsize(ipr_tsv) > 0:
+    with open(ipr_tsv, "r") as fh:
+        for line in fh:
+            if not line.strip() or line.startswith("#"):
+                continue
+            p = line.rstrip("\n").split("\t")
+            if len(p) >= 5 and p[3] == "Pfam" and p[4]:
+                pfam_by_prot[p[0]].add(p[4])
+
+pfam_map = os.path.join(tmp_job, "pfam_by_protein.tsv")
+with open(pfam_map, "w", newline="") as out:
+    w = csv.writer(out, delimiter="\t")
+    w.writerow(["Protein_ID","Pfam"])
+    for pid in prot_ids:
+        hits = sorted(pfam_by_prot.get(pid, set()))
+        w.writerow([pid, ";".join(hits) if hits else "-"])
+
+print(f"Step 4 OK: InterProScan used: {used_ipr if used_ipr else '(none found)'}; proteins w/ Pfam hits={sum(1 for pid in prot_ids if pfam_by_prot.get(pid))}")
+print(f"Step 4 OK: wrote {pfam_map}; standardized ipr TSV at {ipr_tsv}")
+
+# Step 5: master TSV
+with open(out_tsv, "w", newline="") as out:
+    w = csv.writer(out, delimiter="\t")
+    w.writerow(["Locus_Tag","Symbol","Old_Locus_Tag","Location","Protein_ID","Product","Pfam"])
+    for r in rows:
+        pid = r["Protein_ID"]
+        pf = "-"
+        if pid not in (None, "", "-"):
+            hits = sorted(pfam_by_prot.get(pid, set()))
+            pf = ";".join(hits) if hits else "-"
+        w.writerow([r["Locus_Tag"], norm(r["Symbol"]), norm(r["Old_Locus_Tag"]),
+                    format_loc(r["seqid"], r["start"], r["end"], r["strand"]),
+                    norm(pid), norm(r["Product"]), pf])
+
+tmp_master = os.path.join(tmp_job, "cyanoomicsdb_annotate_1.master.tsv")
+shutil.copyfile(out_tsv, tmp_master)
+
+print(f"Step 5 OK: wrote master TSV {out_tsv}")
+print(f"Intermediate master copy: {tmp_master}")
+
+print("\nPreview (header + first 5 rows):")
+with open(out_tsv, "r") as fh:
+    for i, line in enumerate(fh):
+        if i > 5:
+            break
+        print(line.rstrip("\n"))
+</execute>
+<observation>NameError("name 'os' is not defined")</observation>
+<execute>
+import os, csv, shutil
+from collections import defaultdict
+
+print("Quick self-check: os is available:", "os" in globals())
+
+# If os is somehow not present, fail fast with explicit message
+assert "os" in globals(), "os is not defined after import; environment issue"
+
+print("Proceeding with pipeline...")
+
+# Paths
+gff_path = "benchmark/dataset/CyanoOmicsDB/ncbi_dataset/data/GCF_000009725.1/demo_genomic.gff"
+faa_path = "benchmark/dataset/CyanoOmicsDB/ncbi_dataset/data/GCF_000009725.1/protein.faa"
+tmp_root = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb"
+tmp_job  = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb_annotate_1"
+out_tsv  = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/cyanoomicsdb_annotate_1.tsv"
+
+os.makedirs(tmp_root, exist_ok=True)
+os.makedirs(tmp_job, exist_ok=True)
+os.makedirs(os.path.dirname(out_tsv), exist_ok=True)
+assert os.path.exists(gff_path), f"Missing GFF: {gff_path}"
+assert os.path.exists(faa_path), f"Missing FAA: {faa_path}"
+print("Step 1 OK")
+
+def parse_attrs(attr_str):
+    d = {}
+    for part in attr_str.strip().split(";"):
+        if not part:
+            continue
+        if "=" in part:
+            k, v = part.split("=", 1)
+            d[k] = v
+        else:
+            d[part] = ""
+    return d
+
+def norm(x):
+    return x if (x is not None and x != "") else "-"
+
+def format_loc(seqid, start, end, strand):
+    return f"{seqid}:{start}-{end}({strand})"
+
+# Step 2: parse GFF
+gene_by_id = {}
+gene_by_locus = {}
+cds_pending = []
+
+with open(gff_path, "r") as fh:
+    for line in fh:
+        if not line.strip() or line.startswith("#"):
+            continue
+        cols = line.rstrip("\n").split("\t")
+        if len(cols) != 9:
+            continue
+        seqid, source, ftype, start, end, score, strand, phase, attrs = cols
+        a = parse_attrs(attrs)
+        if ftype == "gene":
+            locus_tag = a.get("locus_tag") or a.get("Name") or a.get("gene")
+            if not locus_tag:
+                continue
+            gene_id = a.get("ID")
+            symbol = a.get("gene") or a.get("Name")
+            if symbol == locus_tag:
+                symbol = a.get("gene")
+            old = a.get("old_locus_tag")
+            row = {
+                "Locus_Tag": locus_tag,
+                "Symbol": norm(symbol) if symbol else "-",
+                "Old_Locus_Tag": norm(old),
+                "seqid": seqid,
+                "start": int(start),
+                "end": int(end),
+                "strand": strand,
+                "Protein_ID": "-",
+                "Product": "-",
+            }
+            if gene_id:
+                gene_by_id[gene_id] = row
+            gene_by_locus[locus_tag] = row
+        elif ftype == "CDS":
+            cds_pending.append({
+                "locus": a.get("locus_tag") or a.get("Name") or a.get("gene"),
+                "prot_id": a.get("protein_id"),
+                "product": a.get("product"),
+                "parent": a.get("Parent"),
+                "seqid": seqid,
+                "start": int(start),
+                "end": int(end),
+                "strand": strand
+            })
+
+for cds in cds_pending:
+    linked = False
+    if cds["parent"]:
+        for pid in cds["parent"].split(","):
+            if pid in gene_by_id:
+                r = gene_by_id[pid]
+                if cds["prot_id"]:
+                    r["Protein_ID"] = cds["prot_id"]
+                if cds["product"]:
+                    r["Product"] = cds["product"]
+                linked = True
+    if (not linked) and cds["locus"] and cds["locus"] in gene_by_locus:
+        r = gene_by_locus[cds["locus"]]
+        if cds["prot_id"]:
+            r["Protein_ID"] = cds["prot_id"]
+        if cds["product"]:
+            r["Product"] = cds["product"]
+        linked = True
+    if (not linked) and cds["locus"] and cds["locus"] not in gene_by_locus:
+        gene_by_locus[cds["locus"]] = {
+            "Locus_Tag": cds["locus"],
+            "Symbol": "-",
+            "Old_Locus_Tag": "-",
+            "seqid": cds["seqid"],
+            "start": cds["start"],
+            "end": cds["end"],
+            "strand": cds["strand"],
+            "Protein_ID": cds["prot_id"] or "-",
+            "Product": cds["product"] or "-",
+        }
+
+rows = list(gene_by_locus.values())
+rows.sort(key=lambda r: (r["seqid"], r["start"], r["end"], r["Locus_Tag"]))
+
+genes_tsv = os.path.join(tmp_job, "genes_from_gff.tsv")
+with open(genes_tsv, "w", newline="") as out:
+    w = csv.writer(out, delimiter="\t")
+    w.writerow(["Locus_Tag","Symbol","Old_Locus_Tag","Location","Protein_ID","Product"])
+    for r in rows:
+        w.writerow([r["Locus_Tag"], norm(r["Symbol"]), norm(r["Old_Locus_Tag"]),
+                    format_loc(r["seqid"], r["start"], r["end"], r["strand"]),
+                    norm(r["Protein_ID"]), norm(r["Product"])])
+print("Step 2 OK:", len(rows), "genes")
+
+# Step 3: subset FASTA
+prot_seqs = {}
+cur = None
+chunks = []
+with open(faa_path, "r") as fh:
+    for line in fh:
+        line = line.rstrip("\n")
+        if line.startswith(">"):
+            if cur is not None:
+                prot_seqs[cur] = "".join(chunks)
+            cur = line[1:].split()[0]
+            chunks = []
+        else:
+            chunks.append(line.strip())
+    if cur is not None:
+        prot_seqs[cur] = "".join(chunks)
+
+prot_ids = sorted({r["Protein_ID"] for r in rows if r["Protein_ID"] not in (None, "", "-")})
+subset_faa = os.path.join(tmp_job, "proteins_for_interproscan.faa")
+with open(subset_faa, "w") as out:
+    for pid in prot_ids:
+        seq = prot_seqs.get(pid)
+        if not seq:
+            continue
+        out.write(f">{pid}\n")
+        for i in range(0, len(seq), 60):
+            out.write(seq[i:i+60] + "\n")
+print("Step 3 OK:", subset_faa)
+
+# Step 4: pfam from existing ipr tsv
+def find_interproscan_tsv(search_roots):
+    hits = []
+    for root in search_roots:
+        if not root or not os.path.exists(root):
+            continue
+        for dirpath, _, filenames in os.walk(root):
+            for fn in filenames:
+                fpl = fn.lower()
+                if ("interproscan" in fpl or "iprscan" in fpl) and (fpl.endswith(".tsv") or fpl.endswith(".tab")):
+                    hits.append(os.path.join(dirpath, fn))
+    return hits
+
+ipr_tsv = os.path.join(tmp_job, "interproscan.tsv")
+cands = find_interproscan_tsv([tmp_job, tmp_root, os.path.dirname(gff_path)])
+if cands:
+    cands = sorted(cands, key=lambda p: os.path.getsize(p), reverse=True)
+    if os.path.abspath(cands[0]) != os.path.abspath(ipr_tsv):
+        shutil.copyfile(cands[0], ipr_tsv)
+else:
+    open(ipr_tsv, "w").close()
+
+pfam_by_prot = defaultdict(set)
+if os.path.getsize(ipr_tsv) > 0:
+    with open(ipr_tsv, "r") as fh:
+        for line in fh:
+            if not line.strip() or line.startswith("#"):
+                continue
+            p = line.rstrip("\n").split("\t")
+            if len(p) >= 5 and p[3] == "Pfam" and p[4]:
+                pfam_by_prot[p[0]].add(p[4])
+
+pfam_map = os.path.join(tmp_job, "pfam_by_protein.tsv")
+with open(pfam_map, "w", newline="") as out:
+    w = csv.writer(out, delimiter="\t")
+    w.writerow(["Protein_ID","Pfam"])
+    for pid in prot_ids:
+        hits = sorted(pfam_by_prot.get(pid, set()))
+        w.writerow([pid, ";".join(hits) if hits else "-"])
+print("Step 4 OK:", pfam_map)
+
+# Step 5: master TSV
+with open(out_tsv, "w", newline="") as out:
+    w = csv.writer(out, delimiter="\t")
+    w.writerow(["Locus_Tag","Symbol","Old_Locus_Tag","Location","Protein_ID","Product","Pfam"])
+    for r in rows:
+        pid = r["Protein_ID"]
+        hits = sorted(pfam_by_prot.get(pid, set())) if pid not in (None, "", "-") else []
+        pf = ";".join(hits) if hits else "-"
+        w.writerow([r["Locus_Tag"], norm(r["Symbol"]), norm(r["Old_Locus_Tag"]),
+                    format_loc(r["seqid"], r["start"], r["end"], r["strand"]),
+                    norm(pid), norm(r["Product"]), pf])
+
+tmp_master = os.path.join(tmp_job, "cyanoomicsdb_annotate_1.master.tsv")
+shutil.copyfile(out_tsv, tmp_master)
+print("Step 5 OK:", out_tsv)
+print("Intermediate master:", tmp_master)
+
+print("\nPreview:")
+with open(out_tsv, "r") as fh:
+    for i, line in enumerate(fh):
+        if i > 5:
+            break
+        print(line.rstrip("\n"))
+</execute>
+<observation>AssertionError('os is not defined after import; environment issue')</observation>
+<execute>
+# Workaround: avoid relying on global name resolution at all by importing into a local dict
+# and only accessing modules through that dict.
+import importlib
+
+M = {}
+for mod in ["os", "csv", "shutil", "collections"]:
+    M[mod] = importlib.import_module(mod)
+
+os = M["os"]
+csv = M["csv"]
+shutil = M["shutil"]
+defaultdict = M["collections"].defaultdict
+
+print("Research log: pipeline using modules via importlib (workaround for NameError)")
+
+gff_path = "benchmark/dataset/CyanoOmicsDB/ncbi_dataset/data/GCF_000009725.1/demo_genomic.gff"
+faa_path = "benchmark/dataset/CyanoOmicsDB/ncbi_dataset/data/GCF_000009725.1/protein.faa"
+
+tmp_root = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb"
+tmp_job  = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb_annotate_1"
+out_tsv  = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/cyanoomicsdb_annotate_1.tsv"
+
+os.makedirs(tmp_root, exist_ok=True)
+os.makedirs(tmp_job, exist_ok=True)
+os.makedirs(os.path.dirname(out_tsv), exist_ok=True)
+assert os.path.exists(gff_path), f"Missing GFF: {gff_path}"
+assert os.path.exists(faa_path), f"Missing FAA: {faa_path}"
+print("Step 1 OK")
+
+def parse_attrs(attr_str):
+    d = {}
+    for part in attr_str.strip().split(";"):
+        if not part:
+            continue
+        if "=" in part:
+            k, v = part.split("=", 1)
+            d[k] = v
+        else:
+            d[part] = ""
+    return d
+
+def norm(x):
+    return x if (x is not None and x != "") else "-"
+
+def format_loc(seqid, start, end, strand):
+    return f"{seqid}:{start}-{end}({strand})"
+
+# Step 2
+gene_by_id = {}
+gene_by_locus = {}
+cds_pending = []
+
+with open(gff_path, "r") as fh:
+    for line in fh:
+        if not line.strip() or line.startswith("#"):
+            continue
+        cols = line.rstrip("\n").split("\t")
+        if len(cols) != 9:
+            continue
+        seqid, source, ftype, start, end, score, strand, phase, attrs = cols
+        a = parse_attrs(attrs)
+        if ftype == "gene":
+            locus_tag = a.get("locus_tag") or a.get("Name") or a.get("gene")
+            if not locus_tag:
+                continue
+            gene_id = a.get("ID")
+            symbol = a.get("gene") or a.get("Name")
+            if symbol == locus_tag:
+                symbol = a.get("gene")
+            old = a.get("old_locus_tag")
+            row = {
+                "Locus_Tag": locus_tag,
+                "Symbol": norm(symbol) if symbol else "-",
+                "Old_Locus_Tag": norm(old),
+                "seqid": seqid,
+                "start": int(start),
+                "end": int(end),
+                "strand": strand,
+                "Protein_ID": "-",
+                "Product": "-",
+            }
+            if gene_id:
+                gene_by_id[gene_id] = row
+            gene_by_locus[locus_tag] = row
+        elif ftype == "CDS":
+            cds_pending.append({
+                "locus": a.get("locus_tag") or a.get("Name") or a.get("gene"),
+                "prot_id": a.get("protein_id"),
+                "product": a.get("product"),
+                "parent": a.get("Parent"),
+                "seqid": seqid,
+                "start": int(start),
+                "end": int(end),
+                "strand": strand
+            })
+
+for cds in cds_pending:
+    linked = False
+    if cds["parent"]:
+        for pid in cds["parent"].split(","):
+            if pid in gene_by_id:
+                r = gene_by_id[pid]
+                if cds["prot_id"]:
+                    r["Protein_ID"] = cds["prot_id"]
+                if cds["product"]:
+                    r["Product"] = cds["product"]
+                linked = True
+    if (not linked) and cds["locus"] and cds["locus"] in gene_by_locus:
+        r = gene_by_locus[cds["locus"]]
+        if cds["prot_id"]:
+            r["Protein_ID"] = cds["prot_id"]
+        if cds["product"]:
+            r["Product"] = cds["product"]
+        linked = True
+    if (not linked) and cds["locus"] and cds["locus"] not in gene_by_locus:
+        gene_by_locus[cds["locus"]] = {
+            "Locus_Tag": cds["locus"],
+            "Symbol": "-",
+            "Old_Locus_Tag": "-",
+            "seqid": cds["seqid"],
+            "start": cds["start"],
+            "end": cds["end"],
+            "strand": cds["strand"],
+            "Protein_ID": cds["prot_id"] or "-",
+            "Product": cds["product"] or "-",
+        }
+
+rows = list(gene_by_locus.values())
+rows.sort(key=lambda r: (r["seqid"], r["start"], r["end"], r["Locus_Tag"]))
+
+genes_tsv = os.path.join(tmp_job, "genes_from_gff.tsv")
+with open(genes_tsv, "w", newline="") as out:
+    w = csv.writer(out, delimiter="\t")
+    w.writerow(["Locus_Tag","Symbol","Old_Locus_Tag","Location","Protein_ID","Product"])
+    for r in rows:
+        w.writerow([r["Locus_Tag"], norm(r["Symbol"]), norm(r["Old_Locus_Tag"]),
+                    format_loc(r["seqid"], r["start"], r["end"], r["strand"]),
+                    norm(r["Protein_ID"]), norm(r["Product"])])
+print("Step 2 OK:", len(rows), "genes")
+
+# Step 3: subset FASTA
+prot_seqs = {}
+cur = None
+chunks = []
+with open(faa_path, "r") as fh:
+    for line in fh:
+        line = line.rstrip("\n")
+        if line.startswith(">"):
+            if cur is not None:
+                prot_seqs[cur] = "".join(chunks)
+            cur = line[1:].split()[0]
+            chunks = []
+        else:
+            chunks.append(line.strip())
+    if cur is not None:
+        prot_seqs[cur] = "".join(chunks)
+
+prot_ids = sorted({r["Protein_ID"] for r in rows if r["Protein_ID"] not in (None, "", "-")})
+subset_faa = os.path.join(tmp_job, "proteins_for_interproscan.faa")
+with open(subset_faa, "w") as out:
+    for pid in prot_ids:
+        seq = prot_seqs.get(pid)
+        if not seq:
+            continue
+        out.write(f">{pid}\n")
+        for i in range(0, len(seq), 60):
+            out.write(seq[i:i+60] + "\n")
+print("Step 3 OK:", subset_faa)
+
+# Step 4: Pfam from existing InterProScan TSV
+def find_interproscan_tsv(search_roots):
+    hits = []
+    for root in search_roots:
+        if not root or not os.path.exists(root):
+            continue
+        for dirpath, _, filenames in os.walk(root):
+            for fn in filenames:
+                fpl = fn.lower()
+                if ("interproscan" in fpl or "iprscan" in fpl) and (fpl.endswith(".tsv") or fpl.endswith(".tab")):
+                    hits.append(os.path.join(dirpath, fn))
+    return hits
+
+ipr_tsv = os.path.join(tmp_job, "interproscan.tsv")
+cands = find_interproscan_tsv([tmp_job, tmp_root, os.path.dirname(gff_path)])
+if cands:
+    cands = sorted(cands, key=lambda p: os.path.getsize(p), reverse=True)
+    if os.path.abspath(cands[0]) != os.path.abspath(ipr_tsv):
+        shutil.copyfile(cands[0], ipr_tsv)
+else:
+    open(ipr_tsv, "w").close()
+
+pfam_by_prot = defaultdict(set)
+if os.path.getsize(ipr_tsv) > 0:
+    with open(ipr_tsv, "r") as fh:
+        for line in fh:
+            if not line.strip() or line.startswith("#"):
+                continue
+            p = line.rstrip("\n").split("\t")
+            if len(p) >= 5 and p[3] == "Pfam" and p[4]:
+                pfam_by_prot[p[0]].add(p[4])
+
+pfam_map = os.path.join(tmp_job, "pfam_by_protein.tsv")
+with open(pfam_map, "w", newline="") as out:
+    w = csv.writer(out, delimiter="\t")
+    w.writerow(["Protein_ID","Pfam"])
+    for pid in prot_ids:
+        hits = sorted(pfam_by_prot.get(pid, set()))
+        w.writerow([pid, ";".join(hits) if hits else "-"])
+print("Step 4 OK:", pfam_map)
+
+# Step 5: master TSV
+with open(out_tsv, "w", newline="") as out:
+    w = csv.writer(out, delimiter="\t")
+    w.writerow(["Locus_Tag","Symbol","Old_Locus_Tag","Location","Protein_ID","Product","Pfam"])
+    for r in rows:
+        pid = r["Protein_ID"]
+        hits = sorted(pfam_by_prot.get(pid, set())) if pid not in (None, "", "-") else []
+        pf = ";".join(hits) if hits else "-"
+        w.writerow([r["Locus_Tag"], norm(r["Symbol"]), norm(r["Old_Locus_Tag"]),
+                    format_loc(r["seqid"], r["start"], r["end"], r["strand"]),
+                    norm(pid), norm(r["Product"]), pf])
+
+tmp_master = os.path.join(tmp_job, "cyanoomicsdb_annotate_1.master.tsv")
+shutil.copyfile(out_tsv, tmp_master)
+
+print("Step 5 OK:", out_tsv)
+print("Intermediate master copy:", tmp_master)
+
+print("\nPreview:")
+with open(out_tsv, "r") as fh:
+    for i, line in enumerate(fh):
+        if i > 5:
+            break
+        print(line.rstrip("\n"))
+</execute>
+<observation>NameError("name 'os' is not defined")</observation>
+<execute>
+# Use ONLY the module dictionary M; never bind os/csv/shutil names.
+import importlib
+
+M = {k: importlib.import_module(k) for k in ["os", "csv", "shutil", "collections"]}
+
+print("Research log: pipeline using M['os']/M['csv']/M['shutil'] only")
+
+gff_path = "benchmark/dataset/CyanoOmicsDB/ncbi_dataset/data/GCF_000009725.1/demo_genomic.gff"
+faa_path = "benchmark/dataset/CyanoOmicsDB/ncbi_dataset/data/GCF_000009725.1/protein.faa"
+
+tmp_root = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb"
+tmp_job  = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb_annotate_1"
+out_tsv  = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/cyanoomicsdb_annotate_1.tsv"
+
+M["os"].makedirs(tmp_root, exist_ok=True)
+M["os"].makedirs(tmp_job, exist_ok=True)
+M["os"].makedirs(M["os"].path.dirname(out_tsv), exist_ok=True)
+assert M["os"].path.exists(gff_path), f"Missing GFF: {gff_path}"
+assert M["os"].path.exists(faa_path), f"Missing FAA: {faa_path}"
+print("Step 1 OK")
+
+def parse_attrs(attr_str):
+    d = {}
+    for part in attr_str.strip().split(";"):
+        if not part:
+            continue
+        if "=" in part:
+            k, v = part.split("=", 1)
+            d[k] = v
+        else:
+            d[part] = ""
+    return d
+
+def norm(x):
+    return x if (x is not None and x != "") else "-"
+
+def format_loc(seqid, start, end, strand):
+    return f"{seqid}:{start}-{end}({strand})"
+
+# Step 2: parse GFF
+gene_by_id = {}
+gene_by_locus = {}
+cds_pending = []
+
+with open(gff_path, "r") as fh:
+    for line in fh:
+        if not line.strip() or line.startswith("#"):
+            continue
+        cols = line.rstrip("\n").split("\t")
+        if len(cols) != 9:
+            continue
+        seqid, source, ftype, start, end, score, strand, phase, attrs = cols
+        a = parse_attrs(attrs)
+
+        if ftype == "gene":
+            locus_tag = a.get("locus_tag") or a.get("Name") or a.get("gene")
+            if not locus_tag:
+                continue
+            gene_id = a.get("ID")
+            symbol = a.get("gene") or a.get("Name")
+            if symbol == locus_tag:
+                symbol = a.get("gene")
+            old = a.get("old_locus_tag")
+            row = {
+                "Locus_Tag": locus_tag,
+                "Symbol": norm(symbol) if symbol else "-",
+                "Old_Locus_Tag": norm(old),
+                "seqid": seqid,
+                "start": int(start),
+                "end": int(end),
+                "strand": strand,
+                "Protein_ID": "-",
+                "Product": "-",
+            }
+            if gene_id:
+                gene_by_id[gene_id] = row
+            gene_by_locus[locus_tag] = row
+
+        elif ftype == "CDS":
+            cds_pending.append({
+                "locus": a.get("locus_tag") or a.get("Name") or a.get("gene"),
+                "prot_id": a.get("protein_id"),
+                "product": a.get("product"),
+                "parent": a.get("Parent"),
+                "seqid": seqid,
+                "start": int(start),
+                "end": int(end),
+                "strand": strand
+            })
+
+for cds in cds_pending:
+    linked = False
+    if cds["parent"]:
+        for pid in cds["parent"].split(","):
+            if pid in gene_by_id:
+                r = gene_by_id[pid]
+                if cds["prot_id"]:
+                    r["Protein_ID"] = cds["prot_id"]
+                if cds["product"]:
+                    r["Product"] = cds["product"]
+                linked = True
+    if (not linked) and cds["locus"] and cds["locus"] in gene_by_locus:
+        r = gene_by_locus[cds["locus"]]
+        if cds["prot_id"]:
+            r["Protein_ID"] = cds["prot_id"]
+        if cds["product"]:
+            r["Product"] = cds["product"]
+        linked = True
+    if (not linked) and cds["locus"] and cds["locus"] not in gene_by_locus:
+        gene_by_locus[cds["locus"]] = {
+            "Locus_Tag": cds["locus"],
+            "Symbol": "-",
+            "Old_Locus_Tag": "-",
+            "seqid": cds["seqid"],
+            "start": cds["start"],
+            "end": cds["end"],
+            "strand": cds["strand"],
+            "Protein_ID": cds["prot_id"] or "-",
+            "Product": cds["product"] or "-",
+        }
+
+rows = list(gene_by_locus.values())
+rows.sort(key=lambda r: (r["seqid"], r["start"], r["end"], r["Locus_Tag"]))
+
+genes_tsv = M["os"].path.join(tmp_job, "genes_from_gff.tsv")
+with open(genes_tsv, "w", newline="") as out:
+    w = M["csv"].writer(out, delimiter="\t")
+    w.writerow(["Locus_Tag","Symbol","Old_Locus_Tag","Location","Protein_ID","Product"])
+    for r in rows:
+        w.writerow([r["Locus_Tag"], norm(r["Symbol"]), norm(r["Old_Locus_Tag"]),
+                    format_loc(r["seqid"], r["start"], r["end"], r["strand"]),
+                    norm(r["Protein_ID"]), norm(r["Product"])])
+print("Step 2 OK:", len(rows), "genes")
+
+# Step 3: subset FASTA
+prot_seqs = {}
+cur = None
+chunks = []
+with open(faa_path, "r") as fh:
+    for line in fh:
+        line = line.rstrip("\n")
+        if line.startswith(">"):
+            if cur is not None:
+                prot_seqs[cur] = "".join(chunks)
+            cur = line[1:].split()[0]
+            chunks = []
+        else:
+            chunks.append(line.strip())
+    if cur is not None:
+        prot_seqs[cur] = "".join(chunks)
+
+prot_ids = sorted({r["Protein_ID"] for r in rows if r["Protein_ID"] not in (None, "", "-")})
+subset_faa = M["os"].path.join(tmp_job, "proteins_for_interproscan.faa")
+with open(subset_faa, "w") as out:
+    for pid in prot_ids:
+        seq = prot_seqs.get(pid)
+        if not seq:
+            continue
+        out.write(f">{pid}\n")
+        for i in range(0, len(seq), 60):
+            out.write(seq[i:i+60] + "\n")
+print("Step 3 OK:", subset_faa)
+
+# Step 4: Pfam from existing InterProScan TSV
+def find_interproscan_tsv(search_roots):
+    hits = []
+    for root in search_roots:
+        if not root or not M["os"].path.exists(root):
+            continue
+        for dirpath, _, filenames in M["os"].walk(root):
+            for fn in filenames:
+                fpl = fn.lower()
+                if ("interproscan" in fpl or "iprscan" in fpl) and (fpl.endswith(".tsv") or fpl.endswith(".tab")):
+                    hits.append(M["os"].path.join(dirpath, fn))
+    return hits
+
+ipr_tsv = M["os"].path.join(tmp_job, "interproscan.tsv")
+cands = find_interproscan_tsv([tmp_job, tmp_root, M["os"].path.dirname(gff_path)])
+if cands:
+    cands = sorted(cands, key=lambda p: M["os"].path.getsize(p), reverse=True)
+    if M["os"].path.abspath(cands[0]) != M["os"].path.abspath(ipr_tsv):
+        M["shutil"].copyfile(cands[0], ipr_tsv)
+else:
+    open(ipr_tsv, "w").close()
+
+pfam_by_prot = M["collections"].defaultdict(set)
+if M["os"].path.getsize(ipr_tsv) > 0:
+    with open(ipr_tsv, "r") as fh:
+        for line in fh:
+            if not line.strip() or line.startswith("#"):
+                continue
+            p = line.rstrip("\n").split("\t")
+            if len(p) >= 5 and p[3] == "Pfam" and p[4]:
+                pfam_by_prot[p[0]].add(p[4])
+
+pfam_map = M["os"].path.join(tmp_job, "pfam_by_protein.tsv")
+with open(pfam_map, "w", newline="") as out:
+    w = M["csv"].writer(out, delimiter="\t")
+    w.writerow(["Protein_ID","Pfam"])
+    for pid in prot_ids:
+        hits = sorted(pfam_by_prot.get(pid, set()))
+        w.writerow([pid, ";".join(hits) if hits else "-"])
+print("Step 4 OK:", pfam_map, "Pfam-hit proteins:", sum(1 for pid in prot_ids if pfam_by_prot.get(pid)))
+
+# Step 5: master TSV
+with open(out_tsv, "w", newline="") as out:
+    w = M["csv"].writer(out, delimiter="\t")
+    w.writerow(["Locus_Tag","Symbol","Old_Locus_Tag","Location","Protein_ID","Product","Pfam"])
+    for r in rows:
+        pid = r["Protein_ID"]
+        hits = sorted(pfam_by_prot.get(pid, set())) if pid not in (None, "", "-") else []
+        pf = ";".join(hits) if hits else "-"
+        w.writerow([r["Locus_Tag"], norm(r["Symbol"]), norm(r["Old_Locus_Tag"]),
+                    format_loc(r["seqid"], r["start"], r["end"], r["strand"]),
+                    norm(pid), norm(r["Product"]), pf])
+
+tmp_master = M["os"].path.join(tmp_job, "cyanoomicsdb_annotate_1.master.tsv")
+M["shutil"].copyfile(out_tsv, tmp_master)
+
+print("Step 5 OK:", out_tsv)
+print("Intermediate master copy:", tmp_master)
+
+print("\nPreview:")
+with open(out_tsv, "r") as fh:
+    for i, line in enumerate(fh):
+        if i > 5:
+            break
+        print(line.rstrip("\n"))
+</execute>
+<observation>NameError("name 'importlib' is not defined")</observation>
+<execute>
+# Final attempt: do not use importlib; do plain imports but ONLY access via a dict.
+import os, csv, shutil
+from collections import defaultdict
+
+M = {"os": os, "csv": csv, "shutil": shutil, "defaultdict": defaultdict}
+
+print("Research log: pipeline using dict-backed module access (no importlib/subprocess/plan)")
+
+gff_path = "benchmark/dataset/CyanoOmicsDB/ncbi_dataset/data/GCF_000009725.1/demo_genomic.gff"
+faa_path = "benchmark/dataset/CyanoOmicsDB/ncbi_dataset/data/GCF_000009725.1/protein.faa"
+
+tmp_root = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb"
+tmp_job  = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb_annotate_1"
+out_tsv  = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/cyanoomicsdb_annotate_1.tsv"
+
+M["os"].makedirs(tmp_root, exist_ok=True)
+M["os"].makedirs(tmp_job, exist_ok=True)
+M["os"].makedirs(M["os"].path.dirname(out_tsv), exist_ok=True)
+assert M["os"].path.exists(gff_path), f"Missing GFF: {gff_path}"
+assert M["os"].path.exists(faa_path), f"Missing FAA: {faa_path}"
+print("Step 1 OK")
+
+def parse_attrs(attr_str):
+    d = {}
+    for part in attr_str.strip().split(";"):
+        if not part:
+            continue
+        if "=" in part:
+            k, v = part.split("=", 1)
+            d[k] = v
+        else:
+            d[part] = ""
+    return d
+
+def norm(x):
+    return x if (x is not None and x != "") else "-"
+
+def format_loc(seqid, start, end, strand):
+    return f"{seqid}:{start}-{end}({strand})"
+
+# Step 2: parse GFF
+gene_by_id = {}
+gene_by_locus = {}
+cds_pending = []
+
+with open(gff_path, "r") as fh:
+    for line in fh:
+        if not line.strip() or line.startswith("#"):
+            continue
+        cols = line.rstrip("\n").split("\t")
+        if len(cols) != 9:
+            continue
+        seqid, source, ftype, start, end, score, strand, phase, attrs = cols
+        a = parse_attrs(attrs)
+
+        if ftype == "gene":
+            locus_tag = a.get("locus_tag") or a.get("Name") or a.get("gene")
+            if not locus_tag:
+                continue
+            gene_id = a.get("ID")
+            symbol = a.get("gene") or a.get("Name")
+            if symbol == locus_tag:
+                symbol = a.get("gene")
+            old = a.get("old_locus_tag")
+
+            row = {
+                "Locus_Tag": locus_tag,
+                "Symbol": norm(symbol) if symbol else "-",
+                "Old_Locus_Tag": norm(old),
+                "seqid": seqid,
+                "start": int(start),
+                "end": int(end),
+                "strand": strand,
+                "Protein_ID": "-",
+                "Product": "-",
+            }
+            if gene_id:
+                gene_by_id[gene_id] = row
+            gene_by_locus[locus_tag] = row
+
+        elif ftype == "CDS":
+            cds_pending.append({
+                "locus": a.get("locus_tag") or a.get("Name") or a.get("gene"),
+                "prot_id": a.get("protein_id"),
+                "product": a.get("product"),
+                "parent": a.get("Parent"),
+                "seqid": seqid,
+                "start": int(start),
+                "end": int(end),
+                "strand": strand
+            })
+
+for cds in cds_pending:
+    linked = False
+    if cds["parent"]:
+        for pid in cds["parent"].split(","):
+            if pid in gene_by_id:
+                r = gene_by_id[pid]
+                if cds["prot_id"]:
+                    r["Protein_ID"] = cds["prot_id"]
+                if cds["product"]:
+                    r["Product"] = cds["product"]
+                linked = True
+    if (not linked) and cds["locus"] and cds["locus"] in gene_by_locus:
+        r = gene_by_locus[cds["locus"]]
+        if cds["prot_id"]:
+            r["Protein_ID"] = cds["prot_id"]
+        if cds["product"]:
+            r["Product"] = cds["product"]
+        linked = True
+    if (not linked) and cds["locus"] and cds["locus"] not in gene_by_locus:
+        gene_by_locus[cds["locus"]] = {
+            "Locus_Tag": cds["locus"],
+            "Symbol": "-",
+            "Old_Locus_Tag": "-",
+            "seqid": cds["seqid"],
+            "start": cds["start"],
+            "end": cds["end"],
+            "strand": cds["strand"],
+            "Protein_ID": cds["prot_id"] or "-",
+            "Product": cds["product"] or "-",
+        }
+
+rows = list(gene_by_locus.values())
+rows.sort(key=lambda r: (r["seqid"], r["start"], r["end"], r["Locus_Tag"]))
+
+genes_tsv = M["os"].path.join(tmp_job, "genes_from_gff.tsv")
+with open(genes_tsv, "w", newline="") as out:
+    w = M["csv"].writer(out, delimiter="\t")
+    w.writerow(["Locus_Tag","Symbol","Old_Locus_Tag","Location","Protein_ID","Product"])
+    for r in rows:
+        w.writerow([r["Locus_Tag"], norm(r["Symbol"]), norm(r["Old_Locus_Tag"]),
+                    format_loc(r["seqid"], r["start"], r["end"], r["strand"]),
+                    norm(r["Protein_ID"]), norm(r["Product"])])
+print("Step 2 OK:", len(rows), "genes; wrote", genes_tsv)
+
+# Step 3: subset FASTA
+prot_seqs = {}
+cur = None
+chunks = []
+with open(faa_path, "r") as fh:
+    for line in fh:
+        line = line.rstrip("\n")
+        if line.startswith(">"):
+            if cur is not None:
+                prot_seqs[cur] = "".join(chunks)
+            cur = line[1:].split()[0]
+            chunks = []
+        else:
+            chunks.append(line.strip())
+    if cur is not None:
+        prot_seqs[cur] = "".join(chunks)
+
+prot_ids = sorted({r["Protein_ID"] for r in rows if r["Protein_ID"] not in (None, "", "-")})
+subset_faa = M["os"].path.join(tmp_job, "proteins_for_interproscan.faa")
+with open(subset_faa, "w") as out:
+    for pid in prot_ids:
+        seq = prot_seqs.get(pid)
+        if not seq:
+            continue
+        out.write(f">{pid}\n")
+        for i in range(0, len(seq), 60):
+            out.write(seq[i:i+60] + "\n")
+print("Step 3 OK: wrote", subset_faa)
+
+# Step 4: find existing InterProScan TSV and parse Pfam
+def find_interproscan_tsv(search_roots):
+    hits = []
+    for root in search_roots:
+        if not root or not M["os"].path.exists(root):
+            continue
+        for dirpath, _, filenames in M["os"].walk(root):
+            for fn in filenames:
+                fpl = fn.lower()
+                if ("interproscan" in fpl or "iprscan" in fpl) and (fpl.endswith(".tsv") or fpl.endswith(".tab")):
+                    hits.append(M["os"].path.join(dirpath, fn))
+    return hits
+
+ipr_tsv = M["os"].path.join(tmp_job, "interproscan.tsv")
+cands = find_interproscan_tsv([tmp_job, tmp_root, M["os"].path.dirname(gff_path)])
+if cands:
+    cands = sorted(cands, key=lambda p: M["os"].path.getsize(p), reverse=True)
+    if M["os"].path.abspath(cands[0]) != M["os"].path.abspath(ipr_tsv):
+        M["shutil"].copyfile(cands[0], ipr_tsv)
+else:
+    open(ipr_tsv, "w").close()
+
+pfam_by_prot = M["defaultdict"](set)
+if M["os"].path.getsize(ipr_tsv) > 0:
+    with open(ipr_tsv, "r") as fh:
+        for line in fh:
+            if not line.strip() or line.startswith("#"):
+                continue
+            p = line.rstrip("\n").split("\t")
+            if len(p) >= 5 and p[3] == "Pfam" and p[4]:
+                pfam_by_prot[p[0]].add(p[4])
+
+pfam_map = M["os"].path.join(tmp_job, "pfam_by_protein.tsv")
+with open(pfam_map, "w", newline="") as out:
+    w = M["csv"].writer(out, delimiter="\t")
+    w.writerow(["Protein_ID","Pfam"])
+    for pid in prot_ids:
+        hits = sorted(pfam_by_prot.get(pid, set()))
+        w.writerow([pid, ";".join(hits) if hits else "-"])
+print("Step 4 OK: wrote", pfam_map, "| Pfam-hit proteins:", sum(1 for pid in prot_ids if pfam_by_prot.get(pid)))
+
+# Step 5: master TSV
+with open(out_tsv, "w", newline="") as out:
+    w = M["csv"].writer(out, delimiter="\t")
+    w.writerow(["Locus_Tag","Symbol","Old_Locus_Tag","Location","Protein_ID","Product","Pfam"])
+    for r in rows:
+        pid = r["Protein_ID"]
+        hits = sorted(pfam_by_prot.get(pid, set())) if pid not in (None, "", "-") else []
+        pf = ";".join(hits) if hits else "-"
+        w.writerow([r["Locus_Tag"], norm(r["Symbol"]), norm(r["Old_Locus_Tag"]),
+                    format_loc(r["seqid"], r["start"], r["end"], r["strand"]),
+                    norm(pid), norm(r["Product"]), pf])
+
+tmp_master = M["os"].path.join(tmp_job, "cyanoomicsdb_annotate_1.master.tsv")
+M["shutil"].copyfile(out_tsv, tmp_master)
+print("Step 5 OK: wrote", out_tsv)
+print("Intermediate master copy:", tmp_master)
+
+print("\nPreview:")
+with open(out_tsv, "r") as fh:
+    for i, line in enumerate(fh):
+        if i > 5:
+            break
+        print(line.rstrip("\n"))
+</execute>
+<observation>NameError("name 'M' is not defined")</observation>
+<solution>
+1. [✗] Create required output/temp directories (failed because this execution environment is repeatedly raising `NameError` for variables/modules that are clearly defined within the same code block; e.g., `plan`, `STATE`, `subprocess`, `os`, and even `M`).
+2. [ ] Parse GFF to extract per-gene basic fields (locus tag, symbol, old locus tag, coordinates, product, protein_id)
+3. [ ] Prepare protein FASTA subset for InterProScan input
+4. [ ] Integrate Pfam accessions from InterProScan
+5. [ ] Write the master TSV file to `/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/cyanoomicsdb_annotate_1.tsv`
+
+I cannot complete the requested extraction + integration because the environment is not executing Python reliably: variables and imports defined in the same `<execute>` block are intermittently “forgotten” mid-block, producing `NameError` exceptions (confirmed with your observations). This prevents any deterministic file parsing/writing.
+
+If you can restart/reset the interactive runtime/kernel (or provide a stable execution session), I can rerun the pipeline in a single self-contained script that:
+- parses `demo_genomic.gff` to produce `genes_from_gff.tsv` in `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/cyanoomicsdb_annotate_1/`
+- generates `proteins_for_interproscan.faa` from `protein.faa`
+- parses an InterProScan TSV (or runs InterProScan if available) to extract Pfam accessions
+- writes the final master TSV exactly in your specified format and path
+
+To proceed, please restart the environment and rerun once; then I will deliver the TSV and all intermediate files in the requested directories. </solution></execute>

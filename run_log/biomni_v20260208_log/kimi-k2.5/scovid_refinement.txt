@@ -1,0 +1,1030 @@
+Load the NCBI GEO single-cell RNA-seq dataset GSE182298 located at `benchmark/dataset/SCovid/GSE182298`.'
+
+Perform Quality Control (QC) filtering with the following strict criteria:
+
+Filter out cells that have fewer than 200 detected genes.
+
+Filter out genes that are detected in fewer than 3 cells.
+
+Calculate the percentage of mitochondrial genes (genes starting with prefix "MT-") for each cell.
+
+Apply the tissue-specific mitochondrial filtering rule: If the input tissue is Liver, remove cells with a mitochondrial gene proportion > 50%. (Note: For non-liver tissues, the threshold would be > 20%).
+
+Save the list of remaining valid cell barcodes to a CSV file named /root/autodl-tmp/biomni_v20260208_pred_results/kimi-k2.5/qc_passed_barcodes.csv (single column, no header).
+
+All temp data should be save in `/root/autodl-tmp/biomni_v20260208_tmp/kimi-k2.5/scovid_refinement`.
+
+Output Format (For Reference)
+```
+<GSMID1>_barcode1
+<GSMID2>_barcode2
+...
+
+I'll help you load and process the GSE182298 single-cell RNA-seq dataset with the specified QC filtering. Let me start by creating a plan and then execute it step by step.
+
+## Plan
+
+1. [ ] Explore the dataset directory structure to understand the data format
+2. [ ] Load the scRNA-seq data using scanpy
+3. [ ] Calculate QC metrics (detected genes per cell, cells per gene, mitochondrial percentage)
+4. [ ] Apply QC filtering: cells with ≥200 genes, genes detected in ≥3 cells
+5. [ ] Apply tissue-specific mitochondrial filtering (>50% for Liver)
+6. [ ] Save the valid cell barcodes to the specified CSV file
+
+Let me start by exploring the dataset:
+
+<execute>
+import os
+import scanpy as sc
+import pandas as pd
+import numpy as np
+
+# Define paths
+data_path = "benchmark/dataset/SCovid/GSE182298"
+tmp_path = "/root/autodl-tmp/biomni_v20260208_tmp/kimi-k2.5/scovid_refinement"
+output_path = "/root/autodl-tmp/biomni_v20260208_pred_results/kimi-k2.5/qc_passed_barcodes.csv"
+
+# Create temp directory if needed
+os.makedirs(tmp_path, exist_ok=True)
+os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+# Explore the dataset directory
+print("Exploring dataset directory structure...")
+for root, dirs, files in os.walk(data_path):
+    level = root.replace(data_path, '').count(os.sep)
+    indent = ' ' * 2 * level
+    print(f'{indent}{os.path.basename(root)}/')
+    subindent = ' ' * 2 * (level + 1)
+    for file in files[:20]:  # Limit to first 20 files per directory
+        print(f'{subindent}{file}')
+    if len(files) > 20:
+        print(f'{subindent}... and {len(files) - 20} more files')
+</execute>
+<observation>Exploring dataset directory structure...
+GSE182298/
+  GSM5526328_91_NxtG_Olfactory_Bulb_2_COVID_MA_20_89-premrna-3prime-filtered-bc-barcodes.tsv.gz
+  GSM5526328_91_NxtG_Olfactory_Bulb_2_COVID_MA_20_89-premrna-3prime-filtered-bc-features.tsv.gz
+  GSM5526328_91_NxtG_Olfactory_Bulb_2_COVID_MA_20_89-premrna-3prime-filtered-bc-matrix.mtx.gz
+  GSM5526329_92_NxtG_Olfactory_Bulb_3_COVID_MA_20_89-premrna-3prime-filtered-bc-barcodes.tsv.gz
+  GSM5526329_92_NxtG_Olfactory_Bulb_3_COVID_MA_20_89-premrna-3prime-filtered-bc-features.tsv.gz
+  GSM5526329_92_NxtG_Olfactory_Bulb_3_COVID_MA_20_89-premrna-3prime-filtered-bc-matrix.mtx.gz
+  GSM5526330_87_NxtG_Frontal_Lobe_1_COVID_MA_20_89-premrna-3prime-filtered-bc-barcodes.tsv.gz
+  GSM5526330_87_NxtG_Frontal_Lobe_1_COVID_MA_20_89-premrna-3prime-filtered-bc-features.tsv.gz
+  GSM5526330_87_NxtG_Frontal_Lobe_1_COVID_MA_20_89-premrna-3prime-filtered-bc-matrix.mtx.gz
+  GSM5526331_88_NxtG_Frontal_Lobe_2_COVID_MA_20_89-premrna-3prime-filtered-bc-barcodes.tsv.gz
+  GSM5526331_88_NxtG_Frontal_Lobe_2_COVID_MA_20_89-premrna-3prime-filtered-bc-features.tsv.gz
+  GSM5526331_88_NxtG_Frontal_Lobe_2_COVID_MA_20_89-premrna-3prime-filtered-bc-matrix.mtx.gz
+  GSM5526332_89_NxtG_Frontal_Lobe_3_COVID_MA_20_89-premrna-3prime-filtered-bc-barcodes.tsv.gz
+  GSM5526332_89_NxtG_Frontal_Lobe_3_COVID_MA_20_89-premrna-3prime-filtered-bc-features.tsv.gz
+  GSM5526332_89_NxtG_Frontal_Lobe_3_COVID_MA_20_89-premrna-3prime-filtered-bc-matrix.mtx.gz
+</observation>
+Now I can see the data structure. The dataset contains 10x Genomics single-cell data from brain tissues (Olfactory Bulb and Frontal Lobe). Let me update the plan and load the data:
+
+## Updated Plan
+
+1. [✓] Explore the dataset directory structure to understand the data format
+2. [ ] Load all scRNA-seq samples using scanpy and concatenate them
+3. [ ] Calculate QC metrics (detected genes per cell, cells per gene, mitochondrial percentage)
+4. [ ] Apply QC filtering: cells with ≥200 genes, genes detected in ≥3 cells
+5. [ ] Apply tissue-specific mitochondrial filtering (>20% for non-liver brain tissue)
+6. [ ] Save the valid cell barcodes to the specified CSV file
+
+<execute>
+import glob
+import re
+
+# Get all sample directories (mtx files)
+mtx_files = sorted(glob.glob(os.path.join(data_path, "*matrix.mtx.gz")))
+print(f"Found {len(mtx_files)} samples:")
+
+# Parse sample information
+samples = []
+for mtx_file in mtx_files:
+    # Extract GSM ID and tissue info from filename
+    filename = os.path.basename(mtx_file)
+    # Pattern: GSM<id>_<sample_num>_NxtG_<Tissue>_<...>-matrix.mtx.gz
+    match = re.match(r'(GSM\d+)_.*_NxtG_([^_]+_[^_]+|[\w_]+)_COVID.*-matrix.mtx.gz', filename)
+    if match:
+        gsm_id = match.group(1)
+        tissue = match.group(2).replace('_', ' ')
+        samples.append({
+            'gsm_id': gsm_id,
+            'tissue': tissue,
+            'mtx_file': mtx_file,
+            'base_name': filename.replace('-matrix.mtx.gz', '')
+        })
+        print(f"  {gsm_id}: {tissue}")
+
+print(f"\nTotal samples to process: {len(samples)}")
+</execute>
+<observation>NameError("name 'os' is not defined")</observation>
+<execute>
+import os
+import glob
+import re
+import scanpy as sc
+import pandas as pd
+import numpy as np
+
+# Define paths
+data_path = "benchmark/dataset/SCovid/GSE182298"
+tmp_path = "/root/autodl-tmp/biomni_v20260208_tmp/kimi-k2.5/scovid_refinement"
+output_path = "/root/autodl-tmp/biomni_v20260208_pred_results/kimi-k2.5/qc_passed_barcodes.csv"
+
+# Create temp directory if needed
+os.makedirs(tmp_path, exist_ok=True)
+os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+# Get all sample directories (mtx files)
+mtx_files = sorted(glob.glob(os.path.join(data_path, "*matrix.mtx.gz")))
+print(f"Found {len(mtx_files)} samples:")
+
+# Parse sample information
+samples = []
+for mtx_file in mtx_files:
+    # Extract GSM ID and tissue info from filename
+    filename = os.path.basename(mtx_file)
+    # Pattern: GSM<id>_<sample_num>_NxtG_<Tissue>_<...>-matrix.mtx.gz
+    match = re.match(r'(GSM\d+)_.*_NxtG_([^_]+_[^_]+|[\w_]+)_COVID.*-matrix.mtx.gz', filename)
+    if match:
+        gsm_id = match.group(1)
+        tissue = match.group(2).replace('_', ' ')
+        samples.append({
+            'gsm_id': gsm_id,
+            'tissue': tissue,
+            'mtx_file': mtx_file,
+            'base_name': filename.replace('-matrix.mtx.gz', '')
+        })
+        print(f"  {gsm_id}: {tissue}")
+
+print(f"\nTotal samples to process: {len(samples)}")
+</execute>
+<observation>Found 5 samples:
+  GSM5526328: Olfactory Bulb 2
+  GSM5526329: Olfactory Bulb 3
+  GSM5526330: Frontal Lobe 1
+  GSM5526331: Frontal Lobe 2
+  GSM5526332: Frontal Lobe 3
+
+Total samples to process: 5
+</observation>
+Now let me load all the samples and concatenate them into a single AnnData object:
+
+<execute>
+# Load all samples
+print("Loading scRNA-seq data from all samples...")
+adatas = []
+
+for sample in samples:
+    gsm_id = sample['gsm_id']
+    tissue = sample['tissue']
+    base_name = sample['base_name']
+    
+    # Construct file paths
+    mtx_file = sample['mtx_file']
+    features_file = os.path.join(data_path, f"{base_name}-features.tsv.gz")
+    barcodes_file = os.path.join(data_path, f"{base_name}-barcodes.tsv.gz")
+    
+    print(f"\nLoading {gsm_id} ({tissue})...")
+    
+    # Read 10x data
+    adata = sc.read_10x_mtx(
+        data_path,
+        prefix=f"{base_name}-",
+        var_names='gene_symbols',
+        cache=True
+    )
+    
+    # Add metadata
+    adata.obs['GSM_ID'] = gsm_id
+    adata.obs['tissue'] = tissue
+    
+    # Modify cell barcodes to include GSM ID prefix
+    adata.obs_names = [f"{gsm_id}_{bc}" for bc in adata.obs_names]
+    
+    print(f"  Shape: {adata.shape}")
+    adatas.append(adata)
+
+# Concatenate all samples
+print("\nConcatenating all samples...")
+adata = sc.concat(adatas, axis=0, join='outer', merge='same')
+print(f"Combined dataset shape: {adata.shape}")
+print(f"Total cells: {adata.n_obs}")
+print(f"Total genes: {adata.n_vars}")
+
+# Save raw data to temp
+adata.raw = adata.copy()
+adata.write(os.path.join(tmp_path, "combined_raw.h5ad"))
+print(f"\nRaw data saved to {tmp_path}/combined_raw.h5ad")
+</execute>
+<observation>NameError("name 'samples' is not defined")</observation>
+Let me run the complete workflow together to maintain variables:
+
+<execute>
+import os
+import glob
+import re
+import scanpy as sc
+import pandas as pd
+import numpy as np
+
+# Define paths
+data_path = "benchmark/dataset/SCovid/GSE182298"
+tmp_path = "/root/autodl-tmp/biomni_v20260208_tmp/kimi-k2.5/scovid_refinement"
+output_path = "/root/autodl-tmp/biomni_v20260208_pred_results/kimi-k2.5/qc_passed_barcodes.csv"
+
+# Create temp directory if needed
+os.makedirs(tmp_path, exist_ok=True)
+os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+# Get all sample directories (mtx files)
+mtx_files = sorted(glob.glob(os.path.join(data_path, "*matrix.mtx.gz")))
+print(f"Found {len(mtx_files)} samples:")
+
+# Parse sample information
+samples = []
+for mtx_file in mtx_files:
+    # Extract GSM ID and tissue info from filename
+    filename = os.path.basename(mtx_file)
+    # Pattern: GSM<id>_<sample_num>_NxtG_<Tissue>_<...>-matrix.mtx.gz
+    match = re.match(r'(GSM\d+)_.*_NxtG_([^_]+_[^_]+|[\w_]+)_COVID.*-matrix.mtx.gz', filename)
+    if match:
+        gsm_id = match.group(1)
+        tissue = match.group(2).replace('_', ' ')
+        samples.append({
+            'gsm_id': gsm_id,
+            'tissue': tissue,
+            'mtx_file': mtx_file,
+            'base_name': filename.replace('-matrix.mtx.gz', '')
+        })
+        print(f"  {gsm_id}: {tissue}")
+
+print(f"\nTotal samples to process: {len(samples)}")
+
+# Load all samples
+print("\n" + "="*60)
+print("Loading scRNA-seq data from all samples...")
+print("="*60)
+adatas = []
+
+for sample in samples:
+    gsm_id = sample['gsm_id']
+    tissue = sample['tissue']
+    base_name = sample['base_name']
+    
+    # Construct file paths
+    mtx_file = sample['mtx_file']
+    features_file = os.path.join(data_path, f"{base_name}-features.tsv.gz")
+    barcodes_file = os.path.join(data_path, f"{base_name}-barcodes.tsv.gz")
+    
+    print(f"\nLoading {gsm_id} ({tissue})...")
+    
+    # Read 10x data
+    adata = sc.read_10x_mtx(
+        data_path,
+        prefix=f"{base_name}-",
+        var_names='gene_symbols',
+        cache=True
+    )
+    
+    # Add metadata
+    adata.obs['GSM_ID'] = gsm_id
+    adata.obs['tissue'] = tissue
+    
+    # Modify cell barcodes to include GSM ID prefix
+    adata.obs_names = [f"{gsm_id}_{bc}" for bc in adata.obs_names]
+    
+    print(f"  Shape: {adata.shape}")
+    adatas.append(adata)
+
+# Concatenate all samples
+print("\n" + "="*60)
+print("Concatenating all samples...")
+print("="*60)
+adata = sc.concat(adatas, axis=0, join='outer', merge='same')
+print(f"Combined dataset shape: {adata.shape}")
+print(f"Total cells: {adata.n_obs}")
+print(f"Total genes: {adata.n_vars}")
+
+# Save raw data to temp
+adata.write(os.path.join(tmp_path, "combined_raw.h5ad"))
+print(f"\nRaw data saved to {tmp_path}/combined_raw.h5ad")
+</execute>
+<observation>NameError("name 'gsm_id' is not defined")</observation>
+Let me run the entire workflow in a single code block:
+
+<execute>
+import os
+import glob
+import re
+import scanpy as sc
+import pandas as pd
+import numpy as np
+
+# Define paths
+data_path = "benchmark/dataset/SCovid/GSE182298"
+tmp_path = "/root/autodl-tmp/biomni_v20260208_tmp/kimi-k2.5/scovid_refinement"
+output_path = "/root/autodl-tmp/biomni_v20260208_pred_results/kimi-k2.5/qc_passed_barcodes.csv"
+
+# Create temp directory if needed
+os.makedirs(tmp_path, exist_ok=True)
+os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+# Get all sample directories (mtx files)
+mtx_files = sorted(glob.glob(os.path.join(data_path, "*matrix.mtx.gz")))
+print(f"Found {len(mtx_files)} samples:")
+
+# Parse sample information
+samples = []
+for mtx_file in mtx_files:
+    filename = os.path.basename(mtx_file)
+    match = re.match(r'(GSM\d+)_.*_NxtG_([^_]+_[^_]+|[\w_]+)_COVID.*-matrix.mtx.gz', filename)
+    if match:
+        gsm_id = match.group(1)
+        tissue = match.group(2).replace('_', ' ')
+        samples.append({
+            'gsm_id': gsm_id,
+            'tissue': tissue,
+            'mtx_file': mtx_file,
+            'base_name': filename.replace('-matrix.mtx.gz', '')
+        })
+        print(f"  {gsm_id}: {tissue}")
+
+print(f"\nTotal samples to process: {len(samples)}")
+
+# Load all samples
+print("\n" + "="*60)
+print("Loading scRNA-seq data from all samples...")
+print("="*60)
+adatas = []
+
+for sample_info in samples:
+    gsm = sample_info['gsm_id']
+    tiss = sample_info['tissue']
+    base = sample_info['base_name']
+    
+    print(f"\nLoading {gsm} ({tiss})...")
+    
+    adata = sc.read_10x_mtx(
+        data_path,
+        prefix=f"{base}-",
+        var_names='gene_symbols',
+        cache=True
+    )
+    
+    adata.obs['GSM_ID'] = gsm
+    adata.obs['tissue'] = tiss
+    adata.obs_names = [f"{gsm}_{bc}" for bc in adata.obs_names]
+    
+    print(f"  Shape: {adata.shape}")
+    adatas.append(adata)
+
+# Concatenate all samples
+print("\n" + "="*60)
+print("Concatenating all samples...")
+print("="*60)
+adata_combined = sc.concat(adatas, axis=0, join='outer', merge='same')
+print(f"Combined dataset shape: {adata_combined.shape}")
+print(f"Total cells: {adata_combined.n_obs}")
+print(f"Total genes: {adata_combined.n_vars}")
+
+# Calculate QC metrics
+print("\n" + "="*60)
+print("Calculating QC metrics...")
+print("="*60)
+
+# Calculate mitochondrial gene percentage
+adata_combined.var['mt'] = adata_combined.var_names.str.startswith('MT-')
+sc.pp.calculate_qc_metrics(adata_combined, qc_vars=['mt'], percent_top=None, log1p=False, inplace=True)
+
+print(f"\nQC Metrics Summary:")
+print(f"  Total cells: {adata_combined.n_obs}")
+print(f"  Total genes: {adata_combined.n_vars}")
+print(f"  n_genes_by_counts (min, max): {adata_combined.obs['n_genes_by_counts'].min():.0f}, {adata_combined.obs['n_genes_by_counts'].max():.0f}")
+print(f"  pct_counts_mt (min, max): {adata_combined.obs['pct_counts_mt'].min():.2f}%, {adata_combined.obs['pct_counts_mt'].max():.2f}%")
+print(f"  Cells with MT genes: {(adata_combined.obs['pct_counts_mt'] > 0).sum()}")
+
+# Apply QC filtering
+print("\n" + "="*60)
+print("Applying QC filtering...")
+print("="*60)
+
+# Filter 1: Remove cells with fewer than 200 detected genes
+print(f"\nFilter 1: Cells with < 200 detected genes")
+cells_before = adata_combined.n_obs
+adata_filtered = adata_combined[adata_combined.obs['n_genes_by_counts'] >= 200, :].copy()
+cells_after_genes = adata_filtered.n_obs
+print(f"  Cells before: {cells_before}")
+print(f"  Cells after: {cells_after_genes}")
+print(f"  Removed: {cells_before - cells_after_genes}")
+
+# Filter 2: Remove genes detected in fewer than 3 cells
+print(f"\nFilter 2: Genes detected in < 3 cells")
+genes_before = adata_filtered.n_vars
+sc.pp.filter_genes(adata_filtered, min_cells=3)
+genes_after = adata_filtered.n_vars
+print(f"  Genes before: {genes_before}")
+print(f"  Genes after: {genes_after}")
+print(f"  Removed: {genes_before - genes_after}")
+
+# Filter 3: Mitochondrial percentage filtering
+# Check tissue type - these are brain tissues (Olfactory Bulb and Frontal Lobe), not Liver
+# So we use > 20% threshold
+print(f"\nFilter 3: Mitochondrial percentage filtering")
+print(f"  Tissue types in data: {adata_filtered.obs['tissue'].unique()}")
+is_liver = any('Liver' in str(t) for t in adata_filtered.obs['tissue'].unique())
+mt_threshold = 50 if is_liver else 20
+print(f"  Is Liver tissue: {is_liver}")
+print(f"  Using threshold: > {mt_threshold}%")
+
+cells_before_mt = adata_filtered.n_obs
+adata_qc = adata_filtered[adata_filtered.obs['pct_counts_mt'] <= mt_threshold, :].copy()
+cells_after_mt = adata_qc.n_obs
+print(f"  Cells before MT filter: {cells_before_mt}")
+print(f"  Cells after MT filter: {cells_after_mt}")
+print(f"  Removed: {cells_before_mt - cells_after_mt}")
+
+# Summary
+print("\n" + "="*60)
+print("QC Filtering Summary")
+print("="*60)
+print(f"Original cells: {adata_combined.n_obs}")
+print(f"Original genes: {adata_combined.n_vars}")
+print(f"Final cells (QC passed): {adata_qc.n_obs}")
+print(f"Final genes: {adata_qc.n_vars}")
+
+# Save QC passed barcodes
+print("\n" + "="*60)
+print("Saving QC passed barcodes...")
+print("="*60)
+qc_barcodes = adata_qc.obs_names.tolist()
+print(f"Number of QC passed barcodes: {len(qc_barcodes)}")
+print(f"\nFirst 10 barcodes:")
+for bc in qc_barcodes[:10]:
+    print(f"  {bc}")
+
+# Save to CSV (single column, no header)
+barcodes_df = pd.DataFrame(qc_barcodes)
+barcodes_df.to_csv(output_path, index=False, header=False)
+print(f"\nSaved to: {output_path}")
+
+# Save filtered data to temp
+adata_qc.write(os.path.join(tmp_path, "qc_filtered.h5ad"))
+print(f"\nQC filtered data saved to {tmp_path}/qc_filtered.h5ad")
+</execute>
+<observation>NameError("name 'gsm' is not defined")</observation>
+<execute>
+import os
+import glob
+import re
+
+data_path = "benchmark/dataset/SCovid/GSE182298"
+
+# Get all sample files
+mtx_files = sorted(glob.glob(os.path.join(data_path, "*matrix.mtx.gz")))
+print(f"Found {len(mtx_files)} samples")
+
+samples_list = []
+for mtx_file in mtx_files:
+    filename = os.path.basename(mtx_file)
+    match = re.match(r'(GSM\d+)_.*_NxtG_([^_]+_[^_]+|[\w_]+)_COVID.*-matrix.mtx.gz', filename)
+    if match:
+        samples_list.append({
+            'gsm_id': match.group(1),
+            'tissue': match.group(2).replace('_', ' '),
+            'base_name': filename.replace('-matrix.mtx.gz', '')
+        })
+        print(f"  {match.group(1)}: {match.group(2).replace('_', ' ')}")
+
+print(f"\nTotal samples: {len(samples_list)}")
+</execute>
+<observation>Found 5 samples
+  GSM5526328: Olfactory Bulb 2
+  GSM5526329: Olfactory Bulb 3
+  GSM5526330: Frontal Lobe 1
+  GSM5526331: Frontal Lobe 2
+  GSM5526332: Frontal Lobe 3
+
+Total samples: 5
+</observation>
+<execute>
+import scanpy as sc
+import pandas as pd
+import numpy as np
+
+# Define paths
+tmp_path = "/root/autodl-tmp/biomni_v20260208_tmp/kimi-k2.5/scovid_refinement"
+output_path = "/root/autodl-tmp/biomni_v20260208_pred_results/kimi-k2.5/qc_passed_barcodes.csv"
+
+os.makedirs(tmp_path, exist_ok=True)
+os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+print("Loading scRNA-seq data from all samples...")
+
+adatas = []
+for idx, sample_info in enumerate(samples_list):
+    current_gsm = sample_info['gsm_id']
+    current_tissue = sample_info['tissue']
+    current_base = sample_info['base_name']
+    
+    print(f"\n[{idx+1}/{len(samples_list)}] Loading {current_gsm} ({current_tissue})...")
+    
+    adata_sample = sc.read_10x_mtx(
+        data_path,
+        prefix=f"{current_base}-",
+        var_names='gene_symbols',
+        cache=True
+    )
+    
+    adata_sample.obs['GSM_ID'] = current_gsm
+    adata_sample.obs['tissue'] = current_tissue
+    adata_sample.obs_names = [f"{current_gsm}_{bc}" for bc in adata_sample.obs_names]
+    
+    print(f"  Shape: {adata_sample.shape}")
+    adatas.append(adata_sample)
+
+print(f"\n{'='*60}")
+print("Concatenating all samples...")
+print(f"{'='*60}")
+
+adata_merged = sc.concat(adatas, axis=0, join='outer', merge='same')
+print(f"Combined dataset shape: {adata_merged.shape}")
+print(f"Total cells: {adata_merged.n_obs}")
+print(f"Total genes: {adata_merged.n_vars}")
+</execute>
+<observation>NameError("name 'os' is not defined")</observation>
+<execute>
+import os
+import glob
+import re
+import scanpy as sc
+import pandas as pd
+import numpy as np
+
+# Define paths
+data_path = "benchmark/dataset/SCovid/GSE182298"
+tmp_path = "/root/autodl-tmp/biomni_v20260208_tmp/kimi-k2.5/scovid_refinement"
+output_path = "/root/autodl-tmp/biomni_v20260208_pred_results/kimi-k2.5/qc_passed_barcodes.csv"
+
+# Create directories
+os.makedirs(tmp_path, exist_ok=True)
+os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+# Get all samples
+mtx_files = sorted(glob.glob(os.path.join(data_path, "*matrix.mtx.gz")))
+samples_list = []
+for mtx_file in mtx_files:
+    filename = os.path.basename(mtx_file)
+    match = re.match(r'(GSM\d+)_.*_NxtG_([^_]+_[^_]+|[\w_]+)_COVID.*-matrix.mtx.gz', filename)
+    if match:
+        samples_list.append({
+            'gsm_id': match.group(1),
+            'tissue': match.group(2).replace('_', ' '),
+            'base_name': filename.replace('-matrix.mtx.gz', '')
+        })
+
+print(f"Found {len(samples_list)} samples")
+print("="*60)
+
+# Load all samples
+adatas = []
+for sample_info in samples_list:
+    gsm = sample_info['gsm_id']
+    tissue = sample_info['tissue']
+    base = sample_info['base_name']
+    
+    print(f"Loading {gsm} ({tissue})...")
+    
+    adata = sc.read_10x_mtx(
+        data_path,
+        prefix=f"{base}-",
+        var_names='gene_symbols',
+        cache=True
+    )
+    
+    adata.obs['GSM_ID'] = gsm
+    adata.obs['tissue'] = tissue
+    adata.obs_names = [f"{gsm}_{bc}" for bc in adata.obs_names]
+    
+    print(f"  Shape: {adata.shape}")
+    adatas.append(adata)
+
+# Concatenate
+print("="*60)
+print("Concatenating all samples...")
+adata_all = sc.concat(adatas, axis=0, join='outer', merge='same')
+print(f"Combined dataset shape: {adata_all.shape}")
+</execute>
+<observation>NameError("name 'gsm' is not defined")</observation>
+<execute>
+import os
+import glob
+import re
+import scanpy as sc
+import pandas as pd
+import numpy as np
+
+data_path = "benchmark/dataset/SCovid/GSE182298"
+tmp_path = "/root/autodl-tmp/biomni_v20260208_tmp/kimi-k2.5/scovid_refinement"
+output_path = "/root/autodl-tmp/biomni_v20260208_pred_results/kimi-k2.5/qc_passed_barcodes.csv"
+
+os.makedirs(tmp_path, exist_ok=True)
+os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+mtx_files = sorted(glob.glob(os.path.join(data_path, "*matrix.mtx.gz")))
+print("Parsing sample information...")
+
+samples_data = []
+for mtx in mtx_files:
+    fname = os.path.basename(mtx)
+    m = re.match(r'(GSM\d+)_.*_NxtG_([^_]+_[^_]+|[\w_]+)_COVID.*-matrix.mtx.gz', fname)
+    if m:
+        samples_data.append({
+            'gsm': m.group(1),
+            'tiss': m.group(2).replace('_', ' '),
+            'base': fname.replace('-matrix.mtx.gz', '')
+        })
+        print(f"  {m.group(1)}: {m.group(2).replace('_', ' ')}")
+
+print(f"\nLoading {len(samples_data)} samples...")
+adatas_list = []
+
+for i in range(len(samples_data)):
+    s = samples_data[i]
+    print(f"\n[{i+1}/{len(samples_data)}] Loading {s['gsm']} ({s['tiss']})...")
+    
+    ad = sc.read_10x_mtx(data_path, prefix=f"{s['base']}-", var_names='gene_symbols', cache=True)
+    ad.obs['GSM_ID'] = s['gsm']
+    ad.obs['tissue'] = s['tiss']
+    ad.obs_names = [f"{s['gsm']}_{b}" for b in ad.obs_names]
+    
+    print(f"  Shape: {ad.shape}")
+    adatas_list.append(ad)
+
+print("\nConcatenating samples...")
+adata_combined = sc.concat(adatas_list, axis=0, join='outer', merge='same')
+print(f"Combined shape: {adata_combined.shape}")
+print(f"Cells: {adata_combined.n_obs}, Genes: {adata_combined.n_vars}")
+</execute>
+<observation>NameError("name 's' is not defined")</observation>
+<execute>
+import os
+import glob
+import re
+import scanpy as sc
+import pandas as pd
+import numpy as np
+
+data_path = "benchmark/dataset/SCovid/GSE182298"
+tmp_path = "/root/autodl-tmp/biomni_v20260208_tmp/kimi-k2.5/scovid_refinement"
+output_path = "/root/autodl-tmp/biomni_v20260208_pred_results/kimi-k2.5/qc_passed_barcodes.csv"
+
+os.makedirs(tmp_path, exist_ok=True)
+os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+# Load first sample
+print("Loading GSM5526328...")
+adata1 = sc.read_10x_mtx(data_path, prefix="GSM5526328_91_NxtG_Olfactory_Bulb_2_COVID_MA_20_89-premrna-3prime-filtered-bc-", var_names='gene_symbols', cache=True)
+adata1.obs['GSM_ID'] = 'GSM5526328'
+adata1.obs['tissue'] = 'Olfactory Bulb 2'
+adata1.obs_names = ['GSM5526328_' + b for b in adata1.obs_names]
+print(f"  Shape: {adata1.shape}")
+
+print("Loading GSM5526329...")
+adata2 = sc.read_10x_mtx(data_path, prefix="GSM5526329_92_NxtG_Olfactory_Bulb_3_COVID_MA_20_89-premrna-3prime-filtered-bc-", var_names='gene_symbols', cache=True)
+adata2.obs['GSM_ID'] = 'GSM5526329'
+adata2.obs['tissue'] = 'Olfactory Bulb 3'
+adata2.obs_names = ['GSM5526329_' + b for b in adata2.obs_names]
+print(f"  Shape: {adata2.shape}")
+
+print("Loading GSM5526330...")
+adata3 = sc.read_10x_mtx(data_path, prefix="GSM5526330_87_NxtG_Frontal_Lobe_1_COVID_MA_20_89-premrna-3prime-filtered-bc-", var_names='gene_symbols', cache=True)
+adata3.obs['GSM_ID'] = 'GSM5526330'
+adata3.obs['tissue'] = 'Frontal Lobe 1'
+adata3.obs_names = ['GSM5526330_' + b for b in adata3.obs_names]
+print(f"  Shape: {adata3.shape}")
+
+print("Loading GSM5526331...")
+adata4 = sc.read_10x_mtx(data_path, prefix="GSM5526331_88_NxtG_Frontal_Lobe_2_COVID_MA_20_89-premrna-3prime-filtered-bc-", var_names='gene_symbols', cache=True)
+adata4.obs['GSM_ID'] = 'GSM5526331'
+adata4.obs['tissue'] = 'Frontal Lobe 2'
+adata4.obs_names = ['GSM5526331_' + b for b in adata4.obs_names]
+print(f"  Shape: {adata4.shape}")
+
+print("Loading GSM5526332...")
+adata5 = sc.read_10x_mtx(data_path, prefix="GSM5526332_89_NxtG_Frontal_Lobe_3_COVID_MA_20_89-premrna-3prime-filtered-bc-", var_names='gene_symbols', cache=True)
+adata5.obs['GSM_ID'] = 'GSM5526332'
+adata5.obs['tissue'] = 'Frontal Lobe 3'
+adata5.obs_names = ['GSM5526332_' + b for b in adata5.obs_names]
+print(f"  Shape: {adata5.shape}")
+
+print("\nConcatenating all samples...")
+adata_all = sc.concat([adata1, adata2, adata3, adata4, adata5], axis=0, join='outer', merge='same')
+print(f"Combined shape: {adata_all.shape}")
+print(f"Cells: {adata_all.n_obs}, Genes: {adata_all.n_vars}")
+</execute>
+<observation>Loading GSM5526328...
+  Shape: (12730, 33538)
+Loading GSM5526329...
+  Shape: (11846, 33538)
+Loading GSM5526330...
+  Shape: (8869, 33538)
+Loading GSM5526331...
+  Shape: (9865, 33538)
+Loading GSM5526332...
+  Shape: (7783, 33538)
+
+Concatenating all samples...
+Combined shape: (51093, 33538)
+Cells: 51093, Genes: 33538
+</observation>
+Now let me calculate QC metrics and apply the filtering:
+
+<execute>
+print("="*60)
+print("Calculating QC metrics...")
+print("="*60)
+
+# Calculate mitochondrial gene percentage
+adata_all.var['mt'] = adata_all.var_names.str.startswith('MT-')
+sc.pp.calculate_qc_metrics(adata_all, qc_vars=['mt'], percent_top=None, log1p=False, inplace=True)
+
+print(f"\nQC Metrics Summary:")
+print(f"  Total cells: {adata_all.n_obs}")
+print(f"  Total genes: {adata_all.n_vars}")
+print(f"  n_genes_by_counts - min: {adata_all.obs['n_genes_by_counts'].min():.0f}, max: {adata_all.obs['n_genes_by_counts'].max():.0f}")
+print(f"  pct_counts_mt - min: {adata_all.obs['pct_counts_mt'].min():.2f}%, max: {adata_all.obs['pct_counts_mt'].max():.2f}%")
+print(f"  Cells with MT genes > 0: {(adata_all.obs['pct_counts_mt'] > 0).sum()}")
+
+# Show distribution
+print(f"\n  n_genes_by_counts distribution:")
+print(adata_all.obs['n_genes_by_counts'].describe())
+print(f"\n  pct_counts_mt distribution:")
+print(adata_all.obs['pct_counts_mt'].describe())
+</execute>
+<observation>NameError("name 'adata_all' is not defined")</observation>
+<execute>
+import os
+import glob
+import re
+import scanpy as sc
+import pandas as pd
+import numpy as np
+
+data_path = "benchmark/dataset/SCovid/GSE182298"
+tmp_path = "/root/autodl-tmp/biomni_v20260208_tmp/kimi-k2.5/scovid_refinement"
+output_path = "/root/autodl-tmp/biomni_v20260208_pred_results/kimi-k2.5/qc_passed_barcodes.csv"
+
+os.makedirs(tmp_path, exist_ok=True)
+os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+print("="*60)
+print("STEP 1: Loading all scRNA-seq samples")
+print("="*60)
+
+# Load all 5 samples
+adata1 = sc.read_10x_mtx(data_path, prefix="GSM5526328_91_NxtG_Olfactory_Bulb_2_COVID_MA_20_89-premrna-3prime-filtered-bc-", var_names='gene_symbols', cache=True)
+adata1.obs['GSM_ID'] = 'GSM5526328'
+adata1.obs['tissue'] = 'Olfactory Bulb 2'
+adata1.obs_names = ['GSM5526328_' + b for b in adata1.obs_names]
+print(f"GSM5526328: {adata1.shape}")
+
+adata2 = sc.read_10x_mtx(data_path, prefix="GSM5526329_92_NxtG_Olfactory_Bulb_3_COVID_MA_20_89-premrna-3prime-filtered-bc-", var_names='gene_symbols', cache=True)
+adata2.obs['GSM_ID'] = 'GSM5526329'
+adata2.obs['tissue'] = 'Olfactory Bulb 3'
+adata2.obs_names = ['GSM5526329_' + b for b in adata2.obs_names]
+print(f"GSM5526329: {adata2.shape}")
+
+adata3 = sc.read_10x_mtx(data_path, prefix="GSM5526330_87_NxtG_Frontal_Lobe_1_COVID_MA_20_89-premrna-3prime-filtered-bc-", var_names='gene_symbols', cache=True)
+adata3.obs['GSM_ID'] = 'GSM5526330'
+adata3.obs['tissue'] = 'Frontal Lobe 1'
+adata3.obs_names = ['GSM5526330_' + b for b in adata3.obs_names]
+print(f"GSM5526330: {adata3.shape}")
+
+adata4 = sc.read_10x_mtx(data_path, prefix="GSM5526331_88_NxtG_Frontal_Lobe_2_COVID_MA_20_89-premrna-3prime-filtered-bc-", var_names='gene_symbols', cache=True)
+adata4.obs['GSM_ID'] = 'GSM5526331'
+adata4.obs['tissue'] = 'Frontal Lobe 2'
+adata4.obs_names = ['GSM5526331_' + b for b in adata4.obs_names]
+print(f"GSM5526331: {adata4.shape}")
+
+adata5 = sc.read_10x_mtx(data_path, prefix="GSM5526332_89_NxtG_Frontal_Lobe_3_COVID_MA_20_89-premrna-3prime-filtered-bc-", var_names='gene_symbols', cache=True)
+adata5.obs['GSM_ID'] = 'GSM5526332'
+adata5.obs['tissue'] = 'Frontal Lobe 3'
+adata5.obs_names = ['GSM5526332_' + b for b in adata5.obs_names]
+print(f"GSM5526332: {adata5.shape}")
+
+# Concatenate
+adata = sc.concat([adata1, adata2, adata3, adata4, adata5], axis=0, join='outer', merge='same')
+print(f"\nCombined dataset: {adata.shape}")
+
+print("\n" + "="*60)
+print("STEP 2: Calculating QC metrics")
+print("="*60)
+
+# Calculate mitochondrial gene percentage
+adata.var['mt'] = adata.var_names.str.startswith('MT-')
+sc.pp.calculate_qc_metrics(adata, qc_vars=['mt'], percent_top=None, log1p=False, inplace=True)
+
+print(f"QC Metrics:")
+print(f"  n_genes_by_counts - min: {adata.obs['n_genes_by_counts'].min():.0f}, max: {adata.obs['n_genes_by_counts'].max():.0f}")
+print(f"  pct_counts_mt - min: {adata.obs['pct_counts_mt'].min():.2f}%, max: {adata.obs['pct_counts_mt'].max():.2f}%")
+
+print("\n" + "="*60)
+print("STEP 3: Applying QC filtering")
+print("="*60)
+
+# Filter 1: Remove cells with fewer than 200 detected genes
+print(f"\nFilter 1: Cells with >= 200 detected genes")
+n_before = adata.n_obs
+adata = adata[adata.obs['n_genes_by_counts'] >= 200, :].copy()
+print(f"  Before: {n_before}, After: {adata.n_obs}, Removed: {n_before - adata.n_obs}")
+
+# Filter 2: Remove genes detected in fewer than 3 cells
+print(f"\nFilter 2: Genes detected in >= 3 cells")
+g_before = adata.n_vars
+sc.pp.filter_genes(adata, min_cells=3)
+print(f"  Before: {g_before}, After: {adata.n_vars}, Removed: {g_before - adata.n_vars}")
+
+# Filter 3: Mitochondrial percentage filtering
+print(f"\nFilter 3: Mitochondrial percentage filtering")
+tissues = adata.obs['tissue'].unique()
+print(f"  Tissues: {list(tissues)}")
+is_liver = any('Liver' in str(t) for t in tissues)
+mt_threshold = 50 if is_liver else 20
+print(f"  Is Liver: {is_liver}, Threshold: <= {mt_threshold}%")
+
+n_before_mt = adata.n_obs
+adata = adata[adata.obs['pct_counts_mt'] <= mt_threshold, :].copy()
+print(f"  Before: {n_before_mt}, After: {adata.n_obs}, Removed: {n_before_mt - adata.n_obs}")
+
+print("\n" + "="*60)
+print("STEP 4: Final Summary")
+print("="*60)
+print(f"Original cells: 51093, Final cells: {adata.n_obs}")
+print(f"Original genes: 33538, Final genes: {adata.n_vars}")
+
+print("\n" + "="*60)
+print("STEP 5: Saving QC passed barcodes")
+print("="*60)
+
+qc_barcodes = adata.obs_names.tolist()
+print(f"Total QC passed barcodes: {len(qc_barcodes)}")
+print(f"\nFirst 10 barcodes:")
+for bc in qc_barcodes[:10]:
+    print(f"  {bc}")
+print(f"\nLast 5 barcodes:")
+for bc in qc_barcodes[-5:]:
+    print(f"  {bc}")
+
+# Save to CSV (single column, no header)
+pd.DataFrame(qc_barcodes).to_csv(output_path, index=False, header=False)
+print(f"\nSaved to: {output_path}")
+
+# Verify saved file
+saved_df = pd.read_csv(output_path, header=None)
+print(f"Verification - lines in saved file: {len(saved_df)}")
+</execute>
+<observation>============================================================
+STEP 1: Loading all scRNA-seq samples
+============================================================
+GSM5526328: (12730, 33538)
+GSM5526329: (11846, 33538)
+GSM5526330: (8869, 33538)
+GSM5526331: (9865, 33538)
+GSM5526332: (7783, 33538)
+
+Combined dataset: (51093, 33538)
+
+============================================================
+STEP 2: Calculating QC metrics
+============================================================
+QC Metrics:
+  n_genes_by_counts - min: 112, max: 10721
+  pct_counts_mt - min: 0.35%, max: 94.56%
+
+============================================================
+STEP 3: Applying QC filtering
+============================================================
+
+Filter 1: Cells with >= 200 detected genes
+  Before: 51093, After: 51082, Removed: 11
+
+Filter 2: Genes detected in >= 3 cells
+  Before: 33538, After: 26530, Removed: 7008
+
+Filter 3: Mitochondrial percentage filtering
+  Tissues: ['Olfactory Bulb 2', 'Olfactory Bulb 3', 'Frontal Lobe 1', 'Frontal Lobe 2', 'Frontal Lobe 3']
+  Is Liver: False, Threshold: <= 20%
+  Before: 51082, After: 39333, Removed: 11749
+
+============================================================
+STEP 4: Final Summary
+============================================================
+Original cells: 51093, Final cells: 39333
+Original genes: 33538, Final genes: 26530
+
+============================================================
+STEP 5: Saving QC passed barcodes
+============================================================
+Total QC passed barcodes: 39333
+
+First 10 barcodes:
+  GSM5526328_AAACCCATCAGACCTA-1
+  GSM5526328_AAACCCATCATCGTAG-1
+  GSM5526328_AAACCCATCCATACAG-1
+  GSM5526328_AAACCCATCGTTGTGA-1
+  GSM5526328_AAACCCATCTAGACCA-1
+  GSM5526328_AAACGAACAAAGCAAT-1
+  GSM5526328_AAACGAACAACCGACC-1
+  GSM5526328_AAACGAACAATCGCAT-1
+  GSM5526328_AAACGAACAGTCTCTC-1
+  GSM5526328_AAACGAACATGACAGG-1
+
+Last 5 barcodes:
+  GSM5526332_TTTGTTGAGTGGCAGT-1
+  GSM5526332_TTTGTTGCAAACTCTG-1
+  GSM5526332_TTTGTTGCACTGATTG-1
+  GSM5526332_TTTGTTGTCTAGCCTC-1
+  GSM5526332_TTTGTTGTCTGGACTA-1
+
+Saved to: /root/autodl-tmp/biomni_v20260208_pred_results/kimi-k2.5/qc_passed_barcodes.csv
+Verification - lines in saved file: 39333
+</observation>
+<execute>
+# Final verification and summary
+import pandas as pd
+
+output_path = "/root/autodl-tmp/biomni_v20260208_pred_results/kimi-k2.5/qc_passed_barcodes.csv"
+
+# Read and verify the output file
+barcodes = pd.read_csv(output_path, header=None)
+print("="*60)
+print("FINAL VERIFICATION")
+print("="*60)
+print(f"Output file: {output_path}")
+print(f"Number of QC-passed barcodes: {len(barcodes)}")
+print(f"Number of columns: {len(barcodes.columns)}")
+print(f"Has header: False")
+print(f"\nSample barcodes (first 10):")
+print(barcodes[0].head(10).tolist())
+print(f"\nSample barcodes (last 5):")
+print(barcodes[0].tail(5).tolist())
+
+# Check barcode format (should be GSMXXXXX_barcode)
+print(f"\nBarcode format verification:")
+print(f"  All start with GSM: {all(b.startswith('GSM') for b in barcodes[0])}")
+sample_gsms = set(b.split('_')[0] for b in barcodes[0])
+print(f"  GSM IDs in output: {sorted(sample_gsms)}")
+</execute>
+<observation>============================================================
+FINAL VERIFICATION
+============================================================
+Output file: /root/autodl-tmp/biomni_v20260208_pred_results/kimi-k2.5/qc_passed_barcodes.csv
+Number of QC-passed barcodes: 39333
+Number of columns: 1
+Has header: False
+
+Sample barcodes (first 10):
+['GSM5526328_AAACCCATCAGACCTA-1', 'GSM5526328_AAACCCATCATCGTAG-1', 'GSM5526328_AAACCCATCCATACAG-1', 'GSM5526328_AAACCCATCGTTGTGA-1', 'GSM5526328_AAACCCATCTAGACCA-1', 'GSM5526328_AAACGAACAAAGCAAT-1', 'GSM5526328_AAACGAACAACCGACC-1', 'GSM5526328_AAACGAACAATCGCAT-1', 'GSM5526328_AAACGAACAGTCTCTC-1', 'GSM5526328_AAACGAACATGACAGG-1']
+
+Sample barcodes (last 5):
+['GSM5526332_TTTGTTGAGTGGCAGT-1', 'GSM5526332_TTTGTTGCAAACTCTG-1', 'GSM5526332_TTTGTTGCACTGATTG-1', 'GSM5526332_TTTGTTGTCTAGCCTC-1', 'GSM5526332_TTTGTTGTCTGGACTA-1']
+
+Barcode format verification:
+  All start with GSM: True
+  GSM IDs in output: ['GSM5526328', 'GSM5526329', 'GSM5526330', 'GSM5526331', 'GSM5526332']
+</observation>
+## Summary
+
+The task has been completed successfully. Here are the results:
+
+### Dataset Processing Summary
+
+**Input Data:**
+- GSE182298 dataset with 5 samples from brain tissues:
+  - GSM5526328: Olfactory Bulb 2 (12,730 cells)
+  - GSM5526329: Olfactory Bulb 3 (11,846 cells)
+  - GSM5526330: Frontal Lobe 1 (8,869 cells)
+  - GSM5526331: Frontal Lobe 2 (9,865 cells)
+  - GSM5526332: Frontal Lobe 3 (7,783 cells)
+
+**QC Filtering Applied:**
+1. ✅ **Cell filtering (≥200 genes):** 51,093 → 51,082 cells (11 removed)
+2. ✅ **Gene filtering (≥3 cells):** 33,538 → 26,530 genes (7,008 removed)
+3. ✅ **Mitochondrial filtering (≤20% for non-liver tissue):** 51,082 → 39,333 cells (11,749 removed)
+
+**Final Results:**
+- **QC-passed cells:** 39,333
+- **QC-passed genes:** 26,530
+- **Tissue type:** Brain (Olfactory Bulb & Frontal Lobe) - used 20% mitochondrial threshold
+
+**Output File:**
+- Location: `/root/autodl-tmp/biomni_v20260208_pred_results/kimi-k2.5/qc_passed_barcodes.csv`
+- Format: Single column, no header, barcodes prefixed with GSM ID
+- Example barcodes:
+  - `GSM5526328_AAACCCATCAGACCTA-1`
+  - `GSM5526332_TTTGTTGTCTGGACTA-1`
+
+<solution>
+Successfully loaded and processed the GSE182298 single-cell RNA-seq dataset. Applied strict QC filtering: removed cells with <200 detected genes (11 cells), genes detected in <3 cells (7,008 genes), and cells with >20% mitochondrial genes (11,749 cells, using non-liver threshold). The 39,333 QC-passed cell barcodes have been saved to /root/autodl-tmp/biomni_v20260208_pred_results/kimi-k2.5/qc_passed_barcodes.csv in the required format (single column, no header, GSM_ID prefixed).
+</solution>

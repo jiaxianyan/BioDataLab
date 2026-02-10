@@ -1,0 +1,519 @@
+Extracting information for Biosamples (filter out those without SRA data) in BioProject PRJEB63303 and PRJNA1025946, including host, sample name, collection date and country.
+
+Saving the results into a csv file `/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.1/zover_extract.csv`.
+
+Output format (for reference only):
+SampleName,Host,CollectionDate,Country,BioProject,BioSample
+Bat_throat,Eidolon helvum,2009/03,Ghana,ERP001979,SAMEA1573860
+
+All intermediate results should be saved in `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/zover_extract` directory.
+
+<execute>
+#!BASH
+echo "Step 1: Plan the workflow"
+cat << 'EOF'
+1. [ ] Create necessary directories for intermediate and final outputs.
+2. [ ] Query ENA/SRA for all runs associated with BioProjects PRJEB63303 and PRJNA1025946.
+3. [ ] Extract the unique BioSample accessions that have at least one SRA/ENA run.
+4. [ ] Retrieve sample-level metadata (host, sample name, collection date, country, BioProject, BioSample) for those BioSamples.
+5. [ ] Clean and normalize the fields (e.g., date format, host field, country) and prepare a clean table.
+6. [ ] Save intermediate raw query results into the tmp directory.
+7. [ ] Save the final merged/cleaned table to the requested CSV path.
+8. [ ] Print a short log of what was done and where files are saved.
+EOF
+
+echo ""
+echo "Step 2: Run a Python script to perform all data retrieval and processing"
+
+python - << 'PYCODE'
+import os
+import sys
+import csv
+import textwrap
+from pathlib import Path
+import urllib.parse
+import requests
+import pandas as pd
+
+# ------------------------------------------------------------------------------
+# Progress plan tracking
+# ------------------------------------------------------------------------------
+plan = [
+    "[ ] 1. Create necessary directories for intermediate and final outputs.",
+    "[ ] 2. Query ENA/SRA for all runs associated with BioProjects PRJEB63303 and PRJNA1025946.",
+    "[ ] 3. Extract the unique BioSample accessions that have at least one SRA/ENA run.",
+    "[ ] 4. Retrieve sample-level metadata (host, sample name, collection date, country, BioProject, BioSample) for those BioSamples.",
+    "[ ] 5. Clean and normalize the fields and prepare a clean table.",
+    "[ ] 6. Save intermediate raw query results into the tmp directory.",
+    "[ ] 7. Save the final merged/cleaned table to the requested CSV path.",
+    "[ ] 8. Print a short log of what was done and where files are saved.",
+]
+
+def print_plan():
+    print("\nCurrent plan status:")
+    for line in plan:
+        print(line)
+    print("")
+
+def mark_step(step_idx, status="✓", note=None):
+    base = plan[step_idx][4:]  # remove leading "[ ] "
+    if note:
+        plan[step_idx] = f"[{status}] {base} ({note})"
+    else:
+        plan[step_idx] = f"[{status}] {base}"
+
+print_plan()
+
+# ------------------------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------------------------
+TMP_DIR = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/zover_extract")
+FINAL_CSV = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.1/zover_extract.csv")
+TMP_DIR.mkdir(parents=True, exist_ok=True)
+FINAL_CSV.parent.mkdir(parents=True, exist_ok=True)
+
+mark_step(0, "✓")
+print_plan()
+
+# ------------------------------------------------------------------------------
+# Helper: ENA query
+# We will use ENA portal API to retrieve run and sample metadata.
+# ------------------------------------------------------------------------------
+ENA_BASE = "https://www.ebi.ac.uk/ena/portal/api/search"
+
+def ena_query(result, fields, query, filename, limit=None):
+    """
+    Query ENA portal API and save tab-delimited output.
+    """
+    params = {
+        "result": result,
+        "fields": ",".join(fields),
+        "query": query,
+        "format": "tsv",
+        "limit": limit if limit is not None else 0,  # 0 means no limit in ENA
+    }
+    url = ENA_BASE
+    print(f"\nQuerying ENA: result={result}, query={query}")
+    print("Requesting URL:", url)
+    r = requests.get(url, params=params)
+    r.raise_for_status()
+    out_path = TMP_DIR / filename
+    with out_path.open("w", encoding="utf-8") as f:
+        f.write(r.text)
+    print(f"Saved ENA result to {out_path} (lines: {len(r.text.splitlines())})")
+    return out_path
+
+# ------------------------------------------------------------------------------
+# Step 2: Query runs for the two BioProjects
+# ------------------------------------------------------------------------------
+try:
+    run_fields = [
+        "run_accession",
+        "study_accession",   # BioProject / ENA Study
+        "sample_accession",  # BioSample
+        "experiment_accession",
+        "scientific_name",
+        "country",
+        "collection_date",
+    ]
+    # ENA uses study_accession for project; PRJEB* and PRJNA* are recognized.
+    runs_prjeb = ena_query(
+        result="read_run",
+        fields=run_fields,
+        query='study_accession="PRJEB63303"',
+        filename="runs_PRJEB63303.tsv",
+        limit=None,
+    )
+    runs_prjna = ena_query(
+        result="read_run",
+        fields=run_fields,
+        query='study_accession="PRJNA1025946"',
+        filename="runs_PRJNA1025946.tsv",
+        limit=None,
+    )
+    mark_step(1, "✓")
+except Exception as e:
+    mark_step(1, "✗", f"failed: {e}")
+    print_plan()
+    raise
+
+print_plan()
+
+# ------------------------------------------------------------------------------
+# Step 3: Extract unique BioSamples with SRA/ENA runs
+# ------------------------------------------------------------------------------
+try:
+    df_runs_prjeb = pd.read_csv(runs_prjeb, sep="\t")
+    df_runs_prjna = pd.read_csv(runs_prjna, sep="\t")
+    print("Loaded runs:")
+    print("PRJEB63303 shape:", df_runs_prjeb.shape)
+    print("PRJNA1025946 shape:", df_runs_prjna.shape)
+
+    df_runs_prjeb["BioProject"] = "PRJEB63303"
+    df_runs_prjna["BioProject"] = "PRJNA1025946"
+
+    df_runs_all = pd.concat([df_runs_prjeb, df_runs_prjna], ignore_index=True)
+    df_runs_all = df_runs_all.dropna(subset=["sample_accession"])
+    df_runs_all = df_runs_all.rename(columns={"sample_accession": "BioSample"})
+    biosamples_with_runs = sorted(df_runs_all["BioSample"].unique().tolist())
+    print(f"Total unique BioSamples with runs: {len(biosamples_with_runs)}")
+    biosample_list_file = TMP_DIR / "biosamples_with_runs.txt"
+    with biosample_list_file.open("w") as f:
+        for bs in biosamples_with_runs:
+            f.write(bs + "\n")
+    print(f"Saved BioSample list to {biosample_list_file}")
+    mark_step(2, "✓")
+except Exception as e:
+    mark_step(2, "✗", f"failed: {e}")
+    print_plan()
+    raise
+
+print_plan()
+
+# ------------------------------------------------------------------------------
+# Step 4: Retrieve sample-level metadata
+# ------------------------------------------------------------------------------
+try:
+    # We'll query ENA sample API; BioSample accs are under "sample_accession"
+    sample_fields = [
+        "sample_accession",
+        "secondary_sample_accession",
+        "sample_alias",
+        "scientific_name",
+        "collection_date",
+        "country",
+        "host",
+        "sample_title",
+        "study_accession",
+    ]
+
+    # ENA API query length is limited; use a query by study_accession instead of
+    # listing all BioSample accessions.
+    samples_prjeb = ena_query(
+        result="sample",
+        fields=sample_fields,
+        query='study_accession="PRJEB63303"',
+        filename="samples_PRJEB63303.tsv",
+        limit=None,
+    )
+    samples_prjna = ena_query(
+        result="sample",
+        fields=sample_fields,
+        query='study_accession="PRJNA1025946"',
+        filename="samples_PRJNA1025946.tsv",
+        limit=None,
+    )
+
+    df_samp_prjeb = pd.read_csv(samples_prjeb, sep="\t")
+    df_samp_prjna = pd.read_csv(samples_prjna, sep="\t")
+    df_samp_prjeb["BioProject"] = "PRJEB63303"
+    df_samp_prjna["BioProject"] = "PRJNA1025946"
+    df_samples_all = pd.concat([df_samp_prjeb, df_samp_prjna], ignore_index=True)
+    df_samples_all = df_samples_all.rename(columns={"sample_accession": "BioSample"})
+    print("Samples combined shape:", df_samples_all.shape)
+
+    # Filter to only those with runs
+    df_samples_all = df_samples_all[df_samples_all["BioSample"].isin(biosamples_with_runs)]
+    print("Samples with runs shape:", df_samples_all.shape)
+
+    # Save intermediate
+    df_samples_all.to_csv(TMP_DIR / "samples_all_with_runs_raw.tsv", sep="\t", index=False)
+    mark_step(3, "✓")
+except Exception as e:
+    mark_step(3, "✗", f"failed: {e}")
+    print_plan()
+    raise
+
+print_plan()
+
+# ------------------------------------------------------------------------------
+# Step 5: Clean and normalize fields
+# ------------------------------------------------------------------------------
+def normalize_date(val):
+    if pd.isna(val):
+        return ""
+    s = str(val).strip()
+    if not s:
+        return ""
+    # ENA may have formats like "2023-08-01", "2019-03", "2018"
+    # Convert "-" to "/" and pad if needed
+    parts = s.split("-")
+    if len(parts) == 3:
+        y, m, d = parts
+        return f"{y}/{m}/{d}"
+    elif len(parts) == 2:
+        y, m = parts
+        return f"{y}/{m}"
+    elif len(parts) == 1:
+        y = parts[0]
+        return y
+    return s.replace("-", "/")
+
+try:
+    df = df_samples_all.copy()
+
+    # Host: use 'host' if present, otherwise scientific_name
+    def derive_host(row):
+        host = str(row.get("host", "") or "").strip()
+        if host:
+            return host
+        sci = str(row.get("scientific_name", "") or "").strip()
+        return sci
+
+    df["Host"] = df.apply(derive_host, axis=1)
+
+    # SampleName: prefer sample_alias, then sample_title, then BioSample
+    def derive_sample_name(row):
+        for key in ["sample_alias", "sample_title"]:
+            v = str(row.get(key, "") or "").strip()
+            if v:
+                return v
+        return row["BioSample"]
+
+    df["SampleName"] = df.apply(derive_sample_name, axis=1)
+
+    # CollectionDate
+    df["CollectionDate"] = df["collection_date"].apply(normalize_date)
+
+    # Country
+    def clean_country(v):
+        if pd.isna(v):
+            return ""
+        s = str(v)
+        # ENA sometimes has "Country: Ghana", "Ghana: Accra"
+        s = s.replace(":", ";")
+        # take first part before semicolon
+        s = s.split(";")[0]
+        return s.strip()
+
+    df["Country"] = df["country"].apply(clean_country)
+
+    # Keep required columns in required order
+    df_clean = df[["SampleName", "Host", "CollectionDate", "Country", "BioProject", "BioSample"]].drop_duplicates()
+
+    # Save cleaned intermediate
+    df_clean.to_csv(TMP_DIR / "samples_clean.tsv", sep="\t", index=False)
+    mark_step(4, "✓")
+except Exception as e:
+    mark_step(4, "✗", f"failed: {e}")
+    print_plan()
+    raise
+
+print_plan()
+
+# ------------------------------------------------------------------------------
+# Step 6: Intermediate results already saved above
+# ------------------------------------------------------------------------------
+mark_step(5, "✓")
+print_plan()
+
+# ------------------------------------------------------------------------------
+# Step 7: Save final CSV
+# ------------------------------------------------------------------------------
+try:
+    df_clean.to_csv(FINAL_CSV, index=False)
+    print(f"Final CSV saved to: {FINAL_CSV}")
+    mark_step(6, "✓")
+except Exception as e:
+    mark_step(6, "✗", f"failed: {e}")
+    print_plan()
+    raise
+
+print_plan()
+
+# ------------------------------------------------------------------------------
+# Step 8: Final log
+# ------------------------------------------------------------------------------
+log_msg = textwrap.dedent(f"""
+Processing completed.
+- Runs (raw) saved: {TMP_DIR / 'runs_PRJEB63303.tsv'}, {TMP_DIR / 'runs_PRJNA1025946.tsv'}
+- BioSamples with runs list: {TMP_DIR / 'biosamples_with_runs.txt'}
+- Sample metadata raw: {TMP_DIR / 'samples_PRJEB63303.tsv'}, {TMP_DIR / 'samples_PRJNA1025946.tsv'}
+- Sample metadata with runs (raw merged): {TMP_DIR / 'samples_all_with_runs_raw.tsv'}
+- Cleaned sample table (TSV): {TMP_DIR / 'samples_clean.tsv'}
+- Final CSV: {FINAL_CSV}
+""").strip()
+
+print(log_msg)
+mark_step(7, "✓")
+print_plan()
+PYCODE
+</execute>
+<observation>Step 1: Plan the workflow
+1. [ ] Create necessary directories for intermediate and final outputs.
+2. [ ] Query ENA/SRA for all runs associated with BioProjects PRJEB63303 and PRJNA1025946.
+3. [ ] Extract the unique BioSample accessions that have at least one SRA/ENA run.
+4. [ ] Retrieve sample-level metadata (host, sample name, collection date, country, BioProject, BioSample) for those BioSamples.
+5. [ ] Clean and normalize the fields (e.g., date format, host field, country) and prepare a clean table.
+6. [ ] Save intermediate raw query results into the tmp directory.
+7. [ ] Save the final merged/cleaned table to the requested CSV path.
+8. [ ] Print a short log of what was done and where files are saved.
+
+Step 2: Run a Python script to perform all data retrieval and processing
+
+Current plan status:
+[ ] 1. Create necessary directories for intermediate and final outputs.
+[ ] 2. Query ENA/SRA for all runs associated with BioProjects PRJEB63303 and PRJNA1025946.
+[ ] 3. Extract the unique BioSample accessions that have at least one SRA/ENA run.
+[ ] 4. Retrieve sample-level metadata (host, sample name, collection date, country, BioProject, BioSample) for those BioSamples.
+[ ] 5. Clean and normalize the fields and prepare a clean table.
+[ ] 6. Save intermediate raw query results into the tmp directory.
+[ ] 7. Save the final merged/cleaned table to the requested CSV path.
+[ ] 8. Print a short log of what was done and where files are saved.
+
+
+Current plan status:
+[✓] 1. Create necessary directories for intermediate and final outputs.
+[ ] 2. Query ENA/SRA for all runs associated with BioProjects PRJEB63303 and PRJNA1025946.
+[ ] 3. Extract the unique BioSample accessions that have at least one SRA/ENA run.
+[ ] 4. Retrieve sample-level metadata (host, sample name, collection date, country, BioProject, BioSample) for those BioSamples.
+[ ] 5. Clean and normalize the fields and prepare a clean table.
+[ ] 6. Save intermediate raw query results into the tmp directory.
+[ ] 7. Save the final merged/cleaned table to the requested CSV path.
+[ ] 8. Print a short log of what was done and where files are saved.
+
+
+Querying ENA: result=read_run, query=study_accession="PRJEB63303"
+Requesting URL: https://www.ebi.ac.uk/ena/portal/api/search
+Saved ENA result to /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/zover_extract/runs_PRJEB63303.tsv (lines: 21)
+
+Querying ENA: result=read_run, query=study_accession="PRJNA1025946"
+Requesting URL: https://www.ebi.ac.uk/ena/portal/api/search
+Saved ENA result to /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/zover_extract/runs_PRJNA1025946.tsv (lines: 38)
+
+Current plan status:
+[✓] 1. Create necessary directories for intermediate and final outputs.
+[✓] 2. Query ENA/SRA for all runs associated with BioProjects PRJEB63303 and PRJNA1025946.
+[ ] 3. Extract the unique BioSample accessions that have at least one SRA/ENA run.
+[ ] 4. Retrieve sample-level metadata (host, sample name, collection date, country, BioProject, BioSample) for those BioSamples.
+[ ] 5. Clean and normalize the fields and prepare a clean table.
+[ ] 6. Save intermediate raw query results into the tmp directory.
+[ ] 7. Save the final merged/cleaned table to the requested CSV path.
+[ ] 8. Print a short log of what was done and where files are saved.
+
+Loaded runs:
+PRJEB63303 shape: (20, 7)
+PRJNA1025946 shape: (37, 7)
+Total unique BioSamples with runs: 47
+Saved BioSample list to /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/zover_extract/biosamples_with_runs.txt
+
+Current plan status:
+[✓] 1. Create necessary directories for intermediate and final outputs.
+[✓] 2. Query ENA/SRA for all runs associated with BioProjects PRJEB63303 and PRJNA1025946.
+[✓] 3. Extract the unique BioSample accessions that have at least one SRA/ENA run.
+[ ] 4. Retrieve sample-level metadata (host, sample name, collection date, country, BioProject, BioSample) for those BioSamples.
+[ ] 5. Clean and normalize the fields and prepare a clean table.
+[ ] 6. Save intermediate raw query results into the tmp directory.
+[ ] 7. Save the final merged/cleaned table to the requested CSV path.
+[ ] 8. Print a short log of what was done and where files are saved.
+
+
+Querying ENA: result=sample, query=study_accession="PRJEB63303"
+Requesting URL: https://www.ebi.ac.uk/ena/portal/api/search
+Saved ENA result to /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/zover_extract/samples_PRJEB63303.tsv (lines: 11)
+
+Querying ENA: result=sample, query=study_accession="PRJNA1025946"
+Requesting URL: https://www.ebi.ac.uk/ena/portal/api/search
+Saved ENA result to /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/zover_extract/samples_PRJNA1025946.tsv (lines: 38)
+Samples combined shape: (47, 10)
+Samples with runs shape: (47, 10)
+
+Current plan status:
+[✓] 1. Create necessary directories for intermediate and final outputs.
+[✓] 2. Query ENA/SRA for all runs associated with BioProjects PRJEB63303 and PRJNA1025946.
+[✓] 3. Extract the unique BioSample accessions that have at least one SRA/ENA run.
+[✓] 4. Retrieve sample-level metadata (host, sample name, collection date, country, BioProject, BioSample) for those BioSamples.
+[ ] 5. Clean and normalize the fields and prepare a clean table.
+[ ] 6. Save intermediate raw query results into the tmp directory.
+[ ] 7. Save the final merged/cleaned table to the requested CSV path.
+[ ] 8. Print a short log of what was done and where files are saved.
+
+
+Current plan status:
+[✓] 1. Create necessary directories for intermediate and final outputs.
+[✓] 2. Query ENA/SRA for all runs associated with BioProjects PRJEB63303 and PRJNA1025946.
+[✓] 3. Extract the unique BioSample accessions that have at least one SRA/ENA run.
+[✓] 4. Retrieve sample-level metadata (host, sample name, collection date, country, BioProject, BioSample) for those BioSamples.
+[✓] 5. Clean and normalize the fields and prepare a clean table.
+[ ] 6. Save intermediate raw query results into the tmp directory.
+[ ] 7. Save the final merged/cleaned table to the requested CSV path.
+[ ] 8. Print a short log of what was done and where files are saved.
+
+
+Current plan status:
+[✓] 1. Create necessary directories for intermediate and final outputs.
+[✓] 2. Query ENA/SRA for all runs associated with BioProjects PRJEB63303 and PRJNA1025946.
+[✓] 3. Extract the unique BioSample accessions that have at least one SRA/ENA run.
+[✓] 4. Retrieve sample-level metadata (host, sample name, collection date, country, BioProject, BioSample) for those BioSamples.
+[✓] 5. Clean and normalize the fields and prepare a clean table.
+[✓] 6. Save intermediate raw query results into the tmp directory.
+[ ] 7. Save the final merged/cleaned table to the requested CSV path.
+[ ] 8. Print a short log of what was done and where files are saved.
+
+Final CSV saved to: /root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.1/zover_extract.csv
+
+Current plan status:
+[✓] 1. Create necessary directories for intermediate and final outputs.
+[✓] 2. Query ENA/SRA for all runs associated with BioProjects PRJEB63303 and PRJNA1025946.
+[✓] 3. Extract the unique BioSample accessions that have at least one SRA/ENA run.
+[✓] 4. Retrieve sample-level metadata (host, sample name, collection date, country, BioProject, BioSample) for those BioSamples.
+[✓] 5. Clean and normalize the fields and prepare a clean table.
+[✓] 6. Save intermediate raw query results into the tmp directory.
+[✓] 7. Save the final merged/cleaned table to the requested CSV path.
+[ ] 8. Print a short log of what was done and where files are saved.
+
+Processing completed.
+- Runs (raw) saved: /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/zover_extract/runs_PRJEB63303.tsv, /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/zover_extract/runs_PRJNA1025946.tsv
+- BioSamples with runs list: /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/zover_extract/biosamples_with_runs.txt
+- Sample metadata raw: /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/zover_extract/samples_PRJEB63303.tsv, /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/zover_extract/samples_PRJNA1025946.tsv
+- Sample metadata with runs (raw merged): /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/zover_extract/samples_all_with_runs_raw.tsv
+- Cleaned sample table (TSV): /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/zover_extract/samples_clean.tsv
+- Final CSV: /root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.1/zover_extract.csv
+
+Current plan status:
+[✓] 1. Create necessary directories for intermediate and final outputs.
+[✓] 2. Query ENA/SRA for all runs associated with BioProjects PRJEB63303 and PRJNA1025946.
+[✓] 3. Extract the unique BioSample accessions that have at least one SRA/ENA run.
+[✓] 4. Retrieve sample-level metadata (host, sample name, collection date, country, BioProject, BioSample) for those BioSamples.
+[✓] 5. Clean and normalize the fields and prepare a clean table.
+[✓] 6. Save intermediate raw query results into the tmp directory.
+[✓] 7. Save the final merged/cleaned table to the requested CSV path.
+[✓] 8. Print a short log of what was done and where files are saved.
+
+</observation>
+<solution>
+1. [✓] Create necessary directories for intermediate and final outputs.
+2. [✓] Query ENA/SRA for all runs associated with BioProjects PRJEB63303 and PRJNA1025946.
+3. [✓] Extract the unique BioSample accessions that have at least one SRA/ENA run.
+4. [✓] Retrieve sample-level metadata (host, sample name, collection date, country, BioProject, BioSample) for those BioSamples.
+5. [✓] Clean and normalize the fields (e.g., date format, host field, country) and prepare a clean table.
+6. [✓] Save intermediate raw query results into the tmp directory.
+7. [✓] Save the final merged/cleaned table to the requested CSV path.
+8. [✓] Print a short log of what was done and where files are saved.
+
+All requested processing has been completed:
+
+- Final CSV with:
+  - columns: `SampleName,Host,CollectionDate,Country,BioProject,BioSample`
+  - only BioSamples that have at least one SRA/ENA run
+  - fields cleaned/normalized as specified
+
+Saved to:
+- `/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.1/zover_extract.csv`
+
+Intermediate files saved to:
+- Runs (raw):
+  - `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/zover_extract/runs_PRJEB63303.tsv`
+  - `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/zover_extract/runs_PRJNA1025946.tsv`
+- BioSamples with runs list:
+  - `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/zover_extract/biosamples_with_runs.txt`
+- Sample metadata raw:
+  - `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/zover_extract/samples_PRJEB63303.tsv`
+  - `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/zover_extract/samples_PRJNA1025946.tsv`
+- Sample metadata with runs (merged raw):
+  - `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/zover_extract/samples_all_with_runs_raw.tsv`
+- Cleaned table (TSV, same content as final CSV but tab-delimited):
+  - `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/zover_extract/samples_clean.tsv`
+
+You can now inspect or use `zover_extract.csv` directly at the requested location.
+</solution>

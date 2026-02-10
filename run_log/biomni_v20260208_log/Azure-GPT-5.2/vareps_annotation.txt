@@ -1,0 +1,1005 @@
+There are a list of possible single amino acid mutations for protein in `benchmark/dataset/VarEPS/4KMN.pdb`. The mutations are as listed in file `benchmark/dataset/VarEPS/mutation_list.txt`.
+
+Identify the most stable mutation among the list of possible mutations by saambe-3d. 
+
+Save the most stable mutation and its corresponding ΔΔG value to `/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/most_stable_mutation.txt`.
+
+All temp data should be save in `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/vareps_annotation`.
+
+Output format (For Reference):
+A 415 Q T
+
+<execute>
+import os, subprocess, textwrap, re, json, pandas as pd
+from pathlib import Path
+
+print("Research log: VarEPS/4KMN saambe-3d stability screening")
+
+# Paths
+pdb_path = Path("benchmark/dataset/VarEPS/4KMN.pdb")
+mut_list_path = Path("benchmark/dataset/VarEPS/mutation_list.txt")
+
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/vareps_annotation")
+out_path = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/most_stable_mutation.txt")
+saambe_dir = Path("operation_env/SAAMBE-3D-master")
+
+tmp_dir.mkdir(parents=True, exist_ok=True)
+out_path.parent.mkdir(parents=True, exist_ok=True)
+
+# Plan
+plan = [
+    "[ ] Inspect input PDB and mutation list; infer mutation format",
+    "[ ] Prepare per-mutation SAAMBE-3D runs (temp workspace, required inputs)",
+    "[ ] Execute SAAMBE-3D for each mutation; parse ΔΔG outputs",
+    "[ ] Select most stable mutation (minimum ΔΔG) and write result file",
+]
+def show_plan(plan): 
+    for i,s in enumerate(plan,1): print(f"{i}. {s}")
+
+show_plan(plan)
+
+# Step 1: inspect inputs
+print("\nStep 1: Inspecting files...")
+print("PDB exists:", pdb_path.exists(), "size:", pdb_path.stat().st_size if pdb_path.exists() else None)
+print("Mutation list exists:", mut_list_path.exists(), "size:", mut_list_path.stat().st_size if mut_list_path.exists() else None)
+
+mut_lines = mut_list_path.read_text().strip().splitlines()
+mut_lines = [ln.strip() for ln in mut_lines if ln.strip() and not ln.strip().startswith("#")]
+print("Num mutations:", len(mut_lines))
+print("First 10 mutation lines:")
+for ln in mut_lines[:10]:
+    print("  ", ln)
+
+# Infer mutation spec; accept formats like "A 415 Q T" or "A415QT" or "A:Q415T"
+def parse_mut(line):
+    # try whitespace-separated: chain pos wt mut
+    parts = line.replace(":", " ").replace(",", " ").split()
+    if len(parts) >= 4 and parts[1].isdigit():
+        chain, pos, wt, mt = parts[0], int(parts[1]), parts[2], parts[3]
+        return chain, pos, wt, mt
+    # try compact like "A415QT" -> chain pos wt mt
+    m = re.match(r"^([A-Za-z])\s*(\d+)\s*([A-Za-z])\s*([A-Za-z])$", line.replace(" ", ""))
+    if m:
+        return m.group(1), int(m.group(2)), m.group(3), m.group(4)
+    # try like "Q415T" (no chain)
+    m = re.match(r"^([A-Za-z])(\d+)([A-Za-z])$", line.replace(" ", ""))
+    if m:
+        return None, int(m.group(2)), m.group(1), m.group(3)
+    return None
+
+parsed = []
+bad = []
+for ln in mut_lines:
+    pm = parse_mut(ln)
+    if pm is None:
+        bad.append(ln)
+    else:
+        parsed.append(pm)
+print("Parsed:", len(parsed), "Bad:", len(bad))
+if bad:
+    print("Unparsed examples:", bad[:5])
+
+plan[0] = "[✓] Inspect input PDB and mutation list; infer mutation format"
+show_plan(plan)
+
+# Step 2: locate SAAMBE-3D runner and learn expected CLI
+print("\nStep 2: Checking SAAMBE-3D installation...")
+print("SAAMBE dir exists:", saambe_dir.exists())
+print("SAAMBE dir listing (top):", [p.name for p in saambe_dir.iterdir()][:20])
+
+# Find candidate entrypoint scripts
+candidates = []
+for root, dirs, files in os.walk(saambe_dir):
+    for f in files:
+        if f.lower() in ("saambe.py","run_saambe.py","main.py") or "saambe" in f.lower():
+            candidates.append(Path(root)/f)
+print("Candidate SAAMBE scripts (first 20):")
+for p in candidates[:20]:
+    print("  ", p)
+
+# Try to identify a runnable command by checking README / usage
+readme = None
+for name in ["README.md","README.txt","Readme.md"]:
+    p = saambe_dir/name
+    if p.exists():
+        readme = p
+        break
+if readme:
+    txt = readme.read_text(errors="ignore")
+    print("\nREADME head:\n", "\n".join(txt.splitlines()[:60]))
+else:
+    print("No README found at top level.")
+
+# Heuristically pick an entrypoint: look for 'SAAMBE-3D.py' etc.
+entry = None
+for p in candidates:
+    if p.name.lower() in ("saambe.py","run_saambe.py"):
+        entry = p
+        break
+if entry is None and candidates:
+    entry = candidates[0]
+print("Chosen entrypoint:", entry)
+
+# If entrypoint exists, run help
+help_text = ""
+if entry and entry.exists():
+    try:
+        res = subprocess.run(["python", str(entry), "-h"], capture_output=True, text=True, cwd=str(saambe_dir))
+        help_text = res.stdout + "\n" + res.stderr
+        print("\nEntrypoint help output (truncated):\n", "\n".join(help_text.splitlines()[:80]))
+    except Exception as e:
+        print("Failed to run help:", e)
+
+plan[1] = "[✓] Prepare per-mutation SAAMBE-3D runs (temp workspace, required inputs)"
+show_plan(plan)
+
+# Step 3: Run SAAMBE per mutation
+print("\nStep 3: Running SAAMBE-3D for each mutation and parsing ΔΔG...")
+# Determine mutation argument format from help, fallback to common: --pdb, --chain, --resnum, --mut
+# We'll implement several command templates and pick first that yields a parseable ddg.
+
+def run_one(m, idx):
+    chain, pos, wt, mt = m
+    work = tmp_dir / f"mut_{idx:05d}_{chain or 'NA'}_{pos}_{wt}_{mt}"
+    work.mkdir(parents=True, exist_ok=True)
+    # copy pdb into work
+    local_pdb = work / pdb_path.name
+    if not local_pdb.exists():
+        local_pdb.write_bytes(pdb_path.read_bytes())
+    # Try command templates
+    cmd_templates = []
+    # common formats
+    cmd_templates.append(["python", str(entry), "-p", str(local_pdb), "-c", str(chain) if chain else "", "-r", str(pos), "-w", wt, "-m", mt])
+    cmd_templates.append(["python", str(entry), "--pdb", str(local_pdb), "--chain", str(chain) if chain else "", "--resnum", str(pos), "--wt", wt, "--mut", mt])
+    cmd_templates.append(["python", str(entry), str(local_pdb), f"{chain}{pos}{wt}{mt}"])
+    cmd_templates.append(["python", str(entry), str(local_pdb), f"{wt}{pos}{mt}"])
+    cmd_templates.append(["python", str(entry), "-i", f"{chain} {pos} {wt} {mt}", "-p", str(local_pdb)])
+    # remove empty args
+    cmd_templates = [[a for a in cmd if a!=""] for cmd in cmd_templates]
+    logs = []
+    for j,cmd in enumerate(cmd_templates):
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, cwd=str(saambe_dir), timeout=600)
+            out = res.stdout + "\n" + res.stderr
+            logs.append((cmd, res.returncode, out))
+            # Try parse ddg from output (look for ΔΔG, ddG, "DDG", "dG")
+            ddg = None
+            # regex for float
+            for pat in [
+                r"ΔΔG[^-\d]*(-?\d+(?:\.\d+)?)",
+                r"DDG[^-\d]*(-?\d+(?:\.\d+)?)",
+                r"ddG[^-\d]*(-?\d+(?:\.\d+)?)",
+                r"ddg[^-\d]*(-?\d+(?:\.\d+)?)",
+                r"\b(-?\d+(?:\.\d+)?)\s*kcal/mol\b",
+            ]:
+                mm = re.search(pat, out)
+                if mm:
+                    ddg = float(mm.group(1))
+                    break
+            # Also search output files for ddg
+            if ddg is None:
+                for fp in work.rglob("*"):
+                    if fp.is_file() and fp.suffix.lower() in (".txt",".out",".log",".csv"):
+                        t = fp.read_text(errors="ignore")
+                        mm = re.search(r"(?:ΔΔG|DDG|ddG|ddg)[^-\d]*(-?\d+(?:\.\d+)?)", t)
+                        if mm:
+                            ddg = float(mm.group(1))
+                            break
+                    if ddg is not None:
+                        break
+            if ddg is not None:
+                # save successful log
+                (work/"saambe_cmd.txt").write_text(" ".join(cmd))
+                (work/"saambe_stdout_stderr.txt").write_text(out)
+                return ddg, cmd, out, work
+        except Exception as e:
+            logs.append((cmd, None, str(e)))
+    # save failure logs
+    fail_log = "\n\n".join([f"CMD: {' '.join(c)}\nRC:{rc}\n{out[:5000]}" for c,rc,out in logs])
+    (work/"saambe_fail.txt").write_text(fail_log)
+    return None, None, None, work
+
+results = []
+for i,m in enumerate(parsed,1):
+    ddg, cmd, out, work = run_one(m, i)
+    results.append({"chain":m[0], "pos":m[1], "wt":m[2], "mut":m[3], "ddg":ddg, "workdir":str(work), "cmd":" ".join(cmd) if cmd else None})
+
+df = pd.DataFrame(results)
+print(df.head())
+print("Successful predictions:", df['ddg'].notna().sum(), " / ", len(df))
+
+# Save all results table for traceability
+all_results_path = tmp_dir/"all_saambe_results.tsv"
+df.to_csv(all_results_path, sep="\t", index=False)
+print("Saved all results to:", all_results_path)
+
+plan[2] = "[✓] Execute SAAMBE-3D for each mutation; parse ΔΔG outputs"
+show_plan(plan)
+
+# Step 4: pick most stable (minimum ΔΔG)
+ok = df[df['ddg'].notna()].copy()
+if ok.empty:
+    raise RuntimeError("No SAAMBE-3D predictions parsed. See tmp_dir for logs.")
+best = ok.loc[ok['ddg'].idxmin()]
+best_line = f"{best['chain']} {int(best['pos'])} {best['wt']} {best['mut']}\t{best['ddg']:.3f}"
+out_path.write_text(best_line + "\n")
+print("\nMost stable mutation:", best_line)
+print("Written to:", out_path)
+
+plan[3] = "[✓] Select most stable mutation (minimum ΔΔG) and write result file"
+show_plan(plan)
+</execute>
+<observation>FileNotFoundError(2, 'No such file or directory')</observation>
+<execute>
+import os
+from pathlib import Path
+
+print("Reasoning: The error indicates an expected input path does not exist. I will (1) locate the actual paths for 4KMN.pdb and mutation_list.txt, (2) update variables accordingly, and (3) rerun SAAMBE screening with the corrected paths.")
+
+# Plan
+plan = [
+    "[ ] Locate the actual dataset paths for 4KMN.pdb and mutation_list.txt in the filesystem",
+    "[ ] Validate SAAMBE-3D entrypoint and minimal runnable example",
+    "[ ] Run SAAMBE-3D on all mutations, parse ΔΔG, and select most stable (min ΔΔG)",
+    "[ ] Save the best mutation and ΔΔG to the required output file and keep temp data in the required tmp folder",
+]
+def show_plan(p):
+    for i,s in enumerate(p,1): print(f"{i}. {s}")
+show_plan(plan)
+
+# Step 1: locate files
+print("\nStep 1: Searching for 4KMN.pdb and mutation_list.txt ...")
+targets = ["4KMN.pdb", "mutation_list.txt"]
+search_roots = [Path("."), Path("/root"), Path("/")]
+found = {t: [] for t in targets}
+
+# Limit walk for performance: search within likely project directories
+likely_roots = [Path("."), Path("./benchmark"), Path("./operation_env"), Path("/root/biodatalab")]
+roots = []
+for r in likely_roots:
+    if r.exists():
+        roots.append(r)
+
+def find_files(root: Path, filename: str, max_hits=20):
+    hits = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        if filename in filenames:
+            hits.append(Path(dirpath)/filename)
+            if len(hits) >= max_hits:
+                break
+    return hits
+
+for t in targets:
+    for r in roots:
+        hits = find_files(r, t, max_hits=50)
+        found[t].extend(hits)
+
+for t,hits in found.items():
+    print(f"\nFound {len(hits)} hits for {t}:")
+    for p in hits[:20]:
+        print("  ", p)
+
+# Choose best matches that include VarEPS in path if possible
+def choose_best(hits):
+    if not hits: 
+        return None
+    vareps = [p for p in hits if "VarEPS" in str(p)]
+    if vareps:
+        return vareps[0]
+    return hits[0]
+
+pdb_path = choose_best(found["4KMN.pdb"])
+mut_list_path = choose_best(found["mutation_list.txt"])
+
+print("\nChosen pdb_path:", pdb_path)
+print("Chosen mut_list_path:", mut_list_path)
+
+if pdb_path is None or mut_list_path is None:
+    raise FileNotFoundError("Could not locate required input files. Please confirm dataset is present.")
+
+plan[0] = "[✓] Locate the actual dataset paths for 4KMN.pdb and mutation_list.txt in the filesystem"
+show_plan(plan)
+</execute>
+<observation>NameError("name 'os' is not defined")</observation>
+<execute>
+from pathlib import Path
+import os
+
+print("Reasoning: The previous run failed because `os` was referenced before being imported in the executed environment. I will re-run Step 1 (file discovery) with the correct imports and then proceed only after confirming the paths exist.")
+
+# Plan
+plan = [
+    "[ ] Locate the actual dataset paths for 4KMN.pdb and mutation_list.txt in the filesystem",
+    "[ ] Validate SAAMBE-3D entrypoint and minimal runnable example",
+    "[ ] Run SAAMBE-3D on all mutations, parse ΔΔG, and select most stable (min ΔΔG)",
+    "[ ] Save the best mutation and ΔΔG to the required output file and keep temp data in the required tmp folder",
+]
+def show_plan(p):
+    for i,s in enumerate(p,1): print(f"{i}. {s}")
+show_plan(plan)
+
+# Step 1: locate files
+print("\nStep 1: Searching for 4KMN.pdb and mutation_list.txt ...")
+targets = ["4KMN.pdb", "mutation_list.txt"]
+
+likely_roots = [Path("."), Path("./benchmark"), Path("./operation_env"), Path("/root/biodatalab")]
+roots = [r for r in likely_roots if r.exists()]
+
+def find_files(root: Path, filename: str, max_hits=50):
+    hits = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        if filename in filenames:
+            hits.append(Path(dirpath)/filename)
+            if len(hits) >= max_hits:
+                break
+    return hits
+
+found = {t: [] for t in targets}
+for t in targets:
+    for r in roots:
+        found[t].extend(find_files(r, t, max_hits=100))
+
+for t,hits in found.items():
+    print(f"\nFound {len(hits)} hits for {t}:")
+    for p in hits[:30]:
+        print("  ", p)
+
+def choose_best(hits):
+    if not hits:
+        return None
+    vareps = [p for p in hits if "VarEPS" in str(p)]
+    if vareps:
+        # prefer benchmark/dataset/VarEPS
+        vareps2 = [p for p in vareps if "benchmark/dataset/VarEPS" in str(p)]
+        return (vareps2[0] if vareps2 else vareps[0])
+    return hits[0]
+
+pdb_path = choose_best(found["4KMN.pdb"])
+mut_list_path = choose_best(found["mutation_list.txt"])
+
+print("\nChosen pdb_path:", pdb_path)
+print("Chosen mut_list_path:", mut_list_path)
+print("PDB exists:", pdb_path.exists() if pdb_path else None)
+print("Mutation list exists:", mut_list_path.exists() if mut_list_path else None)
+
+if pdb_path is None or mut_list_path is None:
+    raise FileNotFoundError("Could not locate required input files. Please confirm dataset is present.")
+
+plan[0] = "[✓] Locate the actual dataset paths for 4KMN.pdb and mutation_list.txt in the filesystem"
+show_plan(plan)
+</execute>
+<observation>NameError("name 'os' is not defined")</observation>
+<execute>
+#!BASH
+set -euo pipefail
+
+echo "Reasoning: The python execution environment appears to be persisting an error state where `os` is not available. I will switch to Bash to locate the required files robustly, then proceed with SAAMBE-3D runs after confirming paths."
+
+echo "PLAN:"
+echo "1. [ ] Locate 4KMN.pdb and mutation_list.txt"
+echo "2. [ ] Validate SAAMBE-3D entrypoint"
+echo "3. [ ] Run SAAMBE-3D for all mutations and parse ddG"
+echo "4. [ ] Save best mutation and ddG to required output"
+
+echo
+echo "Step 1: locating files..."
+echo "Searching under ./benchmark ..."
+find ./benchmark -maxdepth 6 -type f \( -name "4KMN.pdb" -o -name "mutation_list.txt" \) -print || true
+
+echo
+echo "Searching under /root/biodatalab (if present) ..."
+if [ -d /root/biodatalab ]; then
+  find /root/biodatalab -maxdepth 8 -type f \( -name "4KMN.pdb" -o -name "mutation_list.txt" \) -print || true
+fi
+
+echo
+echo "Searching under current repo (depth 8) ..."
+find . -maxdepth 8 -type f \( -name "4KMN.pdb" -o -name "mutation_list.txt" \) -print || true
+
+echo
+echo "Updated PLAN:"
+echo "1. [✓] Locate 4KMN.pdb and mutation_list.txt"
+echo "2. [ ] Validate SAAMBE-3D entrypoint"
+echo "3. [ ] Run SAAMBE-3D for all mutations and parse ddG"
+echo "4. [ ] Save best mutation and ddG to required output"
+</execute>
+<observation>Reasoning: The python execution environment appears to be persisting an error state where  is not available. I will switch to Bash to locate the required files robustly, then proceed with SAAMBE-3D runs after confirming paths.
+PLAN:
+1. [ ] Locate 4KMN.pdb and mutation_list.txt
+2. [ ] Validate SAAMBE-3D entrypoint
+3. [ ] Run SAAMBE-3D for all mutations and parse ddG
+4. [ ] Save best mutation and ddG to required output
+
+Step 1: locating files...
+Searching under ./benchmark ...
+./benchmark/dataset/VarEPS/4KMN.pdb
+./benchmark/dataset/VarEPS/mutation_list.txt
+
+Searching under /root/biodatalab (if present) ...
+/root/biodatalab/benchmark/dataset/VarEPS/4KMN.pdb
+/root/biodatalab/benchmark/dataset/VarEPS/mutation_list.txt
+
+Searching under current repo (depth 8) ...
+./benchmark/dataset/VarEPS/4KMN.pdb
+./benchmark/dataset/VarEPS/mutation_list.txt
+
+Updated PLAN:
+1. [✓] Locate 4KMN.pdb and mutation_list.txt
+2. [ ] Validate SAAMBE-3D entrypoint
+3. [ ] Run SAAMBE-3D for all mutations and parse ddG
+4. [ ] Save best mutation and ddG to required output
+</observation>
+<execute>
+#!BASH
+set -euo pipefail
+
+echo "Reasoning: Inputs exist at ./benchmark/dataset/VarEPS/. Next I will (1) find SAAMBE-3D entrypoint and its CLI usage, (2) run it for each mutation in mutation_list.txt, (3) parse ΔΔG, and (4) write the best (most negative ΔΔG) to the requested output file. All temporary artifacts will be kept under the required tmp directory."
+
+PDB="./benchmark/dataset/VarEPS/4KMN.pdb"
+MUTLIST="./benchmark/dataset/VarEPS/mutation_list.txt"
+SAAMBE_DIR="./operation_env/SAAMBE-3D-master"
+
+TMP_DIR="/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/vareps_annotation"
+OUT="/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/most_stable_mutation.txt"
+
+mkdir -p "$TMP_DIR"
+mkdir -p "$(dirname "$OUT")"
+
+echo "PLAN:"
+echo "1. [✓] Locate 4KMN.pdb and mutation_list.txt"
+echo "2. [ ] Validate SAAMBE-3D entrypoint"
+echo "3. [ ] Run SAAMBE-3D for all mutations and parse ddG"
+echo "4. [ ] Save best mutation and ddG to required output"
+echo
+
+echo "Step 2: Validate SAAMBE-3D entrypoint..."
+if [ ! -d "$SAAMBE_DIR" ]; then
+  echo "ERROR: SAAMBE-3D directory not found: $SAAMBE_DIR"
+  exit 1
+fi
+
+# Find likely entrypoints
+mapfile -t CANDS < <(find "$SAAMBE_DIR" -maxdepth 3 -type f \( -iname "*saambe*.py" -o -iname "run*.py" -o -iname "main*.py" \) | sort)
+echo "Candidate scripts:"
+printf "  %s\n" "${CANDS[@]:0:30}"
+
+ENTRY=""
+for f in "${CANDS[@]}"; do
+  bn="$(basename "$f")"
+  if [ "$bn" = "run_saambe.py" ] || [ "$bn" = "saambe.py" ]; then
+    ENTRY="$f"
+    break
+  fi
+done
+if [ -z "$ENTRY" ] && [ "${#CANDS[@]}" -gt 0 ]; then
+  ENTRY="${CANDS[0]}"
+fi
+if [ -z "$ENTRY" ]; then
+  echo "ERROR: Could not find SAAMBE python entrypoint under $SAAMBE_DIR"
+  exit 1
+fi
+echo "Chosen entrypoint: $ENTRY"
+
+echo
+echo "Entrypoint help (first 120 lines):"
+python "$ENTRY" -h 2>&1 | sed -n '1,120p' || true
+
+echo
+echo "Updated PLAN:"
+echo "1. [✓] Locate 4KMN.pdb and mutation_list.txt"
+echo "2. [✓] Validate SAAMBE-3D entrypoint"
+echo "3. [ ] Run SAAMBE-3D for all mutations and parse ddG"
+echo "4. [ ] Save best mutation and ddG to required output"
+echo
+
+echo "Step 3: Run SAAMBE-3D for all mutations..."
+# Prepare a clean results file
+RESULTS_TSV="$TMP_DIR/all_saambe_results.tsv"
+echo -e "chain\tpos\twt\tmut\tddg\tcmd\tworkdir" > "$RESULTS_TSV"
+
+# Helper: parse a ddG float from text
+parse_ddg_py='import re,sys; t=sys.stdin.read()
+m=None
+for pat in [r"ΔΔG[^-\\d]*(-?\\d+(?:\\.\\d+)?)", r"DDG[^-\\d]*(-?\\d+(?:\\.\\d+)?)", r"ddG[^-\\d]*(-?\\d+(?:\\.\\d+)?)", r"ddg[^-\\d]*(-?\\d+(?:\\.\\d+)?)", r"\\b(-?\\d+(?:\\.\\d+)?)\\s*kcal/mol\\b"]:
+  m=re.search(pat,t)
+  if m: break
+if m: print(m.group(1))'
+
+# Normalize mutation list: skip blank/comment
+i=0
+while IFS= read -r line; do
+  line="$(echo "$line" | sed 's/\r$//')"
+  [ -z "$line" ] && continue
+  echo "$line" | grep -q '^\s*#' && continue
+
+  # Parse formats:
+  # 1) "A 415 Q T"
+  # 2) "A415QT"
+  chain=""; pos=""; wt=""; mut=""
+  if echo "$line" | awk 'NF>=4 && $2 ~ /^[0-9]+$/ {exit 0} {exit 1}'; then
+    chain="$(echo "$line" | awk '{print $1}')"
+    pos="$(echo "$line" | awk '{print $2}')"
+    wt="$(echo "$line" | awk '{print $3}')"
+    mut="$(echo "$line" | awk '{print $4}')"
+  else
+    compact="$(echo "$line" | tr -d '[:space:]' | tr ':' ' ')"
+    # try A415QT
+    if echo "$compact" | grep -Eq '^[A-Za-z][0-9]+[A-Za-z][A-Za-z]$'; then
+      chain="$(echo "$compact" | sed -E 's/^([A-Za-z]).*$/\1/')"
+      pos="$(echo "$compact" | sed -E 's/^[A-Za-z]([0-9]+)[A-Za-z][A-Za-z]$/\1/')"
+      wt="$(echo "$compact" | sed -E 's/^[A-Za-z][0-9]+([A-Za-z])[A-Za-z]$/\1/')"
+      mut="$(echo "$compact" | sed -E 's/^[A-Za-z][0-9]+[A-Za-z]([A-Za-z])$/\1/')"
+    elif echo "$compact" | grep -Eq '^[A-Za-z][0-9]+[A-Za-z]$'; then
+      # Q415T (no chain)
+      chain="NA"
+      wt="$(echo "$compact" | sed -E 's/^([A-Za-z]).*$/\1/')"
+      pos="$(echo "$compact" | sed -E 's/^[A-Za-z]([0-9]+)[A-Za-z]$/\1/')"
+      mut="$(echo "$compact" | sed -E 's/^[A-Za-z][0-9]+([A-Za-z])$/\1/')"
+    else
+      echo "WARN: could not parse mutation line: $line"
+      continue
+    fi
+  fi
+
+  i=$((i+1))
+  work="$TMP_DIR/mut_$(printf "%05d" "$i")_${chain}_${pos}_${wt}_${mut}"
+  mkdir -p "$work"
+  cp -f "$PDB" "$work/4KMN.pdb"
+
+  # Try a small set of common CLI patterns; stop at first that yields parsable ddg
+  ddg=""
+  cmd_used=""
+  out_txt="$work/stdout_stderr.txt"
+
+  # pattern A: flags -p -c -r -w -m
+  cmd1=(python "$ENTRY" -p "$work/4KMN.pdb" -c "$chain" -r "$pos" -w "$wt" -m "$mut")
+  # pattern B: long flags
+  cmd2=(python "$ENTRY" --pdb "$work/4KMN.pdb" --chain "$chain" --resnum "$pos" --wt "$wt" --mut "$mut")
+  # pattern C: positional with mutation token A415QT
+  cmd3=(python "$ENTRY" "$work/4KMN.pdb" "${chain}${pos}${wt}${mut}")
+  # pattern D: positional with mutation token Q415T
+  cmd4=(python "$ENTRY" "$work/4KMN.pdb" "${wt}${pos}${mut}")
+
+  for cmd in cmd1 cmd2 cmd3 cmd4; do
+    # shellcheck disable=SC2154
+    "${!cmd[@]}" >"$out_txt" 2>&1 || true
+    ddg_try="$(python -c "$parse_ddg_py" <"$out_txt" || true)"
+    if [ -n "$ddg_try" ]; then
+      ddg="$ddg_try"
+      # record used command
+      # shellcheck disable=SC2154
+      cmd_used="${!cmd[*]}"
+      break
+    fi
+  done
+
+  if [ -z "$ddg" ]; then
+    # try to parse from any txt/log/out within workdir
+    ddg="$(find "$work" -type f \( -name "*.txt" -o -name "*.log" -o -name "*.out" -o -name "*.csv" \) -maxdepth 3 -print0 \
+      | xargs -0 -I{} sh -c 'python -c "'"$parse_ddg_py"'" < "{}" 2>/dev/null || true' \
+      | head -n 1 || true)"
+  fi
+
+  echo -e "${chain}\t${pos}\t${wt}\t${mut}\t${ddg}\t${cmd_used}\t${work}" >> "$RESULTS_TSV"
+done < "$MUTLIST"
+
+echo "Saved per-mutation results to: $RESULTS_TSV"
+echo "Successful predictions: $(awk -F'\t' 'NR>1 && $5!="" {c++} END{print c+0}' "$RESULTS_TSV")"
+
+echo
+echo "Updated PLAN:"
+echo "1. [✓] Locate 4KMN.pdb and mutation_list.txt"
+echo "2. [✓] Validate SAAMBE-3D entrypoint"
+echo "3. [✓] Run SAAMBE-3D for all mutations and parse ddG"
+echo "4. [ ] Save best mutation and ddG to required output"
+echo
+
+echo "Step 4: Select most stable mutation (minimum ΔΔG) and write output..."
+# Choose minimum ddg among non-empty; numeric compare in awk
+best="$(awk -F'\t' 'NR==1{next} $5!="" { if(min=="" || $5+0 < min+0){min=$5; line=$0} } END{print line}' "$RESULTS_TSV")"
+if [ -z "$best" ]; then
+  echo "ERROR: No parsable ddG values found. Check logs under $TMP_DIR"
+  exit 1
+fi
+
+chain="$(echo "$best" | awk -F'\t' '{print $1}')"
+pos="$(echo "$best" | awk -F'\t' '{print $2}')"
+wt="$(echo "$best" | awk -F'\t' '{print $3}')"
+mut="$(echo "$best" | awk -F'\t' '{print $4}')"
+ddg="$(echo "$best" | awk -F'\t' '{print $5}')"
+
+# Save: mutation plus ddg (tab-separated)
+printf "%s %s %s %s\t%s\n" "$chain" "$pos" "$wt" "$mut" "$ddg" > "$OUT"
+
+echo "Most stable mutation:"
+cat "$OUT"
+echo "Written to: $OUT"
+
+echo
+echo "Updated PLAN:"
+echo "1. [✓] Locate 4KMN.pdb and mutation_list.txt"
+echo "2. [✓] Validate SAAMBE-3D entrypoint"
+echo "3. [✓] Run SAAMBE-3D for all mutations and parse ddG"
+echo "4. [✓] Save best mutation and ddG to required output"
+</execute>
+<observation>Error running Bash script (exit code 1):
+</observation>
+<execute>
+#!BASH
+set -euo pipefail
+
+echo "Reasoning: The previous bash script exited with code 1 but did not show the failing command. I will rerun with shell tracing (-x) and without immediate exit on error for the SAAMBE call sections, to capture the exact failure. Then I can adjust the workflow."
+
+# Plan
+echo "PLAN:"
+echo "1. [✓] Locate 4KMN.pdb and mutation_list.txt"
+echo "2. [ ] Validate SAAMBE-3D entrypoint (debug with tracing)"
+echo "3. [ ] Run SAAMBE-3D for all mutations and parse ddG"
+echo "4. [ ] Save best mutation and ddG"
+
+PDB="./benchmark/dataset/VarEPS/4KMN.pdb"
+MUTLIST="./benchmark/dataset/VarEPS/mutation_list.txt"
+SAAMBE_DIR="./operation_env/SAAMBE-3D-master"
+TMP_DIR="/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/vareps_annotation"
+
+echo
+echo "Sanity checks:"
+ls -l "$PDB" "$MUTLIST" || true
+ls -ld "$SAAMBE_DIR" || true
+
+echo
+echo "Step 2 debug: list SAAMBE-3D-master top-level:"
+ls -ლა "$SAAMBE_DIR" | sed -n '1,120p' || true
+
+echo
+echo "Find candidate scripts:"
+find "$SAAMBE_DIR" -maxdepth 4 -type f \( -iname "*saambe*.py" -o -iname "run*.py" -o -iname "main*.py" \) -print | sed -n '1,200p' || true
+
+echo
+echo "Try to detect a likely entrypoint by searching for '__main__' in python files (first 20 hits):"
+grep -R --line-number "__main__" "$SAAMBE_DIR" 2>/dev/null | head -n 20 || true
+
+echo
+echo "Attempt to run help on a few candidates (capture failures):"
+set +e
+for f in $(find "$SAAMBE_DIR" -maxdepth 4 -type f -iname "*saambe*.py" | head -n 10); do
+  echo
+  echo "==> python $f -h"
+  python "$f" -h 2>&1 | sed -n '1,80p'
+  echo "RC=$?"
+done
+set -e
+
+echo
+echo "Updated PLAN:"
+echo "1. [✓] Locate 4KMN.pdb and mutation_list.txt"
+echo "2. [✓] Validate SAAMBE-3D entrypoint (debug with tracing)"
+echo "3. [ ] Run SAAMBE-3D for all mutations and parse ddG"
+echo "4. [ ] Save best mutation and ddG"
+</execute>
+<observation>Error running Bash script: 'utf-8' codec can't decode byte 0xe1 in position 103: invalid continuation byte</observation>
+<execute>
+#!BASH
+set -euo pipefail
+
+echo "Reasoning: The failure is due to invalid UTF-8 bytes in command output being captured by the runner. I will force locale to C (ASCII-ish), and I will avoid printing non-UTF8 content by filtering output through 'LC_ALL=C' and 'tr' to strip non-printable bytes."
+
+export LC_ALL=C
+export LANG=C
+
+# Plan
+echo "PLAN:"
+echo "1. [✓] Locate 4KMN.pdb and mutation_list.txt"
+echo "2. [ ] Validate SAAMBE-3D entrypoint while sanitizing output to UTF-8-safe text"
+echo "3. [ ] Run SAAMBE-3D for all mutations and parse ddG"
+echo "4. [ ] Save best mutation and ddG"
+
+PDB="./benchmark/dataset/VarEPS/4KMN.pdb"
+MUTLIST="./benchmark/dataset/VarEPS/mutation_list.txt"
+SAAMBE_DIR="./operation_env/SAAMBE-3D-master"
+
+echo
+echo "Sanity checks:"
+ls -l "$PDB" "$MUTLIST" | tr -cd '\11\12\15\40-\176' || true
+ls -ld "$SAAMBE_DIR" | tr -cd '\11\12\15\40-\176' || true
+
+echo
+echo "Step 2: list SAAMBE-3D-master top-level (sanitized):"
+ls -la "$SAAMBE_DIR" | tr -cd '\11\12\15\40-\176' | sed -n '1,120p' || true
+
+echo
+echo "Find candidate scripts (sanitized):"
+find "$SAAMBE_DIR" -maxdepth 4 -type f \( -iname "*saambe*.py" -o -iname "run*.py" -o -iname "main*.py" \) -print \
+  | tr -cd '\11\12\15\40-\176' | sed -n '1,200p' || true
+
+echo
+echo "Search for __main__ (first 20 hits, sanitized):"
+grep -R --line-number "__main__" "$SAAMBE_DIR" 2>/dev/null | head -n 20 | tr -cd '\11\12\15\40-\176' || true
+
+echo
+echo "Try help on a few candidate scripts (sanitize output):"
+set +e
+c=0
+while IFS= read -r f; do
+  c=$((c+1))
+  echo
+  echo "==> python $f -h"
+  python "$f" -h 2>&1 | tr -cd '\11\12\15\40-\176' | sed -n '1,120p'
+  echo "RC=$?"
+  [ $c -ge 8 ] && break
+done < <(find "$SAAMBE_DIR" -maxdepth 4 -type f -iname "*saambe*.py" | head -n 20)
+set -e
+
+echo
+echo "Updated PLAN:"
+echo "1. [✓] Locate 4KMN.pdb and mutation_list.txt"
+echo "2. [✓] Validate SAAMBE-3D entrypoint while sanitizing output to UTF-8-safe text"
+echo "3. [ ] Run SAAMBE-3D for all mutations and parse ddG"
+echo "4. [ ] Save best mutation and ddG"
+</execute>
+<observation>Reasoning: The failure is due to invalid UTF-8 bytes in command output being captured by the runner. I will force locale to C (ASCII-ish), and I will avoid printing non-UTF8 content by filtering output through 'LC_ALL=C' and 'tr' to strip non-printable bytes.
+PLAN:
+1. [✓] Locate 4KMN.pdb and mutation_list.txt
+2. [ ] Validate SAAMBE-3D entrypoint while sanitizing output to UTF-8-safe text
+3. [ ] Run SAAMBE-3D for all mutations and parse ddG
+4. [ ] Save best mutation and ddG
+
+Sanity checks:
+-rw-r--r-- 1 root root 244458 Feb  3 18:22 ./benchmark/dataset/VarEPS/4KMN.pdb
+-rw-r--r-- 1 root root     50 Feb  3 18:30 ./benchmark/dataset/VarEPS/mutation_list.txt
+
+Step 2: list SAAMBE-3D-master top-level (sanitized):
+
+Find candidate scripts (sanitized):
+
+Search for __main__ (first 20 hits, sanitized):
+
+Try help on a few candidate scripts (sanitize output):
+
+Updated PLAN:
+1. [✓] Locate 4KMN.pdb and mutation_list.txt
+2. [✓] Validate SAAMBE-3D entrypoint while sanitizing output to UTF-8-safe text
+3. [ ] Run SAAMBE-3D for all mutations and parse ddG
+4. [ ] Save best mutation and ddG
+</observation>
+<execute>
+#!BASH
+set -euo pipefail
+export LC_ALL=C
+export LANG=C
+
+echo "Reasoning: The SAAMBE-3D directory exists but listing/candidate discovery returned nothing, suggesting the directory may be empty or inaccessible, or the earlier output was stripped. I will directly inspect the directory tree and verify whether SAAMBE-3D files are present. If not, I will fail with a clear message (cannot run SAAMBE-3D without the code)."
+
+# Plan
+echo "PLAN:"
+echo "1. [✓] Locate 4KMN.pdb and mutation_list.txt"
+echo "2. [ ] Verify SAAMBE-3D installation contents and identify runnable entrypoint"
+echo "3. [ ] Run SAAMBE-3D for all mutations and parse ddG"
+echo "4. [ ] Save best mutation and ddG"
+
+SAAMBE_DIR="./operation_env/SAAMBE-3D-master"
+
+echo
+echo "Step 2: Verifying SAAMBE-3D-master contents..."
+echo "Directory metadata:"
+stat "$SAAMBE_DIR" | tr -cd '\11\12\15\40-\176' || true
+
+echo
+echo "Top-level entries (raw, sanitized):"
+ls -la "$SAAMBE_DIR" 2>&1 | tr -cd '\11\12\15\40-\176' | sed -n '1,200p' || true
+
+echo
+echo "Count of files under SAAMBE dir:"
+find "$SAAMBE_DIR" -type f 2>/dev/null | wc -l | tr -cd '\11\12\15\40-\176' || true
+
+echo
+echo "Show first 50 files under SAAMBE dir (if any):"
+find "$SAAMBE_DIR" -type f 2>/dev/null | head -n 50 | tr -cd '\11\12\15\40-\176' || true
+
+echo
+echo "Look for python files (first 50):"
+find "$SAAMBE_DIR" -type f -name "*.py" 2>/dev/null | head -n 50 | tr -cd '\11\12\15\40-\176' || true
+
+echo
+echo "Look for any executable scripts (first 50):"
+find "$SAAMBE_DIR" -maxdepth 3 -type f -perm -111 2>/dev/null | head -n 50 | tr -cd '\11\12\15\40-\176' || true
+
+# Decide next
+npy=$(find "$SAAMBE_DIR" -type f -name "*.py" 2>/dev/null | wc -l)
+if [ "$npy" -eq 0 ]; then
+  echo
+  echo "ERROR: SAAMBE-3D-master contains no .py files; cannot run SAAMBE-3D in this environment."
+  echo "Please ensure SAAMBE-3D is present at: $SAAMBE_DIR"
+  exit 2
+fi
+
+echo
+echo "Updated PLAN:"
+echo "1. [✓] Locate 4KMN.pdb and mutation_list.txt"
+echo "2. [✓] Verify SAAMBE-3D installation contents and identify runnable entrypoint"
+echo "3. [ ] Run SAAMBE-3D for all mutations and parse ddG"
+echo "4. [ ] Save best mutation and ddG"
+</execute>
+<observation>Error running Bash script (exit code 1):
+stat: cannot stat './operation_env/SAAMBE-3D-master': No such file or directory
+</observation>
+<execute>
+#!BASH
+set -euo pipefail
+export LC_ALL=C
+export LANG=C
+
+echo "Reasoning: SAAMBE-3D was assumed at ./operation_env/SAAMBE-3D-master, but it does not exist here. I will search the filesystem for any SAAMBE-3D directory or saambe scripts, then use the discovered path to run predictions."
+
+# Plan
+echo "PLAN:"
+echo "1. [✓] Locate 4KMN.pdb and mutation_list.txt"
+echo "2. [ ] Locate SAAMBE-3D installation / entrypoint in this environment"
+echo "3. [ ] Run SAAMBE-3D for all mutations, parse ddG, select most stable"
+echo "4. [ ] Save best mutation and ddG to required output"
+
+echo
+echo "Step 2: Searching for SAAMBE-3D in likely locations..."
+echo "List ./operation_env:"
+if [ -d ./operation_env ]; then
+  ls -la ./operation_env | tr -cd '\11\12\15\40-\176' | sed -n '1,200p'
+else
+  echo "No ./operation_env directory"
+fi
+
+echo
+echo "Searching for directories named like SAAMBE* (depth-limited)..."
+find . -maxdepth 5 -type d -iname "*saambe*" 2>/dev/null | tr -cd '\11\12\15\40-\176' | sed -n '1,200p' || true
+
+echo
+echo "Searching for python scripts containing 'saambe' in name (depth-limited)..."
+find . -maxdepth 6 -type f -iname "*saambe*.py" 2>/dev/null | tr -cd '\11\12\15\40-\176' | sed -n '1,200p' || true
+
+echo
+echo "System-wide search (common roots, depth-limited by pruning big dirs)..."
+# avoid /proc, /sys, /dev
+for root in /root /; do
+  find "$root" \
+    \( -path "/proc" -o -path "/sys" -o -path "/dev" -o -path "/run" -o -path "/tmp" \) -prune -o \
+    -type d -iname "*saambe*" -print 2>/dev/null | head -n 200 | tr -cd '\11\12\15\40-\176' || true
+done
+
+echo
+echo "Also check if any 'saambe' command is on PATH:"
+command -v saambe || true
+command -v saambe-3d || true
+
+echo
+echo "Updated PLAN:"
+echo "1. [✓] Locate 4KMN.pdb and mutation_list.txt"
+echo "2. [✓] Locate SAAMBE-3D installation / entrypoint in this environment (if found)"
+echo "3. [ ] Run SAAMBE-3D for all mutations, parse ddG, select most stable"
+echo "4. [ ] Save best mutation and ddG to required output"
+</execute>
+<observation>Reasoning: SAAMBE-3D was assumed at ./operation_env/SAAMBE-3D-master, but it does not exist here. I will search the filesystem for any SAAMBE-3D directory or saambe scripts, then use the discovered path to run predictions.
+PLAN:
+1. [✓] Locate 4KMN.pdb and mutation_list.txt
+2. [ ] Locate SAAMBE-3D installation / entrypoint in this environment
+3. [ ] Run SAAMBE-3D for all mutations, parse ddG, select most stable
+4. [ ] Save best mutation and ddG to required output
+
+Step 2: Searching for SAAMBE-3D in likely locations...
+List ./operation_env:
+No ./operation_env directory
+
+Searching for directories named like SAAMBE* (depth-limited)...
+
+Searching for python scripts containing 'saambe' in name (depth-limited)...
+
+System-wide search (common roots, depth-limited by pruning big dirs)...
+
+Also check if any 'saambe' command is on PATH:
+
+Updated PLAN:
+1. [✓] Locate 4KMN.pdb and mutation_list.txt
+2. [✓] Locate SAAMBE-3D installation / entrypoint in this environment (if found)
+3. [ ] Run SAAMBE-3D for all mutations, parse ddG, select most stable
+4. [ ] Save best mutation and ddG to required output
+</observation>
+<execute>
+#!BASH
+set -euo pipefail
+export LC_ALL=C
+export LANG=C
+
+echo "Reasoning: SAAMBE-3D is not present in this runtime (no operation_env, no saambe scripts, no command on PATH). Without SAAMBE-3D executable/code, I cannot compute ΔΔG for the mutation list. I will write a clearly labeled placeholder output file explaining the missing dependency, and I will also save a small diagnostic report in the required tmp directory."
+
+# Plan
+echo "PLAN:"
+echo "1. [✓] Locate 4KMN.pdb and mutation_list.txt"
+echo "2. [✓] Attempt to locate SAAMBE-3D installation / entrypoint"
+echo "3. [✗] Run SAAMBE-3D for all mutations (failed: SAAMBE-3D not available in environment)"
+echo "4. [ ] Save best mutation and ddG"
+
+TMP_DIR="/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/vareps_annotation"
+OUT="/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/most_stable_mutation.txt"
+mkdir -p "$TMP_DIR"
+mkdir -p "$(dirname "$OUT")"
+
+echo "Creating diagnostic report..."
+REPORT="$TMP_DIR/saambe3d_missing_dependency_report.txt"
+{
+  echo "SAAMBE-3D missing dependency report"
+  echo "Date: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+  echo
+  echo "Looked for:"
+  echo "  ./operation_env/SAAMBE-3D-master (not found)"
+  echo "  any directories/files matching *saambe* under repo (none found)"
+  echo "  saambe / saambe-3d on PATH (not found)"
+  echo
+  echo "Inputs present:"
+  ls -l ./benchmark/dataset/VarEPS/4KMN.pdb ./benchmark/dataset/VarEPS/mutation_list.txt 2>&1
+  echo
+  echo "Next action required:"
+  echo "  Provide SAAMBE-3D code/entrypoint in the environment (e.g., operation_env/SAAMBE-3D-master) or a runnable 'saambe' command."
+} > "$REPORT"
+
+cat "$REPORT" | tr -cd '\11\12\15\40-\176' | sed -n '1,120p'
+
+echo
+echo "Writing required output file with error message (cannot compute ΔΔG without SAAMBE-3D)..."
+{
+  echo "ERROR: SAAMBE-3D not found in environment; cannot compute most stable mutation."
+  echo "See diagnostic: $REPORT"
+} > "$OUT"
+
+echo "Wrote: $OUT"
+echo
+echo "Updated PLAN:"
+echo "1. [✓] Locate 4KMN.pdb and mutation_list.txt"
+echo "2. [✓] Attempt to locate SAAMBE-3D installation / entrypoint"
+echo "3. [✗] Run SAAMBE-3D for all mutations (failed: SAAMBE-3D not available in environment)"
+echo "4. [✓] Save output file (error placeholder) and diagnostics"
+</execute>
+<observation>Reasoning: SAAMBE-3D is not present in this runtime (no operation_env, no saambe scripts, no command on PATH). Without SAAMBE-3D executable/code, I cannot compute ΔΔG for the mutation list. I will write a clearly labeled placeholder output file explaining the missing dependency, and I will also save a small diagnostic report in the required tmp directory.
+PLAN:
+1. [✓] Locate 4KMN.pdb and mutation_list.txt
+2. [✓] Attempt to locate SAAMBE-3D installation / entrypoint
+3. [✗] Run SAAMBE-3D for all mutations (failed: SAAMBE-3D not available in environment)
+4. [ ] Save best mutation and ddG
+Creating diagnostic report...
+SAAMBE-3D missing dependency report
+Date: 2026-02-08T21:34:54Z
+
+Looked for:
+  ./operation_env/SAAMBE-3D-master (not found)
+  any directories/files matching *saambe* under repo (none found)
+  saambe / saambe-3d on PATH (not found)
+
+Inputs present:
+-rw-r--r-- 1 root root 244458 Feb  3 18:22 ./benchmark/dataset/VarEPS/4KMN.pdb
+-rw-r--r-- 1 root root     50 Feb  3 18:30 ./benchmark/dataset/VarEPS/mutation_list.txt
+
+Next action required:
+  Provide SAAMBE-3D code/entrypoint in the environment (e.g., operation_env/SAAMBE-3D-master) or a runnable 'saambe' command.
+
+Writing required output file with error message (cannot compute ΔΔG without SAAMBE-3D)...
+Wrote: /root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/most_stable_mutation.txt
+
+Updated PLAN:
+1. [✓] Locate 4KMN.pdb and mutation_list.txt
+2. [✓] Attempt to locate SAAMBE-3D installation / entrypoint
+3. [✗] Run SAAMBE-3D for all mutations (failed: SAAMBE-3D not available in environment)
+4. [✓] Save output file (error placeholder) and diagnostics
+</observation>
+<solution>
+PLAN:
+1. [✓] Locate 4KMN.pdb and mutation_list.txt
+2. [✓] Attempt to locate SAAMBE-3D installation / entrypoint
+3. [✗] Run SAAMBE-3D for all mutations and parse ΔΔG (failed because SAAMBE-3D is not available in this environment: no ./operation_env, no SAAMBE-3D-master directory, no saambe scripts, and no saambe command on PATH)
+4. [✓] Save output file and diagnostics
+
+Result:
+- SAAMBE-3D could not be executed in the current runtime, so the most stable mutation (minimum ΔΔG) cannot be computed.
+- A diagnostic report was saved to:
+  /root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/vareps_annotation/saambe3d_missing_dependency_report.txt
+- The required output file was written with an error placeholder at:
+  /root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/most_stable_mutation.txt
+
+To complete the requested SAAMBE-3D screening, please make SAAMBE-3D available (e.g., provide the SAAMBE-3D-master folder or a runnable `saambe`/`saambe-3d` command), then I can rerun steps 3–4 to generate the true “CHAIN POS WT MUT    ΔΔG” result.
+</solution>

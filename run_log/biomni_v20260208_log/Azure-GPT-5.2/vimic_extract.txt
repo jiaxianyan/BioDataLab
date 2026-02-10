@@ -1,0 +1,1818 @@
+Extracting the mutation sites of Hepatitis B virus (HBV) from the provided pdf file `benchmark/dataset/ViMIC/12985_2021_Article_1493.pdf`.
+
+Saving the results into a json file `/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/vimic_extract.json`.
+
+Result format reference:
+[
+  "G130E",
+  "L109R"
+]
+
+All intermediate results should be saved in `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/vimic_extract` directory.
+
+<execute>#!/usr/bin/env python3
+import os, re, json
+from pathlib import Path
+
+print("Research log: HBV mutation extraction from PDF")
+
+# Plan
+plan = [
+    "Locate and validate the input PDF; create intermediate/output directories.",
+    "Extract text from the PDF (pdfplumber); if needed, fall back to OCR for image-only pages.",
+    "Identify candidate mutation strings using robust regex patterns and filter to plausible amino-acid substitutions.",
+    "De-duplicate, sort, save intermediate artifacts and final JSON to the requested path."
+]
+for i, s in enumerate(plan, 1):
+    print(f"{i}. [ ] {s}")
+
+# Step 1
+pdf_path = Path("benchmark/dataset/ViMIC/12985_2021_Article_1493.pdf")
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/vimic_extract")
+out_path = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/vimic_extract.json")
+tmp_dir.mkdir(parents=True, exist_ok=True)
+out_path.parent.mkdir(parents=True, exist_ok=True)
+
+print("\nStep 1: Validate paths")
+print("PDF exists:", pdf_path.exists(), "->", pdf_path.resolve())
+print("TMP dir:", tmp_dir)
+print("OUT path:", out_path)
+
+plan_status = [
+    True,
+    False,
+    False,
+    False
+]
+
+def print_plan():
+    for i, s in enumerate(plan, 1):
+        mark = "✓" if plan_status[i-1] is True else ("✗" if plan_status[i-1] is False and i-1 < completed_fail_index else " ")
+        # We'll handle failures later; for now just show completion for step 1.
+    # Simpler:
+    for i, s in enumerate(plan, 1):
+        mark = "✓" if (i==1) else " "
+        print(f"{i}. [{mark}] {s}" + (" (completed)" if i==1 else ""))
+
+print("\nUpdated plan after Step 1:")
+print_plan()
+
+# Step 2: Extract text
+print("\nStep 2: Extract text with pdfplumber")
+import pdfplumber
+
+all_text = []
+page_meta = []
+with pdfplumber.open(str(pdf_path)) as pdf:
+    for idx, page in enumerate(pdf.pages, 1):
+        txt = page.extract_text() or ""
+        all_text.append(txt)
+        page_meta.append({"page": idx, "nchars": len(txt)})
+text = "\n\n".join(all_text)
+
+# Save intermediate text and page stats
+(tmp_dir / "page_text_lengths.json").write_text(json.dumps(page_meta, indent=2))
+(tmp_dir / "full_text.txt").write_text(text)
+
+print("Extracted pages:", len(page_meta))
+print("Total extracted characters:", len(text))
+print("Pages with 0 chars:", sum(1 for m in page_meta if m["nchars"]==0))
+
+# Update plan for step 2
+# If too little text, we would OCR; but let's decide threshold.
+too_little = len(text.strip()) < 2000
+if too_little:
+    print("WARNING: Extracted text seems too small; would need OCR fallback (not implemented yet).")
+else:
+    print("Text extraction seems sufficient; proceeding to mutation mining.")
+
+print("\nUpdated plan after Step 2:")
+for i, s in enumerate(plan, 1):
+    mark = "✓" if i in (1,2) else " "
+    print(f"{i}. [{mark}] {s}" + (" (completed)" if i in (1,2) else ""))
+
+# Step 3: Find candidate mutations
+print("\nStep 3: Mine mutation patterns")
+
+# Amino acids single-letter codes
+aa = "ACDEFGHIKLMNPQRSTVWY"
+aa_set = set(aa)
+
+# Common patterns:
+# 1) G130E, L109R, rtM204V, sG145R, preS1A... etc.
+# We'll capture optional gene/protein prefixes like rt, s, preS1, preS2, core, HBx, pol etc.
+prefix_pat = r"(?:rt|RT|s|S|preS1|preS2|preS|PreS1|PreS2|PreS|core|Core|HBx|hbx|pol|Pol|P|X)?"
+mut_pat1 = re.compile(rf"\b{prefix_pat}\s*([{aa}])\s*([0-9]{{1,4}})\s*([{aa}])\b")
+# Also allow formats like G130E with no spaces; done above.
+# 2) Formats with arrow: G130->E, G130→E, G130 to E
+mut_pat2 = re.compile(rf"\b([{aa}])\s*([0-9]{{1,4}})\s*(?:->|→|to)\s*([{aa}])\b")
+
+cands = []
+contexts = []
+for m in mut_pat1.finditer(text):
+    a1, pos, a2 = m.group(1), m.group(2), m.group(3)
+    if a1 in aa_set and a2 in aa_set:
+        token = f"{a1}{pos}{a2}"
+        cands.append(token)
+        # context window
+        start = max(0, m.start()-40); end = min(len(text), m.end()+40)
+        contexts.append({"mutation": token, "match": m.group(0), "context": text[start:end].replace("\n"," ")})
+for m in mut_pat2.finditer(text):
+    a1, pos, a2 = m.group(1), m.group(2), m.group(3)
+    token = f"{a1}{pos}{a2}"
+    cands.append(token)
+    start = max(0, m.start()-40); end = min(len(text), m.end()+40)
+    contexts.append({"mutation": token, "match": m.group(0), "context": text[start:end].replace("\n"," ")})
+
+print("Raw candidate count:", len(cands))
+
+# Filter out likely false positives:
+# - Position should be reasonable for HBV proteins; but across proteins, max ~ 900 (polymerase ~ 843 aa).
+# We'll keep 1..900.
+filtered = []
+for t in cands:
+    m = re.match(rf"^([{aa}])(\d{{1,4}})([{aa}])$", t)
+    if not m: 
+        continue
+    pos = int(m.group(2))
+    if 1 <= pos <= 900 and m.group(1) != m.group(3):
+        filtered.append(t)
+
+# Deduplicate preserving order
+seen = set()
+uniq = []
+for t in filtered:
+    if t not in seen:
+        seen.add(t)
+        uniq.append(t)
+
+print("Filtered unique mutation count:", len(uniq))
+print("First 30:", uniq[:30])
+
+# Save intermediate candidates and contexts
+(tmp_dir / "mutation_candidates_raw.json").write_text(json.dumps(cands[:5000], indent=2))
+(tmp_dir / "mutation_contexts.json").write_text(json.dumps(contexts[:5000], indent=2))
+(tmp_dir / "mutation_list_unique.json").write_text(json.dumps(uniq, indent=2))
+
+print("\nUpdated plan after Step 3:")
+for i, s in enumerate(plan, 1):
+    mark = "✓" if i in (1,2,3) else " "
+    print(f"{i}. [{mark}] {s}" + (" (completed)" if i in (1,2,3) else ""))
+
+# Step 4: Save final JSON
+print("\nStep 4: Save final JSON")
+out_path.write_text(json.dumps(uniq, indent=2))
+print("Wrote:", out_path, "n=", len(uniq))
+
+print("\nUpdated plan after Step 4:")
+for i, s in enumerate(plan, 1):
+    print(f"{i}. [✓] {s} (completed)")
+</execute>
+<observation>NameError("name 'plan' is not defined")</observation>
+<execute>#!/usr/bin/env python3
+import os, re, json
+from pathlib import Path
+
+print("Research log: HBV mutation extraction from PDF")
+
+# -------------------------
+# Plan (define FIRST)
+# -------------------------
+plan = [
+    "Locate and validate the input PDF; create intermediate/output directories.",
+    "Extract text from the PDF (pdfplumber); if needed, fall back to OCR for image-only pages.",
+    "Identify candidate mutation strings using robust regex patterns and filter to plausible amino-acid substitutions.",
+    "De-duplicate, sort, save intermediate artifacts and final JSON to the requested path."
+]
+plan_status = [False]*len(plan)
+
+def show_plan():
+    for i, s in enumerate(plan, 1):
+        if plan_status[i-1] is True:
+            mark = "✓"
+            suffix = " (completed)"
+        elif plan_status[i-1] == "fail":
+            mark = "✗"
+            suffix = " (failed)"
+        else:
+            mark = " "
+            suffix = ""
+        print(f"{i}. [{mark}] {s}{suffix}")
+
+print("Initial plan:")
+show_plan()
+
+# -------------------------
+# Step 1
+# -------------------------
+pdf_path = Path("benchmark/dataset/ViMIC/12985_2021_Article_1493.pdf")
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/vimic_extract")
+out_path = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/vimic_extract.json")
+tmp_dir.mkdir(parents=True, exist_ok=True)
+out_path.parent.mkdir(parents=True, exist_ok=True)
+
+print("\nStep 1: Validate paths")
+print("PDF exists:", pdf_path.exists(), "->", pdf_path.resolve())
+print("TMP dir:", tmp_dir)
+print("OUT path:", out_path)
+
+if not pdf_path.exists():
+    raise FileNotFoundError(f"Input PDF not found: {pdf_path}")
+
+plan_status[0] = True
+print("\nUpdated plan after Step 1:")
+show_plan()
+
+# -------------------------
+# Step 2
+# -------------------------
+print("\nStep 2: Extract text with pdfplumber")
+import pdfplumber
+
+all_text = []
+page_meta = []
+with pdfplumber.open(str(pdf_path)) as pdf:
+    for idx, page in enumerate(pdf.pages, 1):
+        txt = page.extract_text() or ""
+        all_text.append(txt)
+        page_meta.append({"page": idx, "nchars": len(txt)})
+
+text = "\n\n".join(all_text)
+
+(tmp_dir / "page_text_lengths.json").write_text(json.dumps(page_meta, indent=2))
+(tmp_dir / "full_text.txt").write_text(text)
+
+print("Extracted pages:", len(page_meta))
+print("Total extracted characters:", len(text))
+print("Pages with 0 chars:", sum(1 for m in page_meta if m["nchars"] == 0))
+
+# If very little text, note (OCR fallback not run automatically)
+too_little = len(text.strip()) < 2000
+if too_little:
+    print("WARNING: Extracted text seems too small; OCR fallback may be required (not executed).")
+else:
+    print("Text extraction seems sufficient; proceeding.")
+
+plan_status[1] = True
+print("\nUpdated plan after Step 2:")
+show_plan()
+
+# -------------------------
+# Step 3
+# -------------------------
+print("\nStep 3: Mine mutation patterns")
+aa = "ACDEFGHIKLMNPQRSTVWY"
+aa_set = set(aa)
+
+prefix_pat = r"(?:rt|RT|s|S|preS1|preS2|preS|PreS1|PreS2|PreS|core|Core|HBx|hbx|pol|Pol|P|X)?"
+mut_pat1 = re.compile(rf"\b{prefix_pat}\s*([{aa}])\s*([0-9]{{1,4}})\s*([{aa}])\b")
+mut_pat2 = re.compile(rf"\b([{aa}])\s*([0-9]{{1,4}})\s*(?:->|→|to)\s*([{aa}])\b")
+
+cands = []
+contexts = []
+
+def add_context(mutation, match_obj, match_text):
+    start = max(0, match_obj.start() - 40)
+    end = min(len(text), match_obj.end() + 40)
+    contexts.append({
+        "mutation": mutation,
+        "match": match_text,
+        "context": text[start:end].replace("\n", " ")
+    })
+
+for m in mut_pat1.finditer(text):
+    a1, pos, a2 = m.group(1), m.group(2), m.group(3)
+    if a1 in aa_set and a2 in aa_set:
+        token = f"{a1}{pos}{a2}"
+        cands.append(token)
+        add_context(token, m, m.group(0))
+
+for m in mut_pat2.finditer(text):
+    a1, pos, a2 = m.group(1), m.group(2), m.group(3)
+    token = f"{a1}{pos}{a2}"
+    cands.append(token)
+    add_context(token, m, m.group(0))
+
+print("Raw candidate count:", len(cands))
+
+filtered = []
+for t in cands:
+    m = re.match(rf"^([{aa}])(\d{{1,4}})([{aa}])$", t)
+    if not m:
+        continue
+    pos = int(m.group(2))
+    if 1 <= pos <= 900 and m.group(1) != m.group(3):
+        filtered.append(t)
+
+seen = set()
+uniq = []
+for t in filtered:
+    if t not in seen:
+        seen.add(t)
+        uniq.append(t)
+
+print("Filtered unique mutation count:", len(uniq))
+print("First 30:", uniq[:30])
+
+(tmp_dir / "mutation_candidates_raw.json").write_text(json.dumps(cands[:100000], indent=2))
+(tmp_dir / "mutation_contexts.json").write_text(json.dumps(contexts[:100000], indent=2))
+(tmp_dir / "mutation_list_unique.json").write_text(json.dumps(uniq, indent=2))
+
+plan_status[2] = True
+print("\nUpdated plan after Step 3:")
+show_plan()
+
+# -------------------------
+# Step 4
+# -------------------------
+print("\nStep 4: Save final JSON")
+out_path.write_text(json.dumps(uniq, indent=2))
+print("Wrote:", out_path, "n=", len(uniq))
+
+plan_status[3] = True
+print("\nUpdated plan after Step 4:")
+show_plan()
+</execute>
+<observation>NameError("name 'plan' is not defined")</observation>
+<execute>#!/usr/bin/env python3
+# Debug: ensure no stale state; run minimal reproduction end-to-end in one script.
+import json, re
+from pathlib import Path
+
+print("DEBUG START")
+
+plan = ["a","b","c","d"]
+plan_status = [False]*len(plan)
+
+def show_plan():
+    for i, s in enumerate(plan, 1):
+        mark = "✓" if plan_status[i-1] else " "
+        print(f"{i}. [{mark}] {s}")
+
+print("Plan defined? ->", "plan" in globals())
+show_plan()
+
+print("DEBUG END") 
+</execute>
+<observation>NameError("name 'plan' is not defined")</observation>
+<execute>#!/usr/bin/env python3
+# The environment appears to raise NameError for 'plan' regardless of definition.
+# Workaround: avoid any variable named 'plan' and proceed with extraction.
+
+import os, re, json
+from pathlib import Path
+
+print("Research log: HBV mutation extraction from PDF (workaround: no variable named 'plan')")
+
+steps = [
+    "Locate/validate input PDF and create intermediate/output directories.",
+    "Extract text from PDF with pdfplumber and save extracted text as intermediate.",
+    "Regex-mine amino-acid substitutions and save intermediate candidate/context files.",
+    "Write final de-duplicated mutation list JSON to requested output path."
+]
+done = [False]*len(steps)
+
+def show_steps():
+    for i, s in enumerate(steps, 1):
+        mark = "✓" if done[i-1] else " "
+        print(f"{i}. [{mark}] {s}" + (" (completed)" if done[i-1] else ""))
+
+print("Checklist:")
+show_steps()
+
+# Step 1
+pdf_path = Path("benchmark/dataset/ViMIC/12985_2021_Article_1493.pdf")
+tmp_dir = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/vimic_extract")
+out_path = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/vimic_extract.json")
+tmp_dir.mkdir(parents=True, exist_ok=True)
+out_path.parent.mkdir(parents=True, exist_ok=True)
+
+print("\nStep 1: Validate paths")
+print("PDF exists:", pdf_path.exists(), "->", pdf_path.resolve())
+print("TMP dir:", tmp_dir)
+print("OUT path:", out_path)
+if not pdf_path.exists():
+    raise FileNotFoundError(f"Input PDF not found: {pdf_path}")
+done[0] = True
+print("\nUpdated checklist:")
+show_steps()
+
+# Step 2
+print("\nStep 2: Extract text with pdfplumber")
+import pdfplumber
+
+all_text = []
+page_meta = []
+with pdfplumber.open(str(pdf_path)) as pdf:
+    for idx, page in enumerate(pdf.pages, 1):
+        txt = page.extract_text() or ""
+        all_text.append(txt)
+        page_meta.append({"page": idx, "nchars": len(txt)})
+
+text = "\n\n".join(all_text)
+(tmp_dir / "page_text_lengths.json").write_text(json.dumps(page_meta, indent=2))
+(tmp_dir / "full_text.txt").write_text(text)
+
+print("Pages:", len(page_meta))
+print("Total chars:", len(text))
+print("Zero-text pages:", sum(1 for m in page_meta if m["nchars"] == 0))
+if len(text.strip()) < 2000:
+    print("WARNING: extracted text is small; OCR may be needed (not executed).")
+
+done[1] = True
+print("\nUpdated checklist:")
+show_steps()
+
+# Step 3
+print("\nStep 3: Mine mutation patterns")
+aa = "ACDEFGHIKLMNPQRSTVWY"
+aa_set = set(aa)
+
+prefix_pat = r"(?:rt|RT|s|S|preS1|preS2|preS|PreS1|PreS2|PreS|core|Core|HBx|hbx|pol|Pol|P|X)?"
+mut_pat1 = re.compile(rf"\b{prefix_pat}\s*([{aa}])\s*([0-9]{{1,4}})\s*([{aa}])\b")
+mut_pat2 = re.compile(rf"\b([{aa}])\s*([0-9]{{1,4}})\s*(?:->|→|to)\s*([{aa}])\b")
+
+cands = []
+contexts = []
+
+def add_ctx(token, m, match_txt):
+    start = max(0, m.start()-40)
+    end = min(len(text), m.end()+40)
+    contexts.append({
+        "mutation": token,
+        "match": match_txt,
+        "context": text[start:end].replace("\n", " ")
+    })
+
+for m in mut_pat1.finditer(text):
+    a1, pos, a2 = m.group(1), m.group(2), m.group(3)
+    if a1 in aa_set and a2 in aa_set:
+        token = f"{a1}{pos}{a2}"
+        cands.append(token)
+        add_ctx(token, m, m.group(0))
+
+for m in mut_pat2.finditer(text):
+    a1, pos, a2 = m.group(1), m.group(2), m.group(3)
+    token = f"{a1}{pos}{a2}"
+    cands.append(token)
+    add_ctx(token, m, m.group(0))
+
+print("Raw candidates:", len(cands))
+
+# Filter: 1..900 positions, non-synonymous only
+filtered = []
+for t in cands:
+    mm = re.match(rf"^([{aa}])(\d{{1,4}})([{aa}])$", t)
+    if not mm:
+        continue
+    pos = int(mm.group(2))
+    if 1 <= pos <= 900 and mm.group(1) != mm.group(3):
+        filtered.append(t)
+
+seen = set()
+uniq = []
+for t in filtered:
+    if t not in seen:
+        seen.add(t)
+        uniq.append(t)
+
+print("Unique filtered:", len(uniq))
+print("Preview (up to 40):", uniq[:40])
+
+(tmp_dir / "mutation_candidates_raw.json").write_text(json.dumps(cands[:200000], indent=2))
+(tmp_dir / "mutation_contexts.json").write_text(json.dumps(contexts[:200000], indent=2))
+(tmp_dir / "mutation_list_unique.json").write_text(json.dumps(uniq, indent=2))
+
+done[2] = True
+print("\nUpdated checklist:")
+show_steps()
+
+# Step 4
+print("\nStep 4: Write final output JSON")
+out_path.write_text(json.dumps(uniq, indent=2))
+print("Saved final JSON:", out_path, "count:", len(uniq))
+
+done[3] = True
+print("\nUpdated checklist:")
+show_steps()
+</execute>
+<observation>NameError("name 'steps' is not defined")</observation>
+<execute>#!/usr/bin/env python3
+# Workaround for environment bug: NameError triggered for common variable names.
+# Use only dictionary lookups via globals() and avoid referencing identifiers after assignment.
+
+import json, re
+from pathlib import Path
+
+print("Research log: HBV mutation extraction from PDF (identifier-avoidance mode)")
+
+# --- create dirs/paths without relying on variable names later ---
+globals()["PDF_PATH"] = Path("benchmark/dataset/ViMIC/12985_2021_Article_1493.pdf")
+globals()["TMP_DIR"] = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/vimic_extract")
+globals()["OUT_PATH"] = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/vimic_extract.json")
+
+globals()["TMP_DIR"].mkdir(parents=True, exist_ok=True)
+globals()["OUT_PATH"].parent.mkdir(parents=True, exist_ok=True)
+
+print("\n1) Validate paths")
+print("PDF exists:", globals()["PDF_PATH"].exists(), "->", globals()["PDF_PATH"].resolve())
+if not globals()["PDF_PATH"].exists():
+    raise FileNotFoundError(f"Input PDF not found: {globals()['PDF_PATH']}")
+
+print("TMP dir:", globals()["TMP_DIR"])
+print("OUT path:", globals()["OUT_PATH"])
+
+print("\nChecklist:")
+print("1. [✓] Locate/validate input PDF and create intermediate/output directories. (completed)")
+print("2. [ ] Extract text from PDF and save intermediate. ")
+print("3. [ ] Regex-mine amino-acid substitutions and save intermediate files. ")
+print("4. [ ] Write final JSON. ")
+
+# --- Step 2: extract text ---
+print("\n2) Extract text with pdfplumber")
+import pdfplumber
+
+_text_pages = []
+_meta = []
+with pdfplumber.open(str(globals()["PDF_PATH"])) as _pdf:
+    for _i, _page in enumerate(_pdf.pages, 1):
+        _t = _page.extract_text() or ""
+        _text_pages.append(_t)
+        _meta.append({"page": _i, "nchars": len(_t)})
+
+globals()["TEXT_ALL"] = "\n\n".join(_text_pages)
+(globals()["TMP_DIR"] / "page_text_lengths.json").write_text(json.dumps(_meta, indent=2))
+(globals()["TMP_DIR"] / "full_text.txt").write_text(globals()["TEXT_ALL"])
+
+print("Pages:", len(_meta))
+print("Total chars:", len(globals()["TEXT_ALL"]))
+print("Zero-text pages:", sum(1 for m in _meta if m["nchars"] == 0))
+if len(globals()["TEXT_ALL"].strip()) < 2000:
+    print("WARNING: extracted text is small; OCR may be needed (not executed).")
+
+print("\nChecklist:")
+print("1. [✓] Locate/validate input PDF and create intermediate/output directories. (completed)")
+print("2. [✓] Extract text from PDF and save intermediate. (completed)")
+print("3. [ ] Regex-mine amino-acid substitutions and save intermediate files. ")
+print("4. [ ] Write final JSON. ")
+
+# --- Step 3: mine mutations ---
+print("\n3) Mine mutation patterns")
+_aa = "ACDEFGHIKLMNPQRSTVWY"
+_prefix = r"(?:rt|RT|s|S|preS1|preS2|preS|PreS1|PreS2|PreS|core|Core|HBx|hbx|pol|Pol|P|X)?"
+_pat1 = re.compile(rf"\b{_prefix}\s*([{_aa}])\s*([0-9]{{1,4}})\s*([{_aa}])\b")
+_pat2 = re.compile(rf"\b([{_aa}])\s*([0-9]{{1,4}})\s*(?:->|→|to)\s*([{_aa}])\b")
+
+_cands = []
+_ctx = []
+_txt = globals()["TEXT_ALL"]
+
+def _add(_tok, _m, _mtxt):
+    _s = max(0, _m.start()-40); _e = min(len(_txt), _m.end()+40)
+    _ctx.append({"mutation": _tok, "match": _mtxt, "context": _txt[_s:_e].replace("\n"," ")})
+
+for _m in _pat1.finditer(_txt):
+    _tok = f"{_m.group(1)}{_m.group(2)}{_m.group(3)}"
+    _cands.append(_tok)
+    _add(_tok, _m, _m.group(0))
+
+for _m in _pat2.finditer(_txt):
+    _tok = f"{_m.group(1)}{_m.group(2)}{_m.group(3)}"
+    _cands.append(_tok)
+    _add(_tok, _m, _m.group(0))
+
+print("Raw candidates:", len(_cands))
+
+_filt = []
+for _t in _cands:
+    _mm = re.match(rf"^([{_aa}])(\d{{1,4}})([{_aa}])$", _t)
+    if not _mm:
+        continue
+    _pos = int(_mm.group(2))
+    if 1 <= _pos <= 900 and _mm.group(1) != _mm.group(3):
+        _filt.append(_t)
+
+_seen = set()
+globals()["MUTS"] = []
+for _t in _filt:
+    if _t not in _seen:
+        _seen.add(_t)
+        globals()["MUTS"].append(_t)
+
+print("Unique filtered:", len(globals()["MUTS"]))
+print("Preview (up to 40):", globals()["MUTS"][:40])
+
+(globals()["TMP_DIR"] / "mutation_candidates_raw.json").write_text(json.dumps(_cands[:200000], indent=2))
+(globals()["TMP_DIR"] / "mutation_contexts.json").write_text(json.dumps(_ctx[:200000], indent=2))
+(globals()["TMP_DIR"] / "mutation_list_unique.json").write_text(json.dumps(globals()["MUTS"], indent=2))
+
+print("\nChecklist:")
+print("1. [✓] Locate/validate input PDF and create intermediate/output directories. (completed)")
+print("2. [✓] Extract text from PDF and save intermediate. (completed)")
+print("3. [✓] Regex-mine amino-acid substitutions and save intermediate files. (completed)")
+print("4. [ ] Write final JSON. ")
+
+# --- Step 4: write output ---
+print("\n4) Write final JSON")
+globals()["OUT_PATH"].write_text(json.dumps(globals()["MUTS"], indent=2))
+print("Saved:", globals()["OUT_PATH"], "count:", len(globals()["MUTS"]))
+
+print("\nChecklist:")
+print("1. [✓] Locate/validate input PDF and create intermediate/output directories. (completed)")
+print("2. [✓] Extract text from PDF and save intermediate. (completed)")
+print("3. [✓] Regex-mine amino-acid substitutions and save intermediate files. (completed)")
+print("4. [✓] Write final JSON. (completed)")
+</execute>
+<observation>ModuleNotFoundError("No module named 'pdfplumber'")</observation>
+<execute>#!/usr/bin/env python3
+import json, re, subprocess, shutil
+from pathlib import Path
+
+print("Research log: HBV mutation extraction from PDF (no pdfplumber; using pdftotext)")
+
+# Checklist (printed, not stored in a variable that might trigger NameError issues)
+print("1. [ ] Validate input/output paths; create intermediate directories.")
+print("2. [ ] Extract PDF text via system tool (pdftotext).")
+print("3. [ ] Regex-mine amino-acid substitutions; save intermediates.")
+print("4. [ ] Write final JSON output.")
+
+PDF_PATH = Path("benchmark/dataset/ViMIC/12985_2021_Article_1493.pdf")
+TMP_DIR = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/vimic_extract")
+OUT_PATH = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/vimic_extract.json")
+TMP_DIR.mkdir(parents=True, exist_ok=True)
+OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+print("\nStep 1: Validate paths")
+print("PDF exists:", PDF_PATH.exists(), "->", PDF_PATH.resolve())
+if not PDF_PATH.exists():
+    raise FileNotFoundError(str(PDF_PATH))
+print("TMP_DIR:", TMP_DIR)
+print("OUT_PATH:", OUT_PATH)
+print("\n1. [✓] Validate input/output paths; create intermediate directories.")
+print("2. [ ] Extract PDF text via system tool (pdftotext).")
+print("3. [ ] Regex-mine amino-acid substitutions; save intermediates.")
+print("4. [ ] Write final JSON output.")
+
+print("\nStep 2: Extract text using pdftotext")
+pdftotext = shutil.which("pdftotext")
+if not pdftotext:
+    raise RuntimeError("pdftotext not found in PATH; cannot extract PDF text in this environment.")
+
+txt_out = TMP_DIR / "full_text_pdftotext.txt"
+cmd = [pdftotext, "-layout", str(PDF_PATH), str(txt_out)]
+print("Running:", " ".join(cmd))
+res = subprocess.run(cmd, capture_output=True, text=True)
+print("Return code:", res.returncode)
+if res.stdout.strip():
+    print("STDOUT:", res.stdout[:5000])
+if res.stderr.strip():
+    print("STDERR:", res.stderr[:5000])
+if res.returncode != 0 or not txt_out.exists():
+    raise RuntimeError("pdftotext failed to produce output text.")
+
+TEXT_ALL = txt_out.read_text(errors="ignore")
+print("Extracted chars:", len(TEXT_ALL))
+(TMP_DIR / "full_text.txt").write_text(TEXT_ALL)
+
+print("\n1. [✓] Validate input/output paths; create intermediate directories.")
+print("2. [✓] Extract PDF text via system tool (pdftotext).")
+print("3. [ ] Regex-mine amino-acid substitutions; save intermediates.")
+print("4. [ ] Write final JSON output.")
+
+print("\nStep 3: Regex-mine mutation patterns")
+aa = "ACDEFGHIKLMNPQRSTVWY"
+prefix_pat = r"(?:rt|RT|s|S|preS1|preS2|preS|PreS1|PreS2|PreS|core|Core|HBx|hbx|pol|Pol|P|X)?"
+pat1 = re.compile(rf"\b{prefix_pat}\s*([{aa}])\s*([0-9]{{1,4}})\s*([{aa}])\b")
+pat2 = re.compile(rf"\b([{aa}])\s*([0-9]{{1,4}})\s*(?:->|→|to)\s*([{aa}])\b")
+
+cands = []
+contexts = []
+def add_ctx(tok, m, match_txt):
+    s = max(0, m.start()-60); e = min(len(TEXT_ALL), m.end()+60)
+    contexts.append({"mutation": tok, "match": match_txt, "context": TEXT_ALL[s:e].replace("\n"," ")})
+
+for m in pat1.finditer(TEXT_ALL):
+    tok = f"{m.group(1)}{m.group(2)}{m.group(3)}"
+    cands.append(tok)
+    add_ctx(tok, m, m.group(0))
+
+for m in pat2.finditer(TEXT_ALL):
+    tok = f"{m.group(1)}{m.group(2)}{m.group(3)}"
+    cands.append(tok)
+    add_ctx(tok, m, m.group(0))
+
+# Filter: plausible AA substitutions only; positions 1..900; non-synonymous
+filt = []
+for t in cands:
+    mm = re.match(rf"^([{aa}])(\d{{1,4}})([{aa}])$", t)
+    if not mm:
+        continue
+    pos = int(mm.group(2))
+    if 1 <= pos <= 900 and mm.group(1) != mm.group(3):
+        filt.append(t)
+
+seen = set()
+uniq = []
+for t in filt:
+    if t not in seen:
+        seen.add(t)
+        uniq.append(t)
+
+print("Raw candidates:", len(cands))
+print("Unique filtered mutations:", len(uniq))
+print("Preview (first 40):", uniq[:40])
+
+(TMP_DIR / "mutation_candidates_raw.json").write_text(json.dumps(cands[:200000], indent=2))
+(TMP_DIR / "mutation_contexts.json").write_text(json.dumps(contexts[:200000], indent=2))
+(TMP_DIR / "mutation_list_unique.json").write_text(json.dumps(uniq, indent=2))
+
+print("\n1. [✓] Validate input/output paths; create intermediate directories.")
+print("2. [✓] Extract PDF text via system tool (pdftotext).")
+print("3. [✓] Regex-mine amino-acid substitutions; save intermediates.")
+print("4. [ ] Write final JSON output.")
+
+print("\nStep 4: Write final JSON")
+OUT_PATH.write_text(json.dumps(uniq, indent=2))
+print("Saved final JSON:", OUT_PATH, "count:", len(uniq))
+
+print("\n1. [✓] Validate input/output paths; create intermediate directories.")
+print("2. [✓] Extract PDF text via system tool (pdftotext).")
+print("3. [✓] Regex-mine amino-acid substitutions; save intermediates.")
+print("4. [✓] Write final JSON output.")
+</execute>
+<observation>RuntimeError('pdftotext not found in PATH; cannot extract PDF text in this environment.')</observation>
+<execute>#!/usr/bin/env python3
+import json, re
+from pathlib import Path
+
+print("Research log: HBV mutation extraction from PDF (fallback to PyMuPDF/fitz; OCR last resort)")
+
+print("1. [ ] Validate input/output paths; create intermediate directories.")
+print("2. [ ] Extract PDF text via PyMuPDF (fitz).")
+print("3. [ ] If little/no text, OCR pages (pytesseract) and extract text.")
+print("4. [ ] Regex-mine amino-acid substitutions; save intermediates and final JSON output.")
+
+PDF_PATH = Path("benchmark/dataset/ViMIC/12985_2021_Article_1493.pdf")
+TMP_DIR = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/vimic_extract")
+OUT_PATH = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/vimic_extract.json")
+TMP_DIR.mkdir(parents=True, exist_ok=True)
+OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+print("\nStep 1: Validate paths")
+print("PDF exists:", PDF_PATH.exists(), "->", PDF_PATH.resolve())
+if not PDF_PATH.exists():
+    raise FileNotFoundError(str(PDF_PATH))
+print("TMP_DIR:", TMP_DIR)
+print("OUT_PATH:", OUT_PATH)
+print("\n1. [✓] Validate input/output paths; create intermediate directories.")
+print("2. [ ] Extract PDF text via PyMuPDF (fitz).")
+print("3. [ ] If little/no text, OCR pages (pytesseract) and extract text.")
+print("4. [ ] Regex-mine amino-acid substitutions; save intermediates and final JSON output.")
+
+# Step 2: PyMuPDF
+print("\nStep 2: Extract text via PyMuPDF (fitz)")
+TEXT_ALL = ""
+page_stats = []
+fitz_ok = False
+try:
+    import fitz  # PyMuPDF
+    fitz_ok = True
+except Exception as e:
+    print("Could not import fitz (PyMuPDF):", repr(e))
+
+if fitz_ok:
+    doc = fitz.open(str(PDF_PATH))
+    parts = []
+    for i in range(doc.page_count):
+        page = doc.load_page(i)
+        t = page.get_text("text") or ""
+        parts.append(t)
+        page_stats.append({"page": i+1, "nchars": len(t)})
+    TEXT_ALL = "\n\n".join(parts)
+    (TMP_DIR / "page_text_lengths_fitz.json").write_text(json.dumps(page_stats, indent=2))
+    (TMP_DIR / "full_text_fitz.txt").write_text(TEXT_ALL)
+
+print("Extracted chars (fitz):", len(TEXT_ALL))
+print("Zero-text pages (fitz):", sum(1 for s in page_stats if s["nchars"] == 0) if page_stats else "NA")
+
+print("\n1. [✓] Validate input/output paths; create intermediate directories.")
+print("2. [✓] Extract PDF text via PyMuPDF (fitz).")
+print("3. [ ] If little/no text, OCR pages (pytesseract) and extract text.")
+print("4. [ ] Regex-mine amino-acid substitutions; save intermediates and final JSON output.")
+
+# Step 3: OCR if needed
+need_ocr = len(TEXT_ALL.strip()) < 2000
+if need_ocr:
+    print("\nStep 3: Text too small; attempting OCR with pytesseract")
+    from PIL import Image
+    import pytesseract
+
+    if not fitz_ok:
+        raise RuntimeError("Cannot OCR because fitz is unavailable to render PDF pages to images.")
+    doc = fitz.open(str(PDF_PATH))
+    ocr_parts = []
+    ocr_stats = []
+    for i in range(doc.page_count):
+        page = doc.load_page(i)
+        pix = page.get_pixmap(dpi=300)
+        img_path = TMP_DIR / f"page_{i+1:03d}.png"
+        pix.save(str(img_path))
+        txt = pytesseract.image_to_string(Image.open(img_path))
+        ocr_parts.append(txt)
+        ocr_stats.append({"page": i+1, "nchars": len(txt)})
+    TEXT_ALL = "\n\n".join(ocr_parts)
+    (TMP_DIR / "page_text_lengths_ocr.json").write_text(json.dumps(ocr_stats, indent=2))
+    (TMP_DIR / "full_text_ocr.txt").write_text(TEXT_ALL)
+    print("Extracted chars (OCR):", len(TEXT_ALL))
+else:
+    print("\nStep 3: OCR not needed (sufficient extracted text).")
+
+print("\n1. [✓] Validate input/output paths; create intermediate directories.")
+print("2. [✓] Extract PDF text via PyMuPDF (fitz).")
+print("3. [✓] If little/no text, OCR pages (pytesseract) and extract text. (completed)")
+print("4. [ ] Regex-mine amino-acid substitutions; save intermediates and final JSON output.")
+
+# Step 4: mutation mining + save
+print("\nStep 4: Regex-mine mutation patterns and save")
+(TMP_DIR / "full_text.txt").write_text(TEXT_ALL)
+
+aa = "ACDEFGHIKLMNPQRSTVWY"
+prefix_pat = r"(?:rt|RT|s|S|preS1|preS2|preS|PreS1|PreS2|PreS|core|Core|HBx|hbx|pol|Pol|P|X)?"
+pat1 = re.compile(rf"\b{prefix_pat}\s*([{aa}])\s*([0-9]{{1,4}})\s*([{aa}])\b")
+pat2 = re.compile(rf"\b([{aa}])\s*([0-9]{{1,4}})\s*(?:->|→|to)\s*([{aa}])\b")
+
+cands = []
+contexts = []
+def add_ctx(tok, m, match_txt):
+    s = max(0, m.start()-60); e = min(len(TEXT_ALL), m.end()+60)
+    contexts.append({"mutation": tok, "match": match_txt, "context": TEXT_ALL[s:e].replace("\n"," ")})
+
+for m in pat1.finditer(TEXT_ALL):
+    tok = f"{m.group(1)}{m.group(2)}{m.group(3)}"
+    cands.append(tok)
+    add_ctx(tok, m, m.group(0))
+for m in pat2.finditer(TEXT_ALL):
+    tok = f"{m.group(1)}{m.group(2)}{m.group(3)}"
+    cands.append(tok)
+    add_ctx(tok, m, m.group(0))
+
+# filter
+filt = []
+for t in cands:
+    mm = re.match(rf"^([{aa}])(\d{{1,4}})([{aa}])$", t)
+    if not mm:
+        continue
+    pos = int(mm.group(2))
+    if 1 <= pos <= 900 and mm.group(1) != mm.group(3):
+        filt.append(t)
+
+seen = set()
+uniq = []
+for t in filt:
+    if t not in seen:
+        seen.add(t)
+        uniq.append(t)
+
+print("Raw candidates:", len(cands))
+print("Unique filtered mutations:", len(uniq))
+print("Preview (first 50):", uniq[:50])
+
+(TMP_DIR / "mutation_candidates_raw.json").write_text(json.dumps(cands[:200000], indent=2))
+(TMP_DIR / "mutation_contexts.json").write_text(json.dumps(contexts[:200000], indent=2))
+(TMP_DIR / "mutation_list_unique.json").write_text(json.dumps(uniq, indent=2))
+OUT_PATH.write_text(json.dumps(uniq, indent=2))
+print("Saved final JSON:", OUT_PATH)
+
+print("\n1. [✓] Validate input/output paths; create intermediate directories.")
+print("2. [✓] Extract PDF text via PyMuPDF (fitz).")
+print("3. [✓] If little/no text, OCR pages (pytesseract) and extract text.")
+print("4. [✓] Regex-mine amino-acid substitutions; save intermediates and final JSON output.")
+</execute>
+<observation>ImportError('/root/miniconda3/envs/biomni_e1/lib/python3.11/site-packages/PIL/../../../libtiff.so.6: undefined symbol: jpeg12_write_raw_data, version LIBJPEG_8.0')</observation>
+<execute>#!/usr/bin/env python3
+import json, re
+from pathlib import Path
+
+print("Research log: HBV mutation extraction from PDF (PyMuPDF text-only; no PIL/OCR due to libjpeg issue)")
+
+print("1. [ ] Validate input/output paths; create intermediate directories.")
+print("2. [ ] Extract PDF text via PyMuPDF (fitz) and save intermediates.")
+print("3. [ ] Mine mutation sites via regex; save intermediates and final JSON.")
+
+PDF_PATH = Path("benchmark/dataset/ViMIC/12985_2021_Article_1493.pdf")
+TMP_DIR = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/vimic_extract")
+OUT_PATH = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/vimic_extract.json")
+TMP_DIR.mkdir(parents=True, exist_ok=True)
+OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+print("\nStep 1: Validate paths")
+print("PDF exists:", PDF_PATH.exists(), "->", PDF_PATH.resolve())
+if not PDF_PATH.exists():
+    raise FileNotFoundError(str(PDF_PATH))
+print("TMP_DIR:", TMP_DIR)
+print("OUT_PATH:", OUT_PATH)
+
+print("\n1. [✓] Validate input/output paths; create intermediate directories.")
+print("2. [ ] Extract PDF text via PyMuPDF (fitz) and save intermediates.")
+print("3. [ ] Mine mutation sites via regex; save intermediates and final JSON.")
+
+print("\nStep 2: Extract text via PyMuPDF (fitz)")
+import fitz  # PyMuPDF
+
+doc = fitz.open(str(PDF_PATH))
+page_stats = []
+parts = []
+for i in range(doc.page_count):
+    page = doc.load_page(i)
+    t = page.get_text("text") or ""
+    parts.append(t)
+    page_stats.append({"page": i+1, "nchars": len(t)})
+
+TEXT_ALL = "\n\n".join(parts)
+(TMP_DIR / "page_text_lengths_fitz.json").write_text(json.dumps(page_stats, indent=2))
+(TMP_DIR / "full_text_fitz.txt").write_text(TEXT_ALL)
+(TMP_DIR / "full_text.txt").write_text(TEXT_ALL)
+
+print("Pages:", doc.page_count)
+print("Total extracted chars:", len(TEXT_ALL))
+print("Zero-text pages:", sum(1 for s in page_stats if s["nchars"] == 0))
+if len(TEXT_ALL.strip()) < 2000:
+    print("WARNING: Extracted text is small; OCR would normally be attempted, but PIL is broken in this environment.")
+    print("Proceeding with text-only extraction; mutation list may be incomplete.")
+
+print("\n1. [✓] Validate input/output paths; create intermediate directories.")
+print("2. [✓] Extract PDF text via PyMuPDF (fitz) and save intermediates. (completed)")
+print("3. [ ] Mine mutation sites via regex; save intermediates and final JSON.")
+
+print("\nStep 3: Mine mutation sites via regex")
+aa = "ACDEFGHIKLMNPQRSTVWY"
+prefix_pat = r"(?:rt|RT|s|S|preS1|preS2|preS|PreS1|PreS2|PreS|core|Core|HBx|hbx|pol|Pol|P|X)?"
+pat1 = re.compile(rf"\b{prefix_pat}\s*([{aa}])\s*([0-9]{{1,4}})\s*([{aa}])\b")
+pat2 = re.compile(rf"\b([{aa}])\s*([0-9]{{1,4}})\s*(?:->|→|to)\s*([{aa}])\b")
+
+cands, contexts = [], []
+def add_ctx(tok, m, match_txt):
+    s = max(0, m.start()-70); e = min(len(TEXT_ALL), m.end()+70)
+    contexts.append({"mutation": tok, "match": match_txt, "context": TEXT_ALL[s:e].replace("\n"," ")})
+
+for m in pat1.finditer(TEXT_ALL):
+    tok = f"{m.group(1)}{m.group(2)}{m.group(3)}"
+    cands.append(tok)
+    add_ctx(tok, m, m.group(0))
+for m in pat2.finditer(TEXT_ALL):
+    tok = f"{m.group(1)}{m.group(2)}{m.group(3)}"
+    cands.append(tok)
+    add_ctx(tok, m, m.group(0))
+
+# Filter: 1..900 and nonsynonymous
+filt = []
+for t in cands:
+    mm = re.match(rf"^([{aa}])(\d{{1,4}})([{aa}])$", t)
+    if not mm:
+        continue
+    pos = int(mm.group(2))
+    if 1 <= pos <= 900 and mm.group(1) != mm.group(3):
+        filt.append(t)
+
+seen, uniq = set(), []
+for t in filt:
+    if t not in seen:
+        seen.add(t)
+        uniq.append(t)
+
+print("Raw candidates:", len(cands))
+print("Unique filtered mutations:", len(uniq))
+print("Preview (first 60):", uniq[:60])
+
+(TMP_DIR / "mutation_candidates_raw.json").write_text(json.dumps(cands[:200000], indent=2))
+(TMP_DIR / "mutation_contexts.json").write_text(json.dumps(contexts[:200000], indent=2))
+(TMP_DIR / "mutation_list_unique.json").write_text(json.dumps(uniq, indent=2))
+
+OUT_PATH.write_text(json.dumps(uniq, indent=2))
+print("Saved final JSON:", OUT_PATH)
+print("\n1. [✓] Validate input/output paths; create intermediate directories.")
+print("2. [✓] Extract PDF text via PyMuPDF (fitz) and save intermediates. (completed)")
+print("3. [✓] Mine mutation sites via regex; save intermediates and final JSON. (completed)")
+</execute>
+<observation>ModuleNotFoundError("No module named 'fitz'")</observation>
+<execute>#!/usr/bin/env python3
+import os, json, re
+from pathlib import Path
+
+print("Research log: HBV mutation extraction from PDF (no pdfplumber/pdftotext/fitz; using pure-Python PDF parser)")
+
+# Checklist
+print("1. [ ] Validate paths; create intermediate directory.")
+print("2. [ ] Extract text from PDF using a minimal built-in PDF content-stream parser.")
+print("3. [ ] Mine mutation sites; save intermediates and final JSON.")
+
+PDF_PATH = Path("benchmark/dataset/ViMIC/12985_2021_Article_1493.pdf")
+TMP_DIR = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/vimic_extract")
+OUT_PATH = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/vimic_extract.json")
+TMP_DIR.mkdir(parents=True, exist_ok=True)
+OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+print("\nStep 1: Validate paths")
+print("PDF exists:", PDF_PATH.exists(), "->", PDF_PATH.resolve())
+if not PDF_PATH.exists():
+    raise FileNotFoundError(str(PDF_PATH))
+print("TMP_DIR:", TMP_DIR)
+print("OUT_PATH:", OUT_PATH)
+print("\n1. [✓] Validate paths; create intermediate directory.")
+print("2. [ ] Extract text from PDF using a minimal built-in PDF content-stream parser.")
+print("3. [ ] Mine mutation sites; save intermediates and final JSON.")
+
+# -----------------------------
+# Step 2: Minimal PDF text extraction (supports common FlateDecode streams and Tj/TJ text ops)
+# -----------------------------
+print("\nStep 2: Minimal PDF text extraction")
+data = PDF_PATH.read_bytes()
+(TMP_DIR / "pdf_head.bin").write_bytes(data[:200000])
+
+# Find streams and attempt to inflate those with /FlateDecode
+import zlib
+
+def inflate_streams(pdf_bytes: bytes):
+    out_chunks = []
+    # naive stream extraction
+    # matches: "stream\r?\n .... \r?\nendstream"
+    for m in re.finditer(rb"stream\r?\n", pdf_bytes):
+        start = m.end()
+        end = pdf_bytes.find(rb"endstream", start)
+        if end == -1:
+            continue
+        stream = pdf_bytes[start:end]
+        # try zlib raw/with header
+        inflated = None
+        for wbits in (zlib.MAX_WBITS, -zlib.MAX_WBITS):
+            try:
+                inflated = zlib.decompress(stream.strip(b"\r\n"), wbits=wbits)
+                break
+            except Exception:
+                inflated = None
+        if inflated:
+            out_chunks.append(inflated)
+    return out_chunks
+
+inflated = inflate_streams(data)
+print("Inflated stream count:", len(inflated))
+# Save some inflated chunks for inspection
+for i, ch in enumerate(inflated[:20], 1):
+    (TMP_DIR / f"inflated_stream_{i:02d}.bin").write_bytes(ch)
+
+# Extract text operands from PDF text operators:
+# - "(...)" Tj
+# - "[ ... ] TJ" with strings in parentheses
+# We also decode common escape sequences.
+def unescape_pdf_string(s: bytes) -> str:
+    # handle backslash escapes
+    # octal \ddd, escaped chars \n \r \t \b \f \( \) \\
+    out = bytearray()
+    i = 0
+    while i < len(s):
+        c = s[i]
+        if c == 0x5c:  # backslash
+            i += 1
+            if i >= len(s):
+                break
+            c2 = s[i]
+            if c2 in b"nrtbf":
+                out += {ord('n'):b"\n", ord('r'):b"\r", ord('t'):b"\t", ord('b'):b"\b", ord('f'):b"\f"}[c2]
+            elif c2 in b"()\\":
+                out.append(c2)
+            elif 48 <= c2 <= 55:  # octal
+                oct_digits = bytes([c2])
+                j = 0
+                while i+1 < len(s) and j < 2 and 48 <= s[i+1] <= 55:
+                    i += 1
+                    oct_digits += bytes([s[i]])
+                    j += 1
+                try:
+                    out.append(int(oct_digits, 8))
+                except Exception:
+                    pass
+            else:
+                out.append(c2)
+        else:
+            out.append(c)
+        i += 1
+    # Try latin1 to preserve bytes; then later regex over ASCII-like mutations.
+    return out.decode("latin1", errors="ignore")
+
+# Parse parentheses strings (not fully general but works for typical content streams)
+paren_re = re.compile(rb"\((?:\\.|[^\\)])*\)")
+
+def extract_text_from_content(content: bytes) -> str:
+    txt_parts = []
+    # Tj operands
+    for m in re.finditer(rb"\((?:\\.|[^\\)])*\)\s*Tj", content):
+        raw = m.group(0)
+        sm = paren_re.search(raw)
+        if sm:
+            inner = sm.group(0)[1:-1]
+            txt_parts.append(unescape_pdf_string(inner))
+    # TJ arrays
+    for m in re.finditer(rb"\[(.*?)\]\s*TJ", content, flags=re.S):
+        arr = m.group(1)
+        for sm in paren_re.finditer(arr):
+            inner = sm.group(0)[1:-1]
+            txt_parts.append(unescape_pdf_string(inner))
+        txt_parts.append("\n")
+    return " ".join(txt_parts)
+
+text_all = ""
+for ch in inflated:
+    text_all += "\n" + extract_text_from_content(ch)
+
+# Clean a bit
+text_all = re.sub(r"[ \t]+", " ", text_all)
+text_all = re.sub(r"\n{3,}", "\n\n", text_all)
+
+(TMP_DIR / "full_text_minipdf.txt").write_text(text_all, encoding="utf-8", errors="ignore")
+print("Extracted characters (minipdf):", len(text_all))
+if len(text_all.strip()) < 1000:
+    print("WARNING: very little text extracted. This PDF may be mostly image-based; OCR would be required, but image stack is broken in this environment.")
+print("\n1. [✓] Validate paths; create intermediate directory.")
+print("2. [✓] Extract text from PDF using a minimal built-in PDF content-stream parser. (completed)")
+print("3. [ ] Mine mutation sites; save intermediates and final JSON.")
+
+# -----------------------------
+# Step 3: Mine mutation sites
+# -----------------------------
+print("\nStep 3: Mine mutation sites via regex")
+
+aa = "ACDEFGHIKLMNPQRSTVWY"
+prefix_pat = r"(?:rt|RT|s|S|preS1|preS2|preS|PreS1|PreS2|PreS|core|Core|HBx|hbx|pol|Pol|P|X)?"
+pat1 = re.compile(rf"\b{prefix_pat}\s*([{aa}])\s*([0-9]{{1,4}})\s*([{aa}])\b")
+pat2 = re.compile(rf"\b([{aa}])\s*([0-9]{{1,4}})\s*(?:->|→|to)\s*([{aa}])\b")
+
+cands = []
+contexts = []
+
+def add_ctx(tok, m, match_txt):
+    s = max(0, m.start()-70); e = min(len(text_all), m.end()+70)
+    contexts.append({"mutation": tok, "match": match_txt, "context": text_all[s:e].replace("\n"," ")})
+
+for m in pat1.finditer(text_all):
+    tok = f"{m.group(1)}{m.group(2)}{m.group(3)}"
+    cands.append(tok)
+    add_ctx(tok, m, m.group(0))
+for m in pat2.finditer(text_all):
+    tok = f"{m.group(1)}{m.group(2)}{m.group(3)}"
+    cands.append(tok)
+    add_ctx(tok, m, m.group(0))
+
+# Filter to plausible HBV protein positions and nonsynonymous
+filt = []
+for t in cands:
+    mm = re.match(rf"^([{aa}])(\d{{1,4}})([{aa}])$", t)
+    if not mm:
+        continue
+    pos = int(mm.group(2))
+    if 1 <= pos <= 900 and mm.group(1) != mm.group(3):
+        filt.append(t)
+
+seen = set()
+uniq = []
+for t in filt:
+    if t not in seen:
+        seen.add(t)
+        uniq.append(t)
+
+print("Raw candidates:", len(cands))
+print("Unique filtered mutations:", len(uniq))
+print("Preview (first 80):", uniq[:80])
+
+(TMP_DIR / "mutation_candidates_raw.json").write_text(json.dumps(cands, indent=2))
+(TMP_DIR / "mutation_contexts.json").write_text(json.dumps(contexts[:5000], indent=2))
+(TMP_DIR / "mutation_list_unique.json").write_text(json.dumps(uniq, indent=2))
+OUT_PATH.write_text(json.dumps(uniq, indent=2))
+
+print("Saved final JSON:", OUT_PATH)
+print("\n1. [✓] Validate paths; create intermediate directory.")
+print("2. [✓] Extract text from PDF using a minimal built-in PDF content-stream parser. (completed)")
+print("3. [✓] Mine mutation sites; save intermediates and final JSON. (completed)")
+</execute>
+<observation>NameError("name 're' is not defined")</observation>
+<execute>#!/usr/bin/env python3
+# Single-shot script with defensive imports and no reliance on prior state.
+
+import json
+import re
+import zlib
+from pathlib import Path
+
+print("Research log: HBV mutation extraction from PDF (pure-Python minimal PDF text parser; defensive imports)")
+
+print("1. [ ] Validate paths; create intermediate directory.")
+print("2. [ ] Extract text from PDF using minimal parser (FlateDecode + Tj/TJ).")
+print("3. [ ] Mine mutation sites; save intermediates and final JSON.")
+
+PDF_PATH = Path("benchmark/dataset/ViMIC/12985_2021_Article_1493.pdf")
+TMP_DIR = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/vimic_extract")
+OUT_PATH = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/vimic_extract.json")
+TMP_DIR.mkdir(parents=True, exist_ok=True)
+OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+print("\nStep 1: Validate paths")
+print("PDF exists:", PDF_PATH.exists(), "->", PDF_PATH.resolve())
+if not PDF_PATH.exists():
+    raise FileNotFoundError(str(PDF_PATH))
+print("TMP_DIR:", TMP_DIR)
+print("OUT_PATH:", OUT_PATH)
+
+print("\n1. [✓] Validate paths; create intermediate directory.")
+print("2. [ ] Extract text from PDF using minimal parser (FlateDecode + Tj/TJ).")
+print("3. [ ] Mine mutation sites; save intermediates and final JSON.")
+
+print("\nStep 2: Minimal PDF text extraction")
+pdf_bytes = PDF_PATH.read_bytes()
+(TMP_DIR / "pdf_head.bin").write_bytes(pdf_bytes[:200000])
+
+def inflate_streams(pdf_bytes_local: bytes):
+    out_chunks = []
+    for m in re.finditer(rb"stream\r?\n", pdf_bytes_local):
+        start = m.end()
+        end = pdf_bytes_local.find(rb"endstream", start)
+        if end == -1:
+            continue
+        stream = pdf_bytes_local[start:end].strip(b"\r\n")
+        inflated = None
+        for wbits in (zlib.MAX_WBITS, -zlib.MAX_WBITS):
+            try:
+                inflated = zlib.decompress(stream, wbits=wbits)
+                break
+            except Exception:
+                inflated = None
+        if inflated:
+            out_chunks.append(inflated)
+    return out_chunks
+
+inflated_chunks = inflate_streams(pdf_bytes)
+print("Inflated stream count:", len(inflated_chunks))
+for i, ch in enumerate(inflated_chunks[:20], 1):
+    (TMP_DIR / f"inflated_stream_{i:02d}.bin").write_bytes(ch)
+
+paren_re = re.compile(rb"\((?:\\.|[^\\)])*\)")
+
+def unescape_pdf_string(s: bytes) -> str:
+    out = bytearray()
+    i = 0
+    while i < len(s):
+        c = s[i]
+        if c == 0x5c:  # backslash
+            i += 1
+            if i >= len(s):
+                break
+            c2 = s[i]
+            if c2 in b"nrtbf":
+                out += {ord('n'):b"\n", ord('r'):b"\r", ord('t'):b"\t", ord('b'):b"\b", ord('f'):b"\f"}[c2]
+            elif c2 in b"()\\":
+                out.append(c2)
+            elif 48 <= c2 <= 55:
+                oct_digits = bytes([c2])
+                j = 0
+                while i+1 < len(s) and j < 2 and 48 <= s[i+1] <= 55:
+                    i += 1
+                    oct_digits += bytes([s[i]])
+                    j += 1
+                try:
+                    out.append(int(oct_digits, 8))
+                except Exception:
+                    pass
+            else:
+                out.append(c2)
+        else:
+            out.append(c)
+        i += 1
+    return out.decode("latin1", errors="ignore")
+
+def extract_text_from_content(content: bytes) -> str:
+    parts = []
+    # (.. ) Tj
+    for m in re.finditer(rb"\((?:\\.|[^\\)])*\)\s*Tj", content):
+        sm = paren_re.search(m.group(0))
+        if sm:
+            parts.append(unescape_pdf_string(sm.group(0)[1:-1]))
+    # [ (...) ... ] TJ
+    for m in re.finditer(rb"\[(.*?)\]\s*TJ", content, flags=re.S):
+        arr = m.group(1)
+        for sm in paren_re.finditer(arr):
+            parts.append(unescape_pdf_string(sm.group(0)[1:-1]))
+        parts.append("\n")
+    return " ".join(parts)
+
+text_all = ""
+for ch in inflated_chunks:
+    text_all += "\n" + extract_text_from_content(ch)
+
+text_all = re.sub(r"[ \t]+", " ", text_all)
+text_all = re.sub(r"\n{3,}", "\n\n", text_all)
+
+(TMP_DIR / "full_text_minipdf.txt").write_text(text_all, encoding="utf-8", errors="ignore")
+print("Extracted characters:", len(text_all))
+if len(text_all.strip()) < 1000:
+    print("WARNING: very little text extracted; PDF may be image-based and OCR would be required (not available here).")
+
+print("\n1. [✓] Validate paths; create intermediate directory.")
+print("2. [✓] Extract text from PDF using minimal parser (FlateDecode + Tj/TJ). (completed)")
+print("3. [ ] Mine mutation sites; save intermediates and final JSON.")
+
+print("\nStep 3: Mine mutation sites")
+aa = "ACDEFGHIKLMNPQRSTVWY"
+prefix_pat = r"(?:rt|RT|s|S|preS1|preS2|preS|PreS1|PreS2|PreS|core|Core|HBx|hbx|pol|Pol|P|X)?"
+pat1 = re.compile(rf"\b{prefix_pat}\s*([{aa}])\s*([0-9]{{1,4}})\s*([{aa}])\b")
+pat2 = re.compile(rf"\b([{aa}])\s*([0-9]{{1,4}})\s*(?:->|→|to)\s*([{aa}])\b")
+
+cands = []
+contexts = []
+def add_ctx(tok, m, match_txt):
+    s = max(0, m.start()-70); e = min(len(text_all), m.end()+70)
+    contexts.append({"mutation": tok, "match": match_txt, "context": text_all[s:e].replace("\n"," ")})
+
+for m in pat1.finditer(text_all):
+    tok = f"{m.group(1)}{m.group(2)}{m.group(3)}"
+    cands.append(tok)
+    add_ctx(tok, m, m.group(0))
+for m in pat2.finditer(text_all):
+    tok = f"{m.group(1)}{m.group(2)}{m.group(3)}"
+    cands.append(tok)
+    add_ctx(tok, m, m.group(0))
+
+filt = []
+for t in cands:
+    mm = re.match(rf"^([{aa}])(\d{{1,4}})([{aa}])$", t)
+    if not mm:
+        continue
+    pos = int(mm.group(2))
+    if 1 <= pos <= 900 and mm.group(1) != mm.group(3):
+        filt.append(t)
+
+seen = set()
+uniq = []
+for t in filt:
+    if t not in seen:
+        seen.add(t)
+        uniq.append(t)
+
+print("Raw candidates:", len(cands))
+print("Unique filtered:", len(uniq))
+print("Preview (first 80):", uniq[:80])
+
+(TMP_DIR / "mutation_candidates_raw.json").write_text(json.dumps(cands, indent=2))
+(TMP_DIR / "mutation_contexts.json").write_text(json.dumps(contexts[:5000], indent=2))
+(TMP_DIR / "mutation_list_unique.json").write_text(json.dumps(uniq, indent=2))
+OUT_PATH.write_text(json.dumps(uniq, indent=2))
+
+print("Saved final JSON:", OUT_PATH)
+print("\n1. [✓] Validate paths; create intermediate directory.")
+print("2. [✓] Extract text from PDF using minimal parser (FlateDecode + Tj/TJ). (completed)")
+print("3. [✓] Mine mutation sites; save intermediates and final JSON. (completed)")
+</execute>
+<observation>NameError("name 're' is not defined")</observation>
+<execute>#!/usr/bin/env python3
+# NOTE: The runtime in this environment is exhibiting pathological NameError behavior
+# (e.g., NameError: 're' is not defined immediately after "import re").
+# To keep going, avoid the 're' module entirely and implement needed matching with string scanning.
+
+import json
+import zlib
+from pathlib import Path
+
+print("Research log: HBV mutation extraction from PDF (pure-Python; NO regex module)")
+
+print("1. [ ] Validate paths; create intermediate directory.")
+print("2. [ ] Extract text from PDF by inflating FlateDecode streams and extracting Tj/TJ strings.")
+print("3. [ ] Mine mutation sites by manual scanning; save intermediates and final JSON.")
+
+PDF_PATH = Path("benchmark/dataset/ViMIC/12985_2021_Article_1493.pdf")
+TMP_DIR = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/vimic_extract")
+OUT_PATH = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/vimic_extract.json")
+TMP_DIR.mkdir(parents=True, exist_ok=True)
+OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+print("\nStep 1: Validate paths")
+print("PDF exists:", PDF_PATH.exists(), "->", PDF_PATH.resolve())
+if not PDF_PATH.exists():
+    raise FileNotFoundError(str(PDF_PATH))
+print("TMP_DIR:", TMP_DIR)
+print("OUT_PATH:", OUT_PATH)
+
+print("\n1. [✓] Validate paths; create intermediate directory.")
+print("2. [ ] Extract text from PDF by inflating FlateDecode streams and extracting Tj/TJ strings.")
+print("3. [ ] Mine mutation sites by manual scanning; save intermediates and final JSON.")
+
+print("\nStep 2: Inflate streams and extract PDF text operators (Tj/TJ)")
+
+pdf_bytes = PDF_PATH.read_bytes()
+(TMP_DIR / "pdf_head.bin").write_bytes(pdf_bytes[:200000])
+
+def find_all(hay: bytes, needle: bytes):
+    out = []
+    i = 0
+    while True:
+        j = hay.find(needle, i)
+        if j == -1:
+            return out
+        out.append(j)
+        i = j + len(needle)
+
+def inflate_streams(pdf_b: bytes):
+    out_chunks = []
+    for pos in find_all(pdf_b, b"stream\n") + find_all(pdf_b, b"stream\r\n"):
+        # determine exact start after stream EOL
+        if pdf_b[pos:pos+7] == b"stream\n":
+            start = pos + 7
+        else:
+            start = pos + 8
+        end = pdf_b.find(b"endstream", start)
+        if end == -1:
+            continue
+        stream = pdf_b[start:end].strip(b"\r\n")
+        inflated = None
+        for wbits in (zlib.MAX_WBITS, -zlib.MAX_WBITS):
+            try:
+                inflated = zlib.decompress(stream, wbits=wbits)
+                break
+            except Exception:
+                inflated = None
+        if inflated:
+            out_chunks.append(inflated)
+    return out_chunks
+
+def unescape_pdf_string(s: bytes) -> str:
+    out = bytearray()
+    i = 0
+    while i < len(s):
+        c = s[i]
+        if c == 0x5c:  # backslash
+            i += 1
+            if i >= len(s):
+                break
+            c2 = s[i]
+            if c2 == ord('n'): out += b"\n"
+            elif c2 == ord('r'): out += b"\r"
+            elif c2 == ord('t'): out += b"\t"
+            elif c2 == ord('b'): out += b"\b"
+            elif c2 == ord('f'): out += b"\f"
+            elif c2 in (ord('('), ord(')'), ord('\\')): out.append(c2)
+            elif 48 <= c2 <= 55:
+                oct_digits = bytes([c2])
+                j = 0
+                while (i+1) < len(s) and j < 2 and 48 <= s[i+1] <= 55:
+                    i += 1
+                    oct_digits += bytes([s[i]])
+                    j += 1
+                try:
+                    out.append(int(oct_digits, 8))
+                except Exception:
+                    pass
+            else:
+                out.append(c2)
+        else:
+            out.append(c)
+        i += 1
+    return out.decode("latin1", errors="ignore")
+
+def extract_paren_strings(buf: bytes):
+    # returns list of bytes inside (...) with backslash escapes handled later
+    res = []
+    i = 0
+    while i < len(buf):
+        if buf[i:i+1] == b"(":
+            i += 1
+            start = i
+            depth = 1
+            escaped = False
+            out = bytearray()
+            while i < len(buf) and depth > 0:
+                ch = buf[i]
+                if escaped:
+                    out.append(ch)
+                    escaped = False
+                else:
+                    if ch == 0x5c:
+                        out.append(ch)
+                        escaped = True
+                    elif ch == 0x28:  # (
+                        depth += 1
+                        out.append(ch)
+                    elif ch == 0x29:  # )
+                        depth -= 1
+                        if depth == 0:
+                            break
+                        out.append(ch)
+                    else:
+                        out.append(ch)
+                i += 1
+            res.append(bytes(out))
+        i += 1
+    return res
+
+def extract_text_from_content(content: bytes) -> str:
+    # Very lightweight: grab all (...) strings, which is noisy but workable without regex.
+    # In typical content streams most parentheses belong to Tj/TJ text operands.
+    parts = []
+    for s in extract_paren_strings(content):
+        parts.append(unescape_pdf_string(s))
+    return " ".join(parts)
+
+inflated = inflate_streams(pdf_bytes)
+print("Inflated stream count:", len(inflated))
+for i, ch in enumerate(inflated[:10], 1):
+    (TMP_DIR / f"inflated_stream_{i:02d}.bin").write_bytes(ch)
+
+text_all = ""
+for ch in inflated:
+    text_all += "\n" + extract_text_from_content(ch)
+
+# basic whitespace normalization without regex
+text_all = text_all.replace("\t", " ")
+while "  " in text_all:
+    text_all = text_all.replace("  ", " ")
+while "\n\n\n" in text_all:
+    text_all = text_all.replace("\n\n\n", "\n\n")
+
+(TMP_DIR / "full_text_minipdf.txt").write_text(text_all, encoding="utf-8", errors="ignore")
+(TMP_DIR / "full_text.txt").write_text(text_all, encoding="utf-8", errors="ignore")
+print("Extracted characters:", len(text_all))
+if len(text_all.strip()) < 1000:
+    print("WARNING: very little text extracted; PDF may be image-based (OCR not possible here).")
+
+print("\n1. [✓] Validate paths; create intermediate directory.")
+print("2. [✓] Extract text from PDF by inflating FlateDecode streams and extracting Tj/TJ strings. (completed)")
+print("3. [ ] Mine mutation sites by manual scanning; save intermediates and final JSON.")
+
+print("\nStep 3: Mine mutation sites (manual scan)")
+
+AA = set(list("ACDEFGHIKLMNPQRSTVWY"))
+
+def is_boundary(ch: str) -> bool:
+    # word boundary-ish
+    return not (ch.isalnum() or ch in ("_",))
+
+def mine_mutations(s: str):
+    muts = []
+    contexts = []
+    n = len(s)
+    i = 0
+    while i < n - 4:
+        c1 = s[i]
+        if c1 in AA:
+            # parse digits
+            j = i + 1
+            if j < n and s[j].isdigit():
+                k = j
+                while k < n and s[k].isdigit() and (k-j) < 4:
+                    k += 1
+                # need at least 1 digit
+                if k > j and k < n:
+                    c2 = s[k]
+                    if c2 in AA:
+                        # boundaries: left and right
+                        left_ok = (i == 0) or is_boundary(s[i-1])
+                        right_ok = (k == n-1) or is_boundary(s[k+1])
+                        if left_ok and right_ok and c1 != c2:
+                            pos = int(s[j:k])
+                            if 1 <= pos <= 900:
+                                tok = f"{c1}{pos}{c2}"
+                                muts.append(tok)
+                                st = max(0, i-70); en = min(n, k+71)
+                                contexts.append({"mutation": tok, "match": tok, "context": s[st:en].replace("\n"," ")})
+                        i = k + 1
+                        continue
+        i += 1
+    # dedup preserve order
+    seen = set()
+    uniq = []
+    for m in muts:
+        if m not in seen:
+            seen.add(m)
+            uniq.append(m)
+    return uniq, muts, contexts
+
+uniq, raw_list, ctx = mine_mutations(text_all)
+print("Raw candidates:", len(raw_list))
+print("Unique filtered:", len(uniq))
+print("Preview (first 80):", uniq[:80])
+
+(TMP_DIR / "mutation_candidates_raw.json").write_text(json.dumps(raw_list, indent=2))
+(TMP_DIR / "mutation_contexts.json").write_text(json.dumps(ctx[:5000], indent=2))
+(TMP_DIR / "mutation_list_unique.json").write_text(json.dumps(uniq, indent=2))
+OUT_PATH.write_text(json.dumps(uniq, indent=2))
+
+print("Saved final JSON:", OUT_PATH)
+
+print("\n1. [✓] Validate paths; create intermediate directory.")
+print("2. [✓] Extract text from PDF by inflating FlateDecode streams and extracting Tj/TJ strings. (completed)")
+print("3. [✓] Mine mutation sites by manual scanning; save intermediates and final JSON. (completed)")
+</execute>
+<observation>NameError("name 'find_all' is not defined")</observation>
+<execute>#!/usr/bin/env python3
+# Environment is exhibiting severe NameError for user-defined identifiers.
+# Final workaround: do everything inline without defining any functions.
+
+import json, zlib
+from pathlib import Path
+
+print("Research log: HBV mutation extraction from PDF (fully inlined; no function defs)")
+
+# Step 1
+PDF_PATH = Path("benchmark/dataset/ViMIC/12985_2021_Article_1493.pdf")
+TMP_DIR = Path("/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/vimic_extract")
+OUT_PATH = Path("/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/vimic_extract.json")
+TMP_DIR.mkdir(parents=True, exist_ok=True)
+OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+print("PDF exists:", PDF_PATH.exists(), "->", PDF_PATH.resolve())
+if not PDF_PATH.exists():
+    raise FileNotFoundError(str(PDF_PATH))
+
+# Step 2: read bytes
+pdf_bytes = PDF_PATH.read_bytes()
+(TMP_DIR / "pdf_head.bin").write_bytes(pdf_bytes[:200000])
+
+# Inflate streams (inline scanning)
+inflated = []
+i = 0
+n = len(pdf_bytes)
+while i < n:
+    j = pdf_bytes.find(b"stream\n", i)
+    j2 = pdf_bytes.find(b"stream\r\n", i)
+    if j == -1 and j2 == -1:
+        break
+    if j == -1 or (j2 != -1 and j2 < j):
+        start = j2 + 8
+        i = start
+    else:
+        start = j + 7
+        i = start
+    end = pdf_bytes.find(b"endstream", start)
+    if end == -1:
+        continue
+    stream = pdf_bytes[start:end].strip(b"\r\n")
+    inflated_bytes = None
+    try:
+        inflated_bytes = zlib.decompress(stream, wbits=zlib.MAX_WBITS)
+    except Exception:
+        try:
+            inflated_bytes = zlib.decompress(stream, wbits=-zlib.MAX_WBITS)
+        except Exception:
+            inflated_bytes = None
+    if inflated_bytes:
+        inflated.append(inflated_bytes)
+
+print("Inflated stream count:", len(inflated))
+for idx in range(min(10, len(inflated))):
+    (TMP_DIR / f"inflated_stream_{idx+1:02d}.bin").write_bytes(inflated[idx])
+
+# Extract all (...) strings from inflated content (inline), unescape basic sequences
+text_parts = []
+for content in inflated:
+    k = 0
+    L = len(content)
+    while k < L:
+        if content[k:k+1] == b"(":
+            k += 1
+            depth = 1
+            escaped = False
+            buf = bytearray()
+            while k < L and depth > 0:
+                ch = content[k]
+                if escaped:
+                    buf.append(ch)
+                    escaped = False
+                else:
+                    if ch == 0x5c:
+                        buf.append(ch)
+                        escaped = True
+                    elif ch == 0x28:
+                        depth += 1
+                        buf.append(ch)
+                    elif ch == 0x29:
+                        depth -= 1
+                        if depth == 0:
+                            break
+                        buf.append(ch)
+                    else:
+                        buf.append(ch)
+                k += 1
+
+            # unescape
+            out = bytearray()
+            p = 0
+            while p < len(buf):
+                c = buf[p]
+                if c == 0x5c:
+                    p += 1
+                    if p >= len(buf):
+                        break
+                    c2 = buf[p]
+                    if c2 == ord('n'): out += b"\n"
+                    elif c2 == ord('r'): out += b"\r"
+                    elif c2 == ord('t'): out += b"\t"
+                    elif c2 == ord('b'): out += b"\b"
+                    elif c2 == ord('f'): out += b"\f"
+                    elif c2 in (ord('('), ord(')'), ord('\\')): out.append(c2)
+                    elif 48 <= c2 <= 55:
+                        oct_digits = bytes([c2])
+                        q = 0
+                        while p+1 < len(buf) and q < 2 and 48 <= buf[p+1] <= 55:
+                            p += 1
+                            oct_digits += bytes([buf[p]])
+                            q += 1
+                        try:
+                            out.append(int(oct_digits, 8))
+                        except Exception:
+                            pass
+                    else:
+                        out.append(c2)
+                else:
+                    out.append(c)
+                p += 1
+            text_parts.append(out.decode("latin1", errors="ignore"))
+        k += 1
+
+text_all = "\n".join(text_parts)
+text_all = text_all.replace("\t", " ")
+while "  " in text_all:
+    text_all = text_all.replace("  ", " ")
+while "\n\n\n" in text_all:
+    text_all = text_all.replace("\n\n\n", "\n\n")
+
+(TMP_DIR / "full_text_minipdf.txt").write_text(text_all, encoding="utf-8", errors="ignore")
+(TMP_DIR / "full_text.txt").write_text(text_all, encoding="utf-8", errors="ignore")
+print("Extracted characters:", len(text_all))
+
+# Step 3: mine mutations by manual scan inline
+AA = set(list("ACDEFGHIKLMNPQRSTVWY"))
+def is_boundary(ch):
+    return not (ch.isalnum() or ch == "_")
+
+raw = []
+ctx = []
+s = text_all
+n = len(s)
+i = 0
+while i < n - 4:
+    c1 = s[i]
+    if c1 in AA:
+        j = i + 1
+        if j < n and s[j].isdigit():
+            k = j
+            # up to 4 digits
+            while k < n and s[k].isdigit() and (k-j) < 4:
+                k += 1
+            if k > j and k < n and s[k] in AA:
+                c2 = s[k]
+                left_ok = (i == 0) or is_boundary(s[i-1])
+                right_ok = (k == n-1) or is_boundary(s[k+1])
+                if left_ok and right_ok and c1 != c2:
+                    try:
+                        pos = int(s[j:k])
+                    except Exception:
+                        pos = -1
+                    if 1 <= pos <= 900:
+                        tok = f"{c1}{pos}{c2}"
+                        raw.append(tok)
+                        st = max(0, i-70); en = min(n, k+71)
+                        ctx.append({"mutation": tok, "match": tok, "context": s[st:en].replace("\n"," ")})
+                i = k + 1
+                continue
+    i += 1
+
+seen = set()
+uniq = []
+for m in raw:
+    if m not in seen:
+        seen.add(m)
+        uniq.append(m)
+
+print("Raw candidates:", len(raw))
+print("Unique filtered:", len(uniq))
+print("Preview (first 80):", uniq[:80])
+
+(TMP_DIR / "mutation_candidates_raw.json").write_text(json.dumps(raw, indent=2))
+(TMP_DIR / "mutation_contexts.json").write_text(json.dumps(ctx[:5000], indent=2))
+(TMP_DIR / "mutation_list_unique.json").write_text(json.dumps(uniq, indent=2))
+OUT_PATH.write_text(json.dumps(uniq, indent=2))
+
+print("Saved final JSON:", OUT_PATH)
+</execute>
+<observation>Research log: HBV mutation extraction from PDF (fully inlined; no function defs)
+PDF exists: True -> /root/biodatalab/benchmark/dataset/ViMIC/12985_2021_Article_1493.pdf
+Inflated stream count: 86
+Extracted characters: 710035
+Raw candidates: 37
+Unique filtered: 6
+Preview (first 80): ['L180M', 'M204V', 'S202I', 'V173L', 'M204I', 'F68I']
+Saved final JSON: /root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/vimic_extract.json
+</observation>
+<solution>[
+  "L180M",
+  "M204V",
+  "S202I",
+  "V173L",
+  "M204I",
+  "F68I"
+]</solution>

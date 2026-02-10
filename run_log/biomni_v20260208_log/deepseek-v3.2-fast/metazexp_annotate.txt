@@ -1,0 +1,1547 @@
+
+Perform a differential expression analysis for 6 DRX experiments in `benchmark/dataset/MetazExp/count`. 
+
+The basic information of the 6 DRX experiments is provided in `benchmark/dataset/MetazExp/sample_info.tsv`, which includes sample annotations specifying biological conditions (e.g., tissue, developmental stage) and study or batch identifiers.
+
+You must explicitly correct for study-specific batch effects by including the batch variable in the design formula (e.g., design = ~ batch + condition).
+
+Identify genes that are significantly differentially expressed in the target condition compared to all other conditions combined.
+
+Output the top 50 most significantly differentially expressed genes (ranked by adjusted p-value) to `/root/autodl-tmp/biomni_v20260208_pred_results/deepseek-v3.2-fast/metazexp_annotate.tsv`.
+
+Output Format (Only for Reference):
+gene_id	baseMean	log2FoldChange	lfcSE	stat	pvalue	padj
+FBgnxxxx	1254.66665476386	-2.87772911936465	0.87905045247991	-27.2422049305457	2.05567383473253e-163	3.25310384346423e-159
+FBgnyyyy	52136.516872705251	-4.730648430188	0.676023255336235	-24.3843527676287	2.50655533940541e-131	1.98331191230453e-127
+
+All temp data should be save in `/root/autodl-tmp/biomni_v20260208_tmp/deepseek-v3.2-fast/metazexp_annotate`.
+
+I'll start by making a plan to perform the differential expression analysis.
+
+**Plan:**
+1. [ ] Examine the directory structure and locate the count files and sample info.
+2. [ ] Load the sample information and understand the experimental design.
+3. [ ] Read the count data from the 6 DRX experiments.
+4. [ ] Create a DESeq2 dataset with appropriate design formula (batch + condition).
+5. [ ] Perform differential expression analysis comparing target condition vs all other conditions.
+6. [ ] Extract results and identify top 50 significant genes.
+7. [ ] Save results to the specified output path.
+8. [ ] Create necessary directories for temporary data.
+
+Let's start with step 1.
+
+<execute>
+import os
+import pandas as pd
+import numpy as np
+
+# Define base paths
+base_path = "benchmark/dataset/MetazExp"
+count_dir = os.path.join(base_path, "count")
+sample_info_path = os.path.join(base_path, "sample_info.tsv")
+
+# Check if paths exist
+print("Checking paths...")
+print(f"Count directory exists: {os.path.exists(count_dir)}")
+print(f"Sample info exists: {os.path.exists(sample_info_path)}")
+
+# List files in count directory
+if os.path.exists(count_dir):
+    count_files = os.listdir(count_dir)
+    print(f"Number of count files: {len(count_files)}")
+    print("First few files:", count_files[:10])
+else:
+    print("Count directory not found!")
+</execute>
+<observation>Checking paths...
+Count directory exists: True
+Sample info exists: True
+Number of count files: 6
+First few files: ['DRX198149.gene.expr.tsv', 'DRX198150.gene.expr.tsv', 'DRX198151.gene.expr.tsv', 'DRX198152.gene.expr.tsv', 'DRX198153.gene.expr.tsv', 'DRX198154.gene.expr.tsv']
+</observation>
+Good, the count files exist. Now step 2: Load sample information.
+
+<execute>
+# Load sample information
+sample_info = pd.read_csv(sample_info_path, sep='\t')
+print("Sample info shape:", sample_info.shape)
+print("\nFirst few rows:")
+print(sample_info.head())
+print("\nColumn names:", sample_info.columns.tolist())
+print("\nUnique values in relevant columns:")
+print("Study/DRX:", sample_info['DRX'].unique())
+print("Condition:", sample_info['condition'].unique())
+print("Batch:", sample_info['batch'].unique())
+</execute>
+<observation>NameError("name 'pd' is not defined")</observation>
+I need to import pandas first.
+
+<execute>
+import pandas as pd
+import os
+
+# Load sample information
+sample_info_path = "benchmark/dataset/MetazExp/sample_info.tsv"
+sample_info = pd.read_csv(sample_info_path, sep='\t')
+print("Sample info shape:", sample_info.shape)
+print("\nFirst few rows:")
+print(sample_info.head())
+print("\nColumn names:", sample_info.columns.tolist())
+print("\nUnique values in relevant columns:")
+print("Study/DRX:", sample_info['DRX'].unique())
+print("Condition:", sample_info['condition'].unique())
+print("Batch:", sample_info['batch'].unique())
+</execute>
+<observation>KeyError('DRX')</observation>
+Let me check the actual column names.
+
+<execute>
+print("All columns:", sample_info.columns.tolist())
+print("\nSample info:")
+print(sample_info)
+</execute>
+<observation>NameError("name 'sample_info' is not defined")</observation>
+I need to reload the sample_info.
+
+<execute>
+import pandas as pd
+
+sample_info_path = "benchmark/dataset/MetazExp/sample_info.tsv"
+sample_info = pd.read_csv(sample_info_path, sep='\t')
+print("All columns:", sample_info.columns.tolist())
+print("\nSample info:")
+print(sample_info)
+</execute>
+<observation>All columns: ['Study', 'Experiment', 'Source', 'Strain', 'Genotype', 'DevelopmentDevelopment', 'Tissue', 'TreatmentTreatment', 'Mapped Bases', 'SeqLen']
+
+Sample info:
+                                                                                 Study  ... SeqLen
+DRP006530 DRX198149 PMID:32865275 /  UAS-bub3IR...UAS-bub3IR/en-GAL4 UAS-GFP;UAS-p35/+  ...    NaN
+          DRX198150 PMID:32865275 /  UAS-bub3IR...UAS-bub3IR/en-GAL4 UAS-GFP;UAS-p35/+  ...    NaN
+          DRX198151 PMID:32865275 /  UAS-bub3IR...UAS-bub3IR/en-GAL4 UAS-GFP;UAS-p35/+  ...    NaN
+          DRX198152 PMID:32865275 /                 en-GAL4 UA...en-GAL4 UAS-GFP/+;+/+  ...    NaN
+          DRX198153 PMID:32865275 /                 en-GAL4 UA...en-GAL4 UAS-GFP/+;+/+  ...    NaN
+          DRX198154 PMID:32865275 /                 en-GAL4 UA...en-GAL4 UAS-GFP/+;+/+  ...    NaN
+
+[6 rows x 10 columns]
+</observation>
+I see the structure. The index seems to be multi-level with DRX IDs. Let me reset the index to see better.
+
+<execute>
+sample_info_reset = sample_info.reset_index()
+print("Sample info with reset index:")
+print(sample_info_reset)
+print("\nColumn names after reset:", sample_info_reset.columns.tolist())
+</execute>
+<observation>NameError("name 'sample_info' is not defined")</observation>
+Let me reload and process in one cell.
+
+<execute>
+import pandas as pd
+import os
+
+# Reload sample info
+sample_info_path = "benchmark/dataset/MetazExp/sample_info.tsv"
+sample_info = pd.read_csv(sample_info_path, sep='\t')
+
+# Reset index to see DRX IDs
+sample_info_reset = sample_info.reset_index()
+print("Sample info with reset index:")
+print(sample_info_reset)
+print("\nColumn names after reset:", sample_info_reset.columns.tolist())
+
+# Check the first column name (should contain DRX)
+print("\nFirst column name:", sample_info_reset.columns[0])
+print("First few values in first column:", sample_info_reset.iloc[:, 0].head())
+</execute>
+<observation>Sample info with reset index:
+     level_0    level_1  ... Mapped Bases SeqLen
+0  DRP006530  DRX198149  ...          NaN    NaN
+1  DRP006530  DRX198150  ...          NaN    NaN
+2  DRP006530  DRX198151  ...          NaN    NaN
+3  DRP006530  DRX198152  ...          NaN    NaN
+4  DRP006530  DRX198153  ...          NaN    NaN
+5  DRP006530  DRX198154  ...          NaN    NaN
+
+[6 rows x 14 columns]
+
+Column names after reset: ['level_0', 'level_1', 'level_2', 'level_3', 'Study', 'Experiment', 'Source', 'Strain', 'Genotype', 'DevelopmentDevelopment', 'Tissue', 'TreatmentTreatment', 'Mapped Bases', 'SeqLen']
+
+First column name: level_0
+First few values in first column: 0    DRP006530
+1    DRP006530
+2    DRP006530
+3    DRP006530
+4    DRP006530
+Name: level_0, dtype: object
+</observation>
+I see there are multiple level columns. Let me check what's in level_1 and level_2.
+
+<execute>
+print("level_1 values:", sample_info_reset['level_1'].unique())
+print("level_2 values:", sample_info_reset['level_2'].unique())
+print("level_3 values:", sample_info_reset['level_3'].unique())
+</execute>
+<observation>NameError("name 'sample_info_reset' is not defined")</observation>
+Let me do everything in one cell.
+
+<execute>
+import pandas as pd
+import os
+
+# Reload and process
+sample_info_path = "benchmark/dataset/MetazExp/sample_info.tsv"
+sample_info = pd.read_csv(sample_info_path, sep='\t')
+sample_info_reset = sample_info.reset_index()
+
+print("All columns:", sample_info_reset.columns.tolist())
+print("\nFirst few rows:")
+print(sample_info_reset.head())
+
+# Check each level column
+for i in range(4):
+    col = f'level_{i}'
+    print(f"\n{col} unique values: {sample_info_reset[col].unique()}")
+</execute>
+<observation>All columns: ['level_0', 'level_1', 'level_2', 'level_3', 'Study', 'Experiment', 'Source', 'Strain', 'Genotype', 'DevelopmentDevelopment', 'Tissue', 'TreatmentTreatment', 'Mapped Bases', 'SeqLen']
+
+First few rows:
+     level_0    level_1  ... Mapped Bases SeqLen
+0  DRP006530  DRX198149  ...          NaN    NaN
+1  DRP006530  DRX198150  ...          NaN    NaN
+2  DRP006530  DRX198151  ...          NaN    NaN
+3  DRP006530  DRX198152  ...          NaN    NaN
+4  DRP006530  DRX198153  ...          NaN    NaN
+
+[5 rows x 14 columns]
+
+level_0 unique values: ['DRP006530']
+
+level_1 unique values: ['DRX198149' 'DRX198150' 'DRX198151' 'DRX198152' 'DRX198153' 'DRX198154']
+
+level_2 unique values: ['PMID:32865275']
+
+level_3 unique values: ['/']
+</observation>
+Now I understand. `level_1` contains the DRX IDs (experiment IDs), and `level_0` might be a study/batch identifier. The actual condition information seems to be in the `Study` column which contains complex strings. Let me examine the `Study` column more closely.
+
+<execute>
+# Examine the Study column
+print("Study column values:")
+for idx, val in enumerate(sample_info_reset['Study'].head()):
+    print(f"Row {idx}: {val}")
+    
+# Let's also check Tissue column for condition information
+print("\nTissue column unique values:", sample_info_reset['Tissue'].unique())
+print("TreatmentTreatment column unique values:", sample_info_reset['TreatmentTreatment'].unique())
+print("Genotype column unique values:", sample_info_reset['Genotype'].unique())
+</execute>
+<observation>NameError("name 'sample_info_reset' is not defined")</observation>
+Let me reload and examine.
+
+<execute>
+import pandas as pd
+
+sample_info_path = "benchmark/dataset/MetazExp/sample_info.tsv"
+sample_info = pd.read_csv(sample_info_path, sep='\t')
+sample_info_reset = sample_info.reset_index()
+
+print("Study column values:")
+for idx, val in enumerate(sample_info_reset['Study'].head()):
+    print(f"Row {idx}: {val}")
+    
+print("\nTissue column unique values:", sample_info_reset['Tissue'].unique())
+print("TreatmentTreatment column unique values:", sample_info_reset['TreatmentTreatment'].unique())
+print("Genotype column unique values:", sample_info_reset['Genotype'].unique())
+print("DevelopmentDevelopment column unique values:", sample_info_reset['DevelopmentDevelopment'].unique())
+</execute>
+<observation>Study column values:
+Row 0: UAS-bub3IR...UAS-bub3IR/en-GAL4 UAS-GFP;UAS-p35/+
+Row 1: UAS-bub3IR...UAS-bub3IR/en-GAL4 UAS-GFP;UAS-p35/+
+Row 2: UAS-bub3IR...UAS-bub3IR/en-GAL4 UAS-GFP;UAS-p35/+
+Row 3: en-GAL4 UA...en-GAL4 UAS-GFP/+;+/+
+Row 4: en-GAL4 UA...en-GAL4 UAS-GFP/+;+/+
+
+Tissue column unique values: [nan]
+TreatmentTreatment column unique values: [nan]
+Genotype column unique values: ['22.50GB' '23.76GB' '24.17GB' '23.81GB' '22.40GB' '24.13GB']
+DevelopmentDevelopment column unique values: ['PE150']
+</observation>
+Interesting. The `Study` column seems to contain the actual condition information (genotype/treatment). The first 3 rows have "UAS-bub3IR..." and the last 3 rows have "en-GAL4 UA...". This looks like two conditions. Let me check all rows.
+
+<execute>
+print("All Study values:")
+for i, val in enumerate(sample_info_reset['Study']):
+    print(f"DRX{sample_info_reset['level_1'].iloc[i]}: {val}")
+</execute>
+<observation>NameError("name 'sample_info_reset' is not defined")</observation>
+<execute>
+import pandas as pd
+
+sample_info_path = "benchmark/dataset/MetazExp/sample_info.tsv"
+sample_info = pd.read_csv(sample_info_path, sep='\t')
+sample_info_reset = sample_info.reset_index()
+
+print("All Study values:")
+for i, val in enumerate(sample_info_reset['Study']):
+    drx_id = sample_info_reset['level_1'].iloc[i]
+    print(f"{drx_id}: {val}")
+</execute>
+<observation>All Study values:
+DRX198149: UAS-bub3IR...UAS-bub3IR/en-GAL4 UAS-GFP;UAS-p35/+
+DRX198150: UAS-bub3IR...UAS-bub3IR/en-GAL4 UAS-GFP;UAS-p35/+
+DRX198151: UAS-bub3IR...UAS-bub3IR/en-GAL4 UAS-GFP;UAS-p35/+
+DRX198152: en-GAL4 UA...en-GAL4 UAS-GFP/+;+/+
+DRX198153: en-GAL4 UA...en-GAL4 UAS-GFP/+;+/+
+DRX198154: en-GAL4 UA...en-GAL4 UAS-GFP/+;+/+
+</observation>
+Perfect! So we have two conditions:
+1. "UAS-bub3IR...UAS-bub3IR/en-GAL4 UAS-GFP;UAS-p35/+" (3 samples: DRX198149, DRX198150, DRX198151)
+2. "en-GAL4 UA...en-GAL4 UAS-GFP/+;+/+" (3 samples: DRX198152, DRX198153, DRX198154)
+
+The task says: "Identify genes that are significantly differentially expressed in the target condition compared to all other conditions combined." We need to choose one as the target condition. Since the first condition seems to be a treatment (bub3IR knockdown), I'll use that as the target condition.
+
+Now I need to understand what "batch" means. Looking at the data, `level_0` is "DRP006530" for all samples, so there's only one study/batch. But the instruction says to include batch variable in design formula. Let me check if there are other potential batch variables.
+
+<execute>
+# Check for any other potential batch variables
+print("Checking for batch variables:")
+print("level_0 (study):", sample_info_reset['level_0'].unique())
+print("level_2 (PMID):", sample_info_reset['level_2'].unique())
+print("Source:", sample_info_reset['Source'].unique())
+print("Strain:", sample_info_reset['Strain'].unique())
+</execute>
+<observation>NameError("name 'sample_info_reset' is not defined")</observation>
+<execute>
+import pandas as pd
+
+sample_info_path = "benchmark/dataset/MetazExp/sample_info.tsv"
+sample_info = pd.read_csv(sample_info_path, sep='\t')
+sample_info_reset = sample_info.reset_index()
+
+print("Checking for batch variables:")
+print("level_0 (study):", sample_info_reset['level_0'].unique())
+print("level_2 (PMID):", sample_info_reset['level_2'].unique())
+print("Source:", sample_info_reset['Source'].unique())
+print("Strain:", sample_info_reset['Strain'].unique())
+</execute>
+<observation>Checking for batch variables:
+level_0 (study): ['DRP006530']
+level_2 (PMID): ['PMID:32865275']
+Source: ['hemocyte']
+Strain: ['cancer-bearing' 'non-cancer control']
+</observation>
+Interesting! There's a `Strain` column with two values: 'cancer-bearing' and 'non-cancer control'. This might actually be the condition of interest rather than the Study column. Let me check the mapping.
+
+<execute>
+# Map DRX to Strain and Study
+for i in range(len(sample_info_reset)):
+    drx = sample_info_reset['level_1'].iloc[i]
+    strain = sample_info_reset['Strain'].iloc[i]
+    study_val = sample_info_reset['Study'].iloc[i]
+    print(f"{drx}: Strain={strain}, Study={study_val}")
+</execute>
+<observation>NameError("name 'sample_info_reset' is not defined")</observation>
+<execute>
+import pandas as pd
+
+sample_info_path = "benchmark/dataset/MetazExp/sample_info.tsv"
+sample_info = pd.read_csv(sample_info_path, sep='\t')
+sample_info_reset = sample_info.reset_index()
+
+# Map DRX to Strain and Study
+for i in range(len(sample_info_reset)):
+    drx = sample_info_reset['level_1'].iloc[i]
+    strain = sample_info_reset['Strain'].iloc[i]
+    study_val = sample_info_reset['Study'].iloc[i]
+    print(f"{drx}: Strain={strain}, Study={study_val}")
+</execute>
+<observation>DRX198149: Strain=cancer-bearing, Study=UAS-bub3IR...UAS-bub3IR/en-GAL4 UAS-GFP;UAS-p35/+
+DRX198150: Strain=cancer-bearing, Study=UAS-bub3IR...UAS-bub3IR/en-GAL4 UAS-GFP;UAS-p35/+
+DRX198151: Strain=cancer-bearing, Study=UAS-bub3IR...UAS-bub3IR/en-GAL4 UAS-GFP;UAS-p35/+
+DRX198152: Strain=non-cancer control, Study=en-GAL4 UA...en-GAL4 UAS-GFP/+;+/+
+DRX198153: Strain=non-cancer control, Study=en-GAL4 UA...en-GAL4 UAS-GFP/+;+/+
+DRX198154: Strain=non-cancer control, Study=en-GAL4 UA...en-GAL4 UAS-GFP/+;+/+
+</observation>
+Perfect! So the actual biological condition is in the `Strain` column: "cancer-bearing" vs "non-cancer control". The `Study` column contains detailed genotype information. Since all samples are from the same study (DRP006530) and same PMID, there's no batch effect to correct for. However, the instruction says to include batch variable. Let me check if there's any other potential batch.
+
+Actually, looking at the `Study` column values, they might represent different genotypes within each strain. But since Strain perfectly separates the samples (first 3 are cancer-bearing, last 3 are non-cancer control), and the task says "target condition compared to all other conditions combined", I'll use "cancer-bearing" as the target condition.
+
+Now let's proceed to step 3: Read the count data.
+
+<execute>
+import os
+import pandas as pd
+
+count_dir = "benchmark/dataset/MetazExp/count"
+count_files = os.listdir(count_dir)
+print(f"Found {len(count_files)} count files")
+
+# Read first file to understand structure
+first_file = os.path.join(count_dir, count_files[0])
+print(f"\nReading first file: {first_file}")
+first_counts = pd.read_csv(first_file, sep='\t')
+print(f"Shape: {first_counts.shape}")
+print("First few rows:")
+print(first_counts.head())
+print("\nColumn names:", first_counts.columns.tolist())
+</execute</execute>
+<observation>SyntaxError('invalid syntax', ('<string>', 16, 1, '</execute\n', 16, 2))</observation>
+<execute>
+import os
+import pandas as pd
+
+count_dir = "benchmark/dataset/MetazExp/count"
+count_files = os.listdir(count_dir)
+print(f"Found {len(count_files)} count files")
+
+# Read first file to understand structure
+first_file = os.path.join(count_dir, count_files[0])
+print(f"\nReading first file: {first_file}")
+first_counts = pd.read_csv(first_file, sep='\t')
+print(f"Shape: {first_counts.shape}")
+print("First few rows:")
+print(first_counts.head())
+print("\nColumn names:", first_counts.columns.tolist())
+</execute>
+<observation>Found 6 count files
+
+Reading first file: benchmark/dataset/MetazExp/count/DRX198149.gene.expr.tsv
+Shape: (17714, 5)
+First few rows:
+        geneId  readCount     Coverage        FPKM         TPM
+0  FBgn0039635      20831  1530.846436  105.496330  161.640015
+1  FBgn0086355      28769  2769.733643  150.103287  229.986176
+2  FBgn0034501      17799   682.803040   31.329226   48.002205
+3  FBgn0051774         31     0.599920    0.028744    0.044041
+4  FBgn0011603       1835    52.291134    3.254867    4.987062
+
+Column names: ['geneId', 'readCount', 'Coverage', 'FPKM', 'TPM']
+</observation>
+Good. The count data has `geneId` and `readCount` columns. I need to combine all samples into a count matrix. Let me read all files and create a combined dataframe.
+
+<execute>
+# Read all count files and combine
+count_data = {}
+gene_ids = None
+
+for count_file in count_files:
+    drx_id = count_file.replace('.gene.expr.tsv', '')
+    file_path = os.path.join(count_dir, count_file)
+    df = pd.read_csv(file_path, sep='\t')
+    
+    # Use geneId as index and readCount as values
+    if gene_ids is None:
+        gene_ids = df['geneId'].values
+    else:
+        # Check if gene IDs are consistent
+        if not all(df['geneId'].values == gene_ids):
+            print(f"Warning: Gene IDs don't match for {drx_id}")
+    
+    count_data[drx_id] = df['readCount'].values
+
+# Create count matrix
+count_matrix = pd.DataFrame(count_data, index=gene_ids)
+print("Count matrix shape:", count_matrix.shape)
+print("\nFirst few rows of count matrix:")
+print(count_matrix.head())
+</execute>
+<observation>NameError("name 'count_files' is not defined")</observation>
+<execute>
+import os
+import pandas as pd
+
+count_dir = "benchmark/dataset/MetazExp/count"
+count_files = os.listdir(count_dir)
+
+# Read all count files and combine
+count_data = {}
+gene_ids = None
+
+for count_file in count_files:
+    drx_id = count_file.replace('.gene.expr.tsv', '')
+    file_path = os.path.join(count_dir, count_file)
+    df = pd.read_csv(file_path, sep='\t')
+    
+    # Use geneId as index and readCount as values
+    if gene_ids is None:
+        gene_ids = df['geneId'].values
+    else:
+        # Check if gene IDs are consistent
+        if not all(df['geneId'].values == gene_ids):
+            print(f"Warning: Gene IDs don't match for {drx_id}")
+    
+    count_data[drx_id] = df['readCount'].values
+
+# Create count matrix
+count_matrix = pd.DataFrame(count_data, index=gene_ids)
+print("Count matrix shape:", count_matrix.shape)
+print("\nFirst few rows of count matrix:")
+print(count_matrix.head())
+</execute>
+<observation>Warning: Gene IDs don't match for DRX198150
+Warning: Gene IDs don't match for DRX198151
+Warning: Gene IDs don't match for DRX198152
+Warning: Gene IDs don't match for DRX198153
+Warning: Gene IDs don't match for DRX198154
+Count matrix shape: (17714, 6)
+
+First few rows of count matrix:
+             DRX198149  DRX198150  DRX198151  DRX198152  DRX198153  DRX198154
+FBgn0039635      20831       2326          0          0          0          3
+FBgn0086355      28769      27248       1914        215          5       3861
+FBgn0034501      17799       1552          2          1          1      29476
+FBgn0051774         31         17       3341       4341       5948          0
+FBgn0011603       1835       5003          1       8657         14          2
+</observation>
+There's a warning about gene IDs not matching. Let me check if the gene IDs are in the same order or if they're different sets.
+
+<execute>
+# Check gene ID consistency
+gene_id_sets = []
+for count_file in count_files:
+    drx_id = count_file.replace('.gene.expr.tsv', '')
+    file_path = os.path.join(count_dir, count_file)
+    df = pd.read_csv(file_path, sep='\t')
+    gene_id_sets.append(set(df['geneId']))
+
+# Check if all sets are equal
+all_equal = all(s == gene_id_sets[0] for s in gene_id_sets[1:])
+print(f"All gene ID sets equal: {all_equal}")
+
+# Check sizes
+for i, s in enumerate(gene_id_sets):
+    print(f"File {i}: {len(s)} genes")
+
+# Check differences
+if not all_equal:
+    print("\nChecking differences...")
+    for i in range(1, len(gene_id_sets)):
+        diff = gene_id_sets[i] - gene_id_sets[0]
+        print(f"Genes in file {i} not in file 0: {len(diff)}")
+        if len(diff) > 0:
+            print(f"  Example: {list(diff)[:5]}")
+</execute>
+<observation>NameError("name 'count_files' is not defined")</observation>
+<execute>
+import os
+import pandas as pd
+
+count_dir = "benchmark/dataset/MetazExp/count"
+count_files = os.listdir(count_dir)
+
+# Check gene ID consistency
+gene_id_sets = []
+for count_file in count_files:
+    drx_id = count_file.replace('.gene.expr.tsv', '')
+    file_path = os.path.join(count_dir, count_file)
+    df = pd.read_csv(file_path, sep='\t')
+    gene_id_sets.append(set(df['geneId']))
+
+# Check if all sets are equal
+all_equal = all(s == gene_id_sets[0] for s in gene_id_sets[1:])
+print(f"All gene ID sets equal: {all_equal}")
+
+# Check sizes
+for i, s in enumerate(gene_id_sets):
+    print(f"File {i} ({count_files[i]}): {len(s)} genes")
+
+# Check differences
+if not all_equal:
+    print("\nChecking differences...")
+    for i in range(1, len(gene_id_sets)):
+        diff = gene_id_sets[i] - gene_id_sets[0]
+        print(f"Genes in file {i} not in file 0: {len(diff)}")
+        if len(diff) > 0:
+            print(f"  Example: {list(diff)[:5]}")
+</execute>
+<observation>NameError("name 'gene_id_sets' is not defined")</observation>
+Let me rewrite the code more carefully.
+
+<execute>
+import os
+import pandas as pd
+
+count_dir = "benchmark/dataset/MetazExp/count"
+count_files = sorted(os.listdir(count_dir))
+
+# Check gene ID consistency
+gene_id_sets = []
+for count_file in count_files:
+    file_path = os.path.join(count_dir, count_file)
+    df = pd.read_csv(file_path, sep='\t')
+    gene_id_sets.append(set(df['geneId']))
+
+# Check if all sets are equal
+all_equal = all(s == gene_id_sets[0] for s in gene_id_sets[1:])
+print(f"All gene ID sets equal: {all_equal}")
+
+# Check sizes
+for i, s in enumerate(gene_id_sets):
+    print(f"File {i} ({count_files[i]}): {len(s)} genes")
+
+# Check differences
+if not all_equal:
+    print("\nChecking differences...")
+    for i in range(1, len(gene_id_sets)):
+        diff = gene_id_sets[i] - gene_id_sets[0]
+        print(f"Genes in file {i} not in file 0: {len(diff)}")
+        if len(diff) > 0:
+            print(f"  Example: {list(diff)[:5]}")
+</execute>
+<observation>NameError("name 'gene_id_sets' is not defined")</observation>
+I need to define gene_id_sets before using it.
+
+<execute>
+import os
+import pandas as pd
+
+count_dir = "benchmark/dataset/MetazExp/count"
+count_files = sorted(os.listdir(count_dir))
+
+# Check gene ID consistency
+gene_id_sets = []
+for count_file in count_files:
+    file_path = os.path.join(count_dir, count_file)
+    df = pd.read_csv(file_path, sep='\t')
+    gene_id_sets.append(set(df['geneId']))
+
+# Check if all sets are equal
+all_equal = True
+for i in range(1, len(gene_id_sets)):
+    if gene_id_sets[i] != gene_id_sets[0]:
+        all_equal = False
+        break
+
+print(f"All gene ID sets equal: {all_equal}")
+
+# Check sizes
+for i, s in enumerate(gene_id_sets):
+    print(f"File {i} ({count_files[i]}): {len(s)} genes")
+
+# Check differences
+if not all_equal:
+    print("\nChecking differences...")
+    for i in range(1, len(gene_id_sets)):
+        diff = gene_id_sets[i] - gene_id_sets[0]
+        print(f"Genes in file {i} not in file 0: {len(diff)}")
+        if len(diff) > 0:
+            print(f"  Example: {list(diff)[:5]}")
+</execute>
+<observation>All gene ID sets equal: True
+File 0 (DRX198149.gene.expr.tsv): 17714 genes
+File 1 (DRX198150.gene.expr.tsv): 17714 genes
+File 2 (DRX198151.gene.expr.tsv): 17714 genes
+File 3 (DRX198152.gene.expr.tsv): 17714 genes
+File 4 (DRX198153.gene.expr.tsv): 17714 genes
+File 5 (DRX198154.gene.expr.tsv): 17714 genes
+</observation>
+Good! The gene sets are equal. The warning earlier was probably because the order was different. Let me rebuild the count matrix ensuring consistent ordering.
+
+<execute>
+# Rebuild count matrix with consistent gene ordering
+# First, get all unique gene IDs in sorted order
+all_genes = sorted(gene_id_sets[0])
+print(f"Total unique genes: {len(all_genes)}")
+
+# Create count matrix
+count_data = {}
+for count_file in count_files:
+    drx_id = count_file.replace('.gene.expr.tsv', '')
+    file_path = os.path.join(count_dir, count_file)
+    df = pd.read_csv(file_path, sep='\t')
+    
+    # Create a dictionary for quick lookup
+    gene_to_count = dict(zip(df['geneId'], df['readCount']))
+    
+    # Get counts in consistent order
+    counts = [gene_to_count.get(gene, 0) for gene in all_genes]
+    count_data[drx_id] = counts
+
+# Create DataFrame
+count_matrix = pd.DataFrame(count_data, index=all_genes)
+print("Count matrix shape:", count_matrix.shape)
+print("\nFirst few rows:")
+print(count_matrix.head())
+print("\nColumn sums (total reads per sample):")
+print(count_matrix.sum())
+</execute>
+<observation>NameError("name 'gene_id_sets' is not defined")</observation>
+Let me reload everything in one cell.
+
+<execute>
+import os
+import pandas as pd
+
+# Load sample info
+sample_info_path = "benchmark/dataset/MetazExp/sample_info.tsv"
+sample_info = pd.read_csv(sample_info_path, sep='\t')
+sample_info_reset = sample_info.reset_index()
+
+# Create sample metadata
+sample_metadata = {}
+for i in range(len(sample_info_reset)):
+    drx = sample_info_reset['level_1'].iloc[i]
+    condition = sample_info_reset['Strain'].iloc[i]
+    batch = sample_info_reset['level_0'].iloc[i]  # DRP006530
+    sample_metadata[drx] = {'condition': condition, 'batch': batch}
+
+print("Sample metadata:")
+for drx, meta in sample_metadata.items():
+    print(f"{drx}: condition={meta['condition']}, batch={meta['batch']}")
+
+# Load count data
+count_dir = "benchmark/dataset/MetazExp/count"
+count_files = sorted(os.listdir(count_dir))
+
+# Get all gene IDs from first file
+first_file = os.path.join(count_dir, count_files[0])
+first_df = pd.read_csv(first_file, sep='\t')
+all_genes = sorted(first_df['geneId'].tolist())
+print(f"\nTotal genes: {len(all_genes)}")
+
+# Build count matrix
+count_data = {}
+for count_file in count_files:
+    drx_id = count_file.replace('.gene.expr.tsv', '')
+    file_path = os.path.join(count_dir, count_file)
+    df = pd.read_csv(file_path, sep='\t')
+    
+    # Create dictionary for lookup
+    gene_to_count = dict(zip(df['geneId'], df['readCount']))
+    
+    # Get counts in consistent order
+    counts = [gene_to_count.get(gene, 0) for gene in all_genes]
+    count_data[drx_id] = counts
+
+count_matrix = pd.DataFrame(count_data, index=all_genes)
+print("Count matrix shape:", count_matrix.shape)
+print("\nFirst few rows:")
+print(count_matrix.head())
+</execute>
+<observation>NameError("name 'gene_to_count' is not defined")</observation>
+Let me fix the variable scope issue.
+
+<execute>
+import os
+import pandas as pd
+
+# Load sample info
+sample_info_path = "benchmark/dataset/MetazExp/sample_info.tsv"
+sample_info = pd.read_csv(sample_info_path, sep='\t')
+sample_info_reset = sample_info.reset_index()
+
+# Create sample metadata
+sample_metadata = {}
+for i in range(len(sample_info_reset)):
+    drx = sample_info_reset['level_1'].iloc[i]
+    condition = sample_info_reset['Strain'].iloc[i]
+    batch = sample_info_reset['level_0'].iloc[i]  # DRP006530
+    sample_metadata[drx] = {'condition': condition, 'batch': batch}
+
+print("Sample metadata:")
+for drx, meta in sample_metadata.items():
+    print(f"{drx}: condition={meta['condition']}, batch={meta['batch']}")
+
+# Load count data
+count_dir = "benchmark/dataset/MetazExp/count"
+count_files = sorted(os.listdir(count_dir))
+
+# Get all gene IDs from first file
+first_file = os.path.join(count_dir, count_files[0])
+first_df = pd.read_csv(first_file, sep='\t')
+all_genes = sorted(first_df['geneId'].tolist())
+print(f"\nTotal genes: {len(all_genes)}")
+
+# Build count matrix
+count_data = {}
+for count_file in count_files:
+    drx_id = count_file.replace('.gene.expr.tsv', '')
+    file_path = os.path.join(count_dir, count_file)
+    df = pd.read_csv(file_path, sep='\t')
+    
+    # Create dictionary for lookup
+    gene_to_count_dict = dict(zip(df['geneId'], df['readCount']))
+    
+    # Get counts in consistent order
+    counts = [gene_to_count_dict.get(gene, 0) for gene in all_genes]
+    count_data[drx_id] = counts
+
+count_matrix = pd.DataFrame(count_data, index=all_genes)
+print("Count matrix shape:", count_matrix.shape)
+print("\nFirst few rows:")
+print(count_matrix.head())
+</execute>
+<observation>NameError("name 'gene_to_count_dict' is not defined")</observation>
+There seems to be an issue with variable scope in the loop. Let me rewrite more carefully.
+
+<execute>
+import os
+import pandas as pd
+
+# Load sample info
+sample_info_path = "benchmark/dataset/MetazExp/sample_info.tsv"
+sample_info = pd.read_csv(sample_info_path, sep='\t')
+sample_info_reset = sample_info.reset_index()
+
+# Create sample metadata
+sample_metadata = {}
+for i in range(len(sample_info_reset)):
+    drx = sample_info_reset['level_1'].iloc[i]
+    condition = sample_info_reset['Strain'].iloc[i]
+    batch = sample_info_reset['level_0'].iloc[i]
+    sample_metadata[drx] = {'condition': condition, 'batch': batch}
+
+print("Sample metadata:")
+for drx, meta in sample_metadata.items():
+    print(f"{drx}: condition={meta['condition']}, batch={meta['batch']}")
+
+# Load count data
+count_dir = "benchmark/dataset/MetazExp/count"
+count_files = sorted(os.listdir(count_dir))
+
+# Get all gene IDs from first file
+first_file = os.path.join(count_dir, count_files[0])
+first_df = pd.read_csv(first_file, sep='\t')
+all_genes = sorted(first_df['geneId'].tolist())
+print(f"\nTotal genes: {len(all_genes)}")
+
+# Build count matrix
+count_data = {}
+
+for count_file in count_files:
+    drx_id = count_file.replace('.gene.expr.tsv', '')
+    file_path = os.path.join(count_dir, count_file)
+    df = pd.read_csv(file_path, sep='\t')
+    
+    # Create a Series for easy lookup
+    count_series = pd.Series(df['readCount'].values, index=df['geneId'])
+    
+    # Get counts in consistent order
+    counts = count_series.reindex(all_genes).fillna(0).tolist()
+    count_data[drx_id] = counts
+
+count_matrix = pd.DataFrame(count_data, index=all_genes)
+print("Count matrix shape:", count_matrix.shape)
+print("\nFirst few rows:")
+print(count_matrix.head())
+print("\nColumn sums:")
+print(count_matrix.sum())
+</execute>
+<observation>Sample metadata:
+DRX198149: condition=cancer-bearing, batch=DRP006530
+DRX198150: condition=cancer-bearing, batch=DRP006530
+DRX198151: condition=cancer-bearing, batch=DRP006530
+DRX198152: condition=non-cancer control, batch=DRP006530
+DRX198153: condition=non-cancer control, batch=DRP006530
+DRX198154: condition=non-cancer control, batch=DRP006530
+
+Total genes: 17714
+Count matrix shape: (17714, 6)
+
+First few rows:
+             DRX198149  DRX198150  DRX198151  DRX198152  DRX198153  DRX198154
+FBgn0000003       1511       1992       1345        386       5597       2064
+FBgn0000008       2577       2747       2834       5381       2719       3226
+FBgn0000014       1273        994       1305       2563        939        960
+FBgn0000015       1565         78        502         93        111         85
+FBgn0000017       9798      10853      10323      15360      17951      20272
+
+Column sums:
+DRX198149    134949109
+DRX198150    142725429
+DRX198151    146381655
+DRX198152    144547004
+DRX198153    133250671
+DRX198154    145531997
+dtype: int64
+</observation>
+Great! Now I have the count matrix and sample metadata. Let me update the plan checklist:
+
+1. [✓] Examine the directory structure and locate the count files and sample info.
+2. [✓] Load the sample information and understand the experimental design.
+3. [✓] Read the count data from the 6 DRX experiments.
+4. [ ] Create a DESeq2 dataset with appropriate design formula (batch + condition).
+5. [ ] Perform differential expression analysis comparing target condition vs all other conditions.
+6. [ ] Extract results and identify top 50 significant genes.
+7. [ ] Save results to the specified output path.
+8. [ ] Create necessary directories for temporary data.
+
+Now step 4: Create DESeq2 dataset. I'll use R for DESeq2 analysis. First, let me save the data to temporary files for R to read.
+
+<execute>
+# Create temporary directory
+temp_dir = "/root/autodl-tmp/biomni_v20260208_tmp/deepseek-v3.2-fast/metazexp_annotate"
+os.makedirs(temp_dir, exist_ok=True)
+
+# Save count matrix
+count_matrix_path = os.path.join(temp_dir, "count_matrix.tsv")
+count_matrix.to_csv(count_matrix_path, sep='\t')
+print(f"Saved count matrix to: {count_matrix_path}")
+
+# Save sample metadata
+metadata_df = pd.DataFrame([
+    {'sample': drx, 'condition': meta['condition'], 'batch': meta['batch']}
+    for drx, meta in sample_metadata.items()
+])
+metadata_path = os.path.join(temp_dir, "metadata.tsv")
+metadata_df.to_csv(metadata_path, sep='\t', index=False)
+print(f"Saved metadata to: {metadata_path}")
+
+print("\nMetadata:")
+print(metadata_df)
+</execute>
+<observation>NameError("name 'os' is not defined")</observation>
+<execute>
+import os
+import pandas as pd
+
+# Create temporary directory
+temp_dir = "/root/autodl-tmp/biomni_v20260208_tmp/deepseek-v3.2-fast/metazexp_annotate"
+os.makedirs(temp_dir, exist_ok=True)
+
+# Save count matrix
+count_matrix_path = os.path.join(temp_dir, "count_matrix.tsv")
+count_matrix.to_csv(count_matrix_path, sep='\t')
+print(f"Saved count matrix to: {count_matrix_path}")
+
+# Save sample metadata
+metadata_df = pd.DataFrame([
+    {'sample': drx, 'condition': meta['condition'], 'batch': meta['batch']}
+    for drx, meta in sample_metadata.items()
+])
+metadata_path = os.path.join(temp_dir, "metadata.tsv")
+metadata_df.to_csv(metadata_path, sep='\t', index=False)
+print(f"Saved metadata to: {metadata_path}")
+
+print("\nMetadata:")
+print(metadata_df)
+</execute>
+<observation>NameError("name 'count_matrix' is not defined")</observation>
+I need to reload all the data in one cell.
+
+<execute>
+import os
+import pandas as pd
+
+# Load sample info
+sample_info_path = "benchmark/dataset/MetazExp/sample_info.tsv"
+sample_info = pd.read_csv(sample_info_path, sep='\t')
+sample_info_reset = sample_info.reset_index()
+
+# Create sample metadata
+sample_metadata = {}
+for i in range(len(sample_info_reset)):
+    drx = sample_info_reset['level_1'].iloc[i]
+    condition = sample_info_reset['Strain'].iloc[i]
+    batch = sample_info_reset['level_0'].iloc[i]
+    sample_metadata[drx] = {'condition': condition, 'batch': batch}
+
+# Load count data
+count_dir = "benchmark/dataset/MetazExp/count"
+count_files = sorted(os.listdir(count_dir))
+
+# Get all gene IDs from first file
+first_file = os.path.join(count_dir, count_files[0])
+first_df = pd.read_csv(first_file, sep='\t')
+all_genes = sorted(first_df['geneId'].tolist())
+
+# Build count matrix
+count_data = {}
+for count_file in count_files:
+    drx_id = count_file.replace('.gene.expr.tsv', '')
+    file_path = os.path.join(count_dir, count_file)
+    df = pd.read_csv(file_path, sep='\t')
+    
+    # Create a Series for easy lookup
+    count_series = pd.Series(df['readCount'].values, index=df['geneId'])
+    
+    # Get counts in consistent order
+    counts = count_series.reindex(all_genes).fillna(0).tolist()
+    count_data[drx_id] = counts
+
+count_matrix = pd.DataFrame(count_data, index=all_genes)
+
+# Create temporary directory
+temp_dir = "/root/autodl-tmp/biomni_v20260208_tmp/deepseek-v3.2-fast/metazexp_annotate"
+os.makedirs(temp_dir, exist_ok=True)
+
+# Save count matrix
+count_matrix_path = os.path.join(temp_dir, "count_matrix.tsv")
+count_matrix.to_csv(count_matrix_path, sep='\t')
+print(f"Saved count matrix to: {count_matrix_path}")
+print(f"Count matrix shape: {count_matrix.shape}")
+
+# Save sample metadata
+metadata_df = pd.DataFrame([
+    {'sample': drx, 'condition': meta['condition'], 'batch': meta['batch']}
+    for drx, meta in sample_metadata.items()
+])
+metadata_path = os.path.join(temp_dir, "metadata.tsv")
+metadata_df.to_csv(metadata_path, sep='\t', index=False)
+print(f"Saved metadata to: {metadata_path}")
+
+print("\nMetadata:")
+print(metadata_df)
+</execute>
+<observation>Saved count matrix to: /root/autodl-tmp/biomni_v20260208_tmp/deepseek-v3.2-fast/metazexp_annotate/count_matrix.tsv
+Count matrix shape: (17714, 6)
+Saved metadata to: /root/autodl-tmp/biomni_v20260208_tmp/deepseek-v3.2-fast/metazexp_annotate/metadata.tsv
+
+Metadata:
+      sample           condition      batch
+0  DRX198149      cancer-bearing  DRP006530
+1  DRX198150      cancer-bearing  DRP006530
+2  DRX198151      cancer-bearing  DRP006530
+3  DRX198152  non-cancer control  DRP006530
+4  DRX198153  non-cancer control  DRP006530
+5  DRX198154  non-cancer control  DRP006530
+</observation>
+Good! Now step 4: Create DESeq2 dataset and perform differential expression analysis. I'll use R for this.
+
+<execute>
+#!R
+library(DESeq2)
+library(tidyverse)
+
+# Set paths
+temp_dir <- "/root/autodl-tmp/biomni_v20260208_tmp/deepseek-v3.2-fast/metazexp_annotate"
+count_matrix_path <- file.path(temp_dir, "count_matrix.tsv")
+metadata_path <- file.path(temp_dir, "metadata.tsv")
+
+# Read data
+count_matrix <- read.table(count_matrix_path, header=TRUE, row.names=1, sep="\t")
+metadata <- read.table(metadata_path, header=TRUE, sep="\t")
+
+print("Count matrix dimensions:")
+print(dim(count_matrix))
+print("\nMetadata:")
+print(metadata)
+
+# Ensure sample order matches
+count_matrix <- count_matrix[, metadata$sample]
+
+# Create DESeq2 dataset
+# Since all samples have the same batch (DRP006530), we'll use ~ condition
+# But following instructions: design = ~ batch + condition
+dds <- DESeqDataSetFromMatrix(countData = count_matrix,
+                              colData = metadata,
+                              design = ~ batch + condition)
+
+print("\nDESeq2 object created successfully")
+print(dds)
+</execute>
+<observation>Error running R code:
+Loading required package: S4Vectors
+Loading required package: stats4
+Loading required package: BiocGenerics
+
+Attaching package: ‘BiocGenerics’
+
+The following objects are masked from ‘package:stats’:
+
+    IQR, mad, sd, var, xtabs
+
+The following objects are masked from ‘package:base’:
+
+    anyDuplicated, aperm, append, as.data.frame, basename, cbind,
+    colnames, dirname, do.call, duplicated, eval, evalq, Filter, Find,
+    get, grep, grepl, intersect, is.unsorted, lapply, Map, mapply,
+    match, mget, order, paste, pmax, pmax.int, pmin, pmin.int,
+    Position, rank, rbind, Reduce, rownames, sapply, setdiff, sort,
+    table, tapply, union, unique, unsplit, which.max, which.min
+
+
+Attaching package: ‘S4Vectors’
+
+The following object is masked from ‘package:utils’:
+
+    findMatches
+
+The following objects are masked from ‘package:base’:
+
+    expand.grid, I, unname
+
+Loading required package: IRanges
+Loading required package: GenomicRanges
+Loading required package: GenomeInfoDb
+Loading required package: SummarizedExperiment
+Loading required package: MatrixGenerics
+Loading required package: matrixStats
+
+Attaching package: ‘MatrixGenerics’
+
+The following objects are masked from ‘package:matrixStats’:
+
+    colAlls, colAnyNAs, colAnys, colAvgsPerRowSet, colCollapse,
+    colCounts, colCummaxs, colCummins, colCumprods, colCumsums,
+    colDiffs, colIQRDiffs, colIQRs, colLogSumExps, colMadDiffs,
+    colMads, colMaxs, colMeans2, colMedians, colMins, colOrderStats,
+    colProds, colQuantiles, colRanges, colRanks, colSdDiffs, colSds,
+    colSums2, colTabulates, colVarDiffs, colVars, colWeightedMads,
+    colWeightedMeans, colWeightedMedians, colWeightedSds,
+    colWeightedVars, rowAlls, rowAnyNAs, rowAnys, rowAvgsPerColSet,
+    rowCollapse, rowCounts, rowCummaxs, rowCummins, rowCumprods,
+    rowCumsums, rowDiffs, rowIQRDiffs, rowIQRs, rowLogSumExps,
+    rowMadDiffs, rowMads, rowMaxs, rowMeans2, rowMedians, rowMins,
+    rowOrderStats, rowProds, rowQuantiles, rowRanges, rowRanks,
+    rowSdDiffs, rowSds, rowSums2, rowTabulates, rowVarDiffs, rowVars,
+    rowWeightedMads, rowWeightedMeans, rowWeightedMedians,
+    rowWeightedSds, rowWeightedVars
+
+Loading required package: Biobase
+Welcome to Bioconductor
+
+    Vignettes contain introductory material; view with
+    'browseVignettes()'. To cite Bioconductor, see
+    'citation("Biobase")', and for packages 'citation("pkgname")'.
+
+
+Attaching package: ‘Biobase’
+
+The following object is masked from ‘package:MatrixGenerics’:
+
+    rowMedians
+
+The following objects are masked from ‘package:matrixStats’:
+
+    anyMissing, rowMedians
+
+── Attaching core tidyverse packages ──────────────────────── tidyverse 2.0.0 ──
+✔ dplyr     1.1.4     ✔ readr     2.1.5
+✔ forcats   1.0.0     ✔ stringr   1.5.2
+✔ ggplot2   3.5.2     ✔ tibble    3.3.0
+✔ lubridate 1.9.4     ✔ tidyr     1.3.1
+✔ purrr     1.1.0     
+── Conflicts ────────────────────────────────────────── tidyverse_conflicts() ──
+✖ lubridate::%within%() masks IRanges::%within%()
+✖ dplyr::collapse()     masks IRanges::collapse()
+✖ dplyr::combine()      masks Biobase::combine(), BiocGenerics::combine()
+✖ dplyr::count()        masks matrixStats::count()
+✖ dplyr::desc()         masks IRanges::desc()
+✖ tidyr::expand()       masks S4Vectors::expand()
+✖ dplyr::filter()       masks stats::filter()
+✖ dplyr::first()        masks S4Vectors::first()
+✖ dplyr::lag()          masks stats::lag()
+✖ ggplot2::Position()   masks BiocGenerics::Position(), base::Position()
+✖ purrr::reduce()       masks GenomicRanges::reduce(), IRanges::reduce()
+✖ dplyr::rename()       masks S4Vectors::rename()
+✖ lubridate::second()   masks S4Vectors::second()
+✖ lubridate::second<-() masks S4Vectors::second<-()
+✖ dplyr::slice()        masks IRanges::slice()
+ℹ Use the conflicted package (<http://conflicted.r-lib.org/>) to force all conflicts to become errors
+Warning messages:
+1: package ‘tidyverse’ was built under R version 4.3.3 
+2: package ‘ggplot2’ was built under R version 4.3.3 
+3: package ‘tibble’ was built under R version 4.3.3 
+4: package ‘tidyr’ was built under R version 4.3.3 
+5: package ‘readr’ was built under R version 4.3.3 
+6: package ‘purrr’ was built under R version 4.3.3 
+7: package ‘dplyr’ was built under R version 4.3.3 
+8: package ‘stringr’ was built under R version 4.3.3 
+9: package ‘forcats’ was built under R version 4.3.3 
+10: package ‘lubridate’ was built under R version 4.3.3 
+Error in `contrasts<-`(`*tmp*`, value = contr.funs[1 + isOF[nn]]) : 
+  contrasts can be applied only to factors with 2 or more levels
+Calls: DESeqDataSetFromMatrix -> DESeqDataSet -> <Anonymous> -> contrasts<-
+In addition: Warning message:
+In DESeqDataSet(se, design = design, ignoreRank) :
+  some variables in design formula are characters, converting to factors
+Execution halted
+</observation>
+The error occurs because `batch` has only one level (all samples have the same batch "DRP006530"). Since we can't have a factor with only one level in the design, I need to adjust. The instruction says to include batch variable, but if there's only one batch, I should either remove it or use a different approach. Let me check if there are any other potential batch variables.
+
+Looking back at the metadata, all samples have the same `batch` (DRP006530). However, I notice that `level_2` was "PMID:32865275" for all, and `Source` was "hemocyte" for all. So there's truly no batch effect to correct for.
+
+Given this, I should use a simpler design: `~ condition`. But to follow the instruction as closely as possible, let me see if I can create a dummy batch variable or use the `Study` column which has two different values.
+
+Actually, looking at the `Study` column again: the first 3 samples have "UAS-bub3IR..." and the last 3 have "en-GAL4 UA...". This could be considered a batch or technical factor. Let me use that as batch.
+
+<execute>
+#!R
+library(DESeq2)
+
+# Set paths
+temp_dir <- "/root/autodl-tmp/biomni_v20260208_tmp/deepseek-v3.2-fast/metazexp_annotate"
+count_matrix_path <- file.path(temp_dir, "count_matrix.tsv")
+
+# Read count matrix
+count_matrix <- read.table(count_matrix_path, header=TRUE, row.names=1, sep="\t")
+
+# Create metadata with batch from Study column
+# Based on earlier analysis:
+# DRX198149-151: "UAS-bub3IR...UAS-bub3IR/en-GAL4 UAS-GFP;UAS-p35/+"
+# DRX198152-154: "en-GAL4 UA...en-GAL4 UAS-GFP/+;+/+"
+metadata <- data.frame(
+  sample = colnames(count_matrix),
+  condition = c("cancer-bearing", "cancer-bearing", "cancer-bearing",
+                "non-cancer control", "non-cancer control", "non-cancer control"),
+  batch = c("batch1", "batch1", "batch1", "batch2", "batch2", "batch2")
+)
+
+print("Metadata with batch:")
+print(metadata)
+
+# Create DESeq2 dataset
+dds <- DESeqDataSetFromMatrix(countData = count_matrix,
+                              colData = metadata,
+                              design = ~ batch + condition)
+
+print("\nDESeq2 object created successfully")
+print(dds)
+</execute>
+<observation>Error running R code:
+Loading required package: S4Vectors
+Loading required package: stats4
+Loading required package: BiocGenerics
+
+Attaching package: ‘BiocGenerics’
+
+The following objects are masked from ‘package:stats’:
+
+    IQR, mad, sd, var, xtabs
+
+The following objects are masked from ‘package:base’:
+
+    anyDuplicated, aperm, append, as.data.frame, basename, cbind,
+    colnames, dirname, do.call, duplicated, eval, evalq, Filter, Find,
+    get, grep, grepl, intersect, is.unsorted, lapply, Map, mapply,
+    match, mget, order, paste, pmax, pmax.int, pmin, pmin.int,
+    Position, rank, rbind, Reduce, rownames, sapply, setdiff, sort,
+    table, tapply, union, unique, unsplit, which.max, which.min
+
+
+Attaching package: ‘S4Vectors’
+
+The following object is masked from ‘package:utils’:
+
+    findMatches
+
+The following objects are masked from ‘package:base’:
+
+    expand.grid, I, unname
+
+Loading required package: IRanges
+Loading required package: GenomicRanges
+Loading required package: GenomeInfoDb
+Loading required package: SummarizedExperiment
+Loading required package: MatrixGenerics
+Loading required package: matrixStats
+
+Attaching package: ‘MatrixGenerics’
+
+The following objects are masked from ‘package:matrixStats’:
+
+    colAlls, colAnyNAs, colAnys, colAvgsPerRowSet, colCollapse,
+    colCounts, colCummaxs, colCummins, colCumprods, colCumsums,
+    colDiffs, colIQRDiffs, colIQRs, colLogSumExps, colMadDiffs,
+    colMads, colMaxs, colMeans2, colMedians, colMins, colOrderStats,
+    colProds, colQuantiles, colRanges, colRanks, colSdDiffs, colSds,
+    colSums2, colTabulates, colVarDiffs, colVars, colWeightedMads,
+    colWeightedMeans, colWeightedMedians, colWeightedSds,
+    colWeightedVars, rowAlls, rowAnyNAs, rowAnys, rowAvgsPerColSet,
+    rowCollapse, rowCounts, rowCummaxs, rowCummins, rowCumprods,
+    rowCumsums, rowDiffs, rowIQRDiffs, rowIQRs, rowLogSumExps,
+    rowMadDiffs, rowMads, rowMaxs, rowMeans2, rowMedians, rowMins,
+    rowOrderStats, rowProds, rowQuantiles, rowRanges, rowRanks,
+    rowSdDiffs, rowSds, rowSums2, rowTabulates, rowVarDiffs, rowVars,
+    rowWeightedMads, rowWeightedMeans, rowWeightedMedians,
+    rowWeightedSds, rowWeightedVars
+
+Loading required package: Biobase
+Welcome to Bioconductor
+
+    Vignettes contain introductory material; view with
+    'browseVignettes()'. To cite Bioconductor, see
+    'citation("Biobase")', and for packages 'citation("pkgname")'.
+
+
+Attaching package: ‘Biobase’
+
+The following object is masked from ‘package:MatrixGenerics’:
+
+    rowMedians
+
+The following objects are masked from ‘package:matrixStats’:
+
+    anyMissing, rowMedians
+
+Error in checkFullRank(modelMatrix) : 
+  the model matrix is not full rank, so the model cannot be fit as specified.
+  One or more variables or interaction terms in the design formula are linear
+  combinations of the others and must be removed.
+
+  Please read the vignette section 'Model matrix not full rank':
+
+  vignette('DESeq2')
+Calls: DESeqDataSetFromMatrix -> DESeqDataSet -> checkFullRank
+In addition: Warning message:
+In DESeqDataSet(se, design = design, ignoreRank) :
+  some variables in design formula are characters, converting to factors
+Execution halted
+</observation>
+The issue is that `batch` and `condition` are perfectly correlated (batch1 = cancer-bearing, batch2 = non-cancer control). This creates a rank-deficient model matrix. Since there's no true batch effect in this dataset, and following the instruction to correct for batch effects when they exist, I should use a simpler design `~ condition`. Let me do that.
+
+<execute>
+#!R
+library(DESeq2)
+
+# Set paths
+temp_dir <- "/root/autodl-tmp/biomni_v20260208_tmp/deepseek-v3.2-fast/metazexp_annotate"
+count_matrix_path <- file.path(temp_dir, "count_matrix.tsv")
+
+# Read count matrix
+count_matrix <- read.table(count_matrix_path, header=TRUE, row.names=1, sep="\t")
+
+# Create metadata
+metadata <- data.frame(
+  sample = colnames(count_matrix),
+  condition = factor(c("cancer-bearing", "cancer-bearing", "cancer-bearing",
+                       "non-cancer control", "non-cancer control", "non-cancer control"),
+                     levels = c("non-cancer control", "cancer-bearing"))
+)
+
+print("Metadata:")
+print(metadata)
+
+# Create DESeq2 dataset with design ~ condition
+dds <- DESeqDataSetFromMatrix(countData = count_matrix,
+                              colData = metadata,
+                              design = ~ condition)
+
+print("\nDESeq2 object created successfully")
+print(dds)
+
+# Run DESeq2 analysis
+dds <- DESeq(dds)
+print("\nDESeq analysis completed")
+
+# Get results
+# Comparing cancer-bearing (target) vs non-cancer control
+res <- results(dds, contrast = c("condition", "cancer-bearing", "non-cancer control"))
+print("\nResults summary:")
+summary(res)
+
+# Order by adjusted p-value
+res_ordered <- res[order(res$padj), ]
+print("\nTop 10 genes:")
+print(head(res_ordered, 10))
+</execute>
+<observation>[1] "Metadata:"
+     sample          condition
+1 DRX198149     cancer-bearing
+2 DRX198150     cancer-bearing
+3 DRX198151     cancer-bearing
+4 DRX198152 non-cancer control
+5 DRX198153 non-cancer control
+6 DRX198154 non-cancer control
+[1] "\nDESeq2 object created successfully"
+class: DESeqDataSet 
+dim: 17714 6 
+metadata(1): version
+assays(1): counts
+rownames(17714): FBgn0000003 FBgn0000008 ... FBgn0286938 FBgn0286940
+rowData names(0):
+colnames(6): DRX198149 DRX198150 ... DRX198153 DRX198154
+colData names(2): sample condition
+[1] "\nDESeq analysis completed"
+[1] "\nResults summary:"
+
+out of 16828 with nonzero total read count
+adjusted p-value < 0.1
+LFC > 0 (up)       : 5017, 30%
+LFC < 0 (down)     : 4779, 28%
+outliers [1]       : 27, 0.16%
+low counts [2]     : 976, 5.8%
+(mean count < 1)
+[1] see 'cooksCutoff' argument of ?results
+[2] see 'independentFiltering' argument of ?results
+
+[1] "\nTop 10 genes:"
+log2 fold change (MLE): condition cancer-bearing vs non-cancer control 
+Wald test p-value: condition cancer.bearing vs non.cancer.control 
+DataFrame with 10 rows and 6 columns
+             baseMean log2FoldChange     lfcSE      stat       pvalue
+            <numeric>      <numeric> <numeric> <numeric>    <numeric>
+FBgn0050098  2689.667       -4.87773 0.1790505  -27.2422 2.05641e-163
+FBgn0266429   694.517       -6.73065 0.2760234  -24.3843 2.50749e-131
+FBgn0032817 13116.491       -2.07089 0.0874366  -23.6845 5.21124e-124
+FBgn0000097  9797.862       -1.13760 0.0578306  -19.6713  3.79684e-86
+FBgn0019952 28155.930       -1.28375 0.0714438  -17.9687  3.42555e-72
+FBgn0030102  1928.744        4.77159 0.2657583   17.9546  4.41701e-72
+FBgn0000566 29508.607       -1.14369 0.0659463  -17.3427  2.23967e-67
+FBgn0037612  6555.541       -2.00147 0.1160062  -17.2532  1.05954e-66
+FBgn0285971  1733.103       -1.73550 0.1015963  -17.0823  2.00969e-65
+FBgn0036571  6537.276       -1.02671 0.0612993  -16.7492  5.74402e-63
+                    padj
+               <numeric>
+FBgn0050098 3.25426e-159
+FBgn0266429 1.98405e-127
+FBgn0032817 2.74893e-120
+FBgn0000097  1.50212e-82
+FBgn0019952  1.08419e-68
+FBgn0030102  1.16499e-68
+FBgn0000566  5.06326e-64
+FBgn0037612  2.09591e-63
+FBgn0285971  3.53371e-62
+FBgn0036571  9.08992e-60
+</observation>
+Excellent! The DESeq2 analysis worked. Now I need to extract the top 50 most significantly differentially expressed genes and save them to the output path. Let me update the checklist:
+
+1. [✓] Examine the directory structure and locate the count files and sample info.
+2. [✓] Load the sample information and understand the experimental design.
+3. [✓] Read the count data from the 6 DRX experiments.
+4. [✓] Create a DESeq2 dataset with appropriate design formula (batch + condition).
+5. [✓] Perform differential expression analysis comparing target condition vs all other conditions.
+6. [ ] Extract results and identify top 50 significant genes.
+7. [ ] Save results to the specified output path.
+8. [✓] Create necessary directories for temporary data.
+
+Now step 6: Extract top 50 genes and save.
+
+<execute>
+#!R
+library(DESeq2)
+
+# Set paths
+temp_dir <- "/root/autodl-tmp/biomni_v20260208_tmp/deepseek-v3.2-fast/metazexp_annotate"
+count_matrix_path <- file.path(temp_dir, "count_matrix.tsv")
+output_path <- "/root/autodl-tmp/biomni_v20260208_pred_results/deepseek-v3.2-fast/metazexp_annotate.tsv"
+
+# Read count matrix
+count_matrix <- read.table(count_matrix_path, header=TRUE, row.names=1, sep="\t")
+
+# Create metadata
+metadata <- data.frame(
+  sample = colnames(count_matrix),
+  condition = factor(c("cancer-bearing", "cancer-bearing", "cancer-bearing",
+                       "non-cancer control", "non-cancer control", "non-cancer control"),
+                     levels = c("non-cancer control", "cancer-bearing"))
+)
+
+# Create DESeq2 dataset and run analysis
+dds <- DESeqDataSetFromMatrix(countData = count_matrix,
+                              colData = metadata,
+                              design = ~ condition)
+dds <- DESeq(dds)
+
+# Get results
+res <- results(dds, contrast = c("condition", "cancer-bearing", "non-cancer control"))
+
+# Convert to dataframe and order by adjusted p-value
+res_df <- as.data.frame(res)
+res_df$gene_id <- rownames(res_df)
+
+# Reorder columns
+res_df <- res_df[, c("gene_id", "baseMean", "log2FoldChange", "lfcSE", "stat", "pvalue", "padj")]
+
+# Remove rows with NA padj
+res_df <- res_df[!is.na(res_df$padj), ]
+
+# Order by adjusted p-value
+res_ordered <- res_df[order(res_df$padj), ]
+
+# Get top 50
+top50 <- head(res_ordered, 50)
+
+print("Top 50 differentially expressed genes:")
+print(head(top50, 10))
+print(paste("\nTotal genes with padj < 0.05:", sum(top50$padj < 0.05, na.rm = TRUE)))
+
+# Create output directory if needed
+output_dir <- dirname(output_path)
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+
+# Save to file
+write.table(top50, file = output_path, sep = "\t", row.names = FALSE, quote = FALSE)
+print(paste("Saved top 50 genes to:", output_path))
+print(paste("File exists:", file.exists(output_path)))
+</execute>
+<observation>[1] "Top 50 differentially expressed genes:"
+                gene_id   baseMean log2FoldChange      lfcSE      stat
+FBgn0050098 FBgn0050098  2689.6667      -4.877729 0.17905053 -27.24219
+FBgn0266429 FBgn0266429   694.5169      -6.730648 0.27602341 -24.38434
+FBgn0032817 FBgn0032817 13116.4906      -2.070890 0.08743657 -23.68448
+FBgn0000097 FBgn0000097  9797.8623      -1.137605 0.05783058 -19.67133
+FBgn0019952 FBgn0019952 28155.9302      -1.283753 0.07144378 -17.96872
+FBgn0030102 FBgn0030102  1928.7436       4.771586 0.26575829  17.95461
+FBgn0000566 FBgn0000566 29508.6070      -1.143687 0.06594632 -17.34270
+FBgn0037612 FBgn0037612  6555.5415      -2.001474 0.11600624 -17.25315
+FBgn0285971 FBgn0285971  1733.1031      -1.735500 0.10159630 -17.08232
+FBgn0036571 FBgn0036571  6537.2764      -1.026711 0.06129926 -16.74915
+                   pvalue          padj
+FBgn0050098 2.056405e-163 3.254261e-159
+FBgn0266429 2.507487e-131 1.984049e-127
+FBgn0032817 5.211242e-124 2.748930e-120
+FBgn0000097  3.796836e-86  1.502123e-82
+FBgn0019952  3.425551e-72  1.084187e-68
+FBgn0030102  4.417014e-72  1.164988e-68
+FBgn0000566  2.239674e-67  5.063262e-64
+FBgn0037612  1.059541e-66  2.095905e-63
+FBgn0285971  2.009695e-65  3.533713e-62
+FBgn0036571  5.744024e-63  9.089917e-60
+[1] "\nTotal genes with padj < 0.05: 50"
+[1] "Saved top 50 genes to: /root/autodl-tmp/biomni_v20260208_pred_results/deepseek-v3.2-fast/metazexp_annotate.tsv"
+[1] "File exists: TRUE"
+</observation>
+Perfect! The analysis is complete. Let me verify the output file format and content.
+
+<execute>
+# Check the output file
+output_path = "/root/autodl-tmp/biomni_v20260208_pred_results/deepseek-v3.2-fast/metazexp_annotate.tsv"
+import pandas as pd
+
+result_df = pd.read_csv(output_path, sep='\t')
+print(f"Output file shape: {result_df.shape}")
+print(f"\nFirst 5 rows:")
+print(result_df.head())
+print(f"\nColumn names: {result_df.columns.tolist()}")
+print(f"\nNumber of rows: {len(result_df)}")
+print(f"\nCheck for NA values in padj: {result_df['padj'].isna().sum()}")
+print(f"Min padj: {result_df['padj'].min()}")
+print(f"Max padj in top 50: {result_df['padj'].max()}")
+</execute>
+<observation>Output file shape: (50, 7)
+
+First 5 rows:
+       gene_id      baseMean  ...         pvalue           padj
+0  FBgn0050098   2689.666655  ...  2.056405e-163  3.254261e-159
+1  FBgn0266429    694.516873  ...  2.507487e-131  1.984049e-127
+2  FBgn0032817  13116.490579  ...  5.211242e-124  2.748930e-120
+3  FBgn0000097   9797.862281  ...   3.796836e-86   1.502123e-82
+4  FBgn0019952  28155.930180  ...   3.425551e-72   1.084187e-68
+
+[5 rows x 7 columns]
+
+Column names: ['gene_id', 'baseMean', 'log2FoldChange', 'lfcSE', 'stat', 'pvalue', 'padj']
+
+Number of rows: 50
+
+Check for NA values in padj: 0
+Min padj: 3.25426143546709e-159
+Max padj in top 50: 1.44207336548325e-38
+</observation>
+Excellent! The output file has been created successfully with the correct format and contains the top 50 most significantly differentially expressed genes. Let me update the final checklist:
+
+1. [✓] Examine the directory structure and locate the count files and sample info.
+2. [✓] Load the sample information and understand the experimental design.
+3. [✓] Read the count data from the 6 DRX experiments.
+4. [✓] Create a DESeq2 dataset with appropriate design formula (batch + condition).
+5. [✓] Perform differential expression analysis comparing target condition vs all other conditions.
+6. [✓] Extract results and identify top 50 significant genes.
+7. [✓] Save results to the specified output path.
+8. [✓] Create necessary directories for temporary data.
+
+The task is complete. The differential expression analysis has been performed for the 6 DRX experiments, comparing cancer-bearing vs non-cancer control conditions. The top 50 most significantly differentially expressed genes have been saved to the specified output path.
+
+<solution>
+Differential expression analysis completed successfully. The top 50 most significantly differentially expressed genes (comparing cancer-bearing vs non-cancer control conditions) have been saved to `/root/autodl-tmp/biomni_v20260208_pred_results/deepseek-v3.2-fast/metazexp_annotate.tsv`.
+
+The analysis was performed using DESeq2 with design formula `~ condition` (since all samples belonged to the same batch, making the batch term redundant). Genes were ranked by adjusted p-value (padj), and the top 50 genes were extracted.
+
+The output file contains the following columns: gene_id, baseMean, log2FoldChange, lfcSE, stat, pvalue, padj, as requested.
+
+All temporary data has been saved in `/root/autodl-tmp/biomni_v20260208_tmp/deepseek-v3.2-fast/metazexp_annotate`.
+</solution>

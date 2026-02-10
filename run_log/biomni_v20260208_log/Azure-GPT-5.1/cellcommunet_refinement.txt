@@ -1,0 +1,518 @@
+Perform quality control on a single-cell RNA-seq dataset. 
+
+Load the raw PBMC3k dataset from `benchmark/dataset/CellCommuNet/pbmc3k_raw.h5ad`. 
+
+First, filter out cells that express fewer than 200 genes. 
+
+Second, filter out cells that express more than 2500 genes. 
+
+Third, calculate the percentage of counts from mitochondrial genes for each cell and remove any cell where this percentage exceeds 5%.
+
+Finally, save the filtered data as an AnnData object to `/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.1/cellcommunet_refinement.h5ad`.
+
+All intermediate results should be stored in the `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/cellcommunet_refinement` directory.
+
+<execute>
+import os
+import scanpy as sc
+import anndata as ad
+
+print("Step 0: Initialize plan and paths")
+
+plan = [
+    "[ ] 1. Load the raw PBMC3k dataset from the specified h5ad file",
+    "[ ] 2. Create intermediate output directory for all QC steps",
+    "[ ] 3. Filter out cells expressing fewer than 200 genes and save intermediate result",
+    "[ ] 4. Filter out cells expressing more than 2500 genes and save intermediate result",
+    "[ ] 5. Compute mitochondrial percentage per cell, filter cells with >5% mt, and save intermediate result",
+    "[ ] 6. Save final filtered AnnData object to the specified output path"
+]
+print("Initial plan:")
+for item in plan:
+    print(item)
+
+# Define paths
+raw_path = "./operation_env/database_lake/benchmark/dataset/CellCommuNet/pbmc3k_raw.h5ad"
+tmp_dir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/cellcommunet_refinement"
+final_path = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.1/cellcommunet_refinement.h5ad"
+
+# Ensure directories exist
+print("\nCreating directories if they do not exist...")
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(final_path), exist_ok=True)
+
+plan[0] = "[✓] 1. Load the raw PBMC3k dataset from the specified h5ad file (pending actual load)"
+plan[1] = "[✓] 2. Create intermediate output directory for all QC steps (completed)"
+print("\nUpdated plan after directory setup:")
+for item in plan:
+    print(item)
+
+print("\nStep 1: Load raw PBMC3k dataset")
+adata = sc.read_h5ad(raw_path)
+print(f"Loaded AnnData: {adata}")
+print(f"Initial shape (cells x genes): {adata.n_obs} x {adata.n_vars}")
+
+plan[0] = "[✓] 1. Load the raw PBMC3k dataset from the specified h5ad file (completed)"
+print("\nUpdated plan after loading data:")
+for item in plan:
+    print(item)
+
+print("\nStep 2: Filter out cells with fewer than 200 genes expressed")
+# Compute n_genes per cell
+sc.pp.calculate_qc_metrics(adata, inplace=True)
+print("QC metrics calculated. Example of .obs columns:", list(adata.obs.columns))
+
+# Filter cells with at least 200 genes
+min_genes = 200
+n_cells_before = adata.n_obs
+adata_filt1 = adata[adata.obs['n_genes_by_counts'] >= min_genes].copy()
+n_cells_after = adata_filt1.n_obs
+print(f"Cells before filtering (<{min_genes} genes): {n_cells_before}")
+print(f"Cells after filtering: {n_cells_after}")
+
+# Save intermediate result
+filt1_path = os.path.join(tmp_dir, "step1_min200genes.h5ad")
+adata_filt1.write(filt1_path)
+print(f"Intermediate file saved to: {filt1_path}")
+
+plan[2] = "[✓] 3. Filter out cells expressing fewer than 200 genes and save intermediate result (completed)"
+print("\nUpdated plan after Step 2:")
+for item in plan:
+    print(item)
+
+print("\nStep 3: Filter out cells with more than 2500 genes expressed")
+max_genes = 2500
+n_cells_before2 = adata_filt1.n_obs
+adata_filt2 = adata_filt1[adata_filt1.obs['n_genes_by_counts'] <= max_genes].copy()
+n_cells_after2 = adata_filt2.n_obs
+print(f"Cells before filtering (>{max_genes} genes): {n_cells_before2}")
+print(f"Cells after filtering: {n_cells_after2}")
+
+# Save intermediate result
+filt2_path = os.path.join(tmp_dir, "step2_max2500genes.h5ad")
+adata_filt2.write(filt2_path)
+print(f"Intermediate file saved to: {filt2_path}")
+
+plan[3] = "[✓] 4. Filter out cells expressing more than 2500 genes and save intermediate result (completed)"
+print("\nUpdated plan after Step 3:")
+for item in plan:
+    print(item)
+
+print("\nStep 4: Compute mitochondrial percentage and filter cells with >5% mt")
+# Identify mitochondrial genes: assuming human data with 'MT-' prefix
+mt_gene_mask = adata_filt2.var_names.str.upper().str.startswith('MT-')
+n_mt_genes = mt_gene_mask.sum()
+print(f"Number of mitochondrial genes detected by 'MT-' prefix: {n_mt_genes}")
+
+# Recalculate QC metrics including mt content
+sc.pp.calculate_qc_metrics(
+    adata_filt2,
+    qc_vars=None,
+    percent_top=None,
+    log1p=False,
+    inplace=True
+)
+
+# If mt genes are present, calculate mt fraction using var index
+if n_mt_genes > 0:
+    import numpy as np
+    mt_counts = adata_filt2[:, mt_gene_mask].X.sum(axis=1)
+    total_counts = adata_filt2.X.sum(axis=1)
+    # Handle sparse matrix
+    if not isinstance(mt_counts, np.ndarray):
+        mt_counts = mt_counts.A1
+    if not isinstance(total_counts, np.ndarray):
+        total_counts = total_counts.A1
+    adata_filt2.obs['pct_counts_mt'] = (mt_counts / total_counts) * 100.0
+    print("Calculated pct_counts_mt based on MT- genes.")
+else:
+    # If no MT- genes found, set mt percentage to 0
+    adata_filt2.obs['pct_counts_mt'] = 0.0
+    print("No MT- genes found; pct_counts_mt set to 0 for all cells.")
+
+# Filter cells with mt percentage <= 5%
+max_mt = 5.0
+n_cells_before3 = adata_filt2.n_obs
+adata_filt3 = adata_filt2[adata_filt2.obs['pct_counts_mt'] <= max_mt].copy()
+n_cells_after3 = adata_filt3.n_obs
+print(f"Cells before mt filtering (> {max_mt}%): {n_cells_before3}")
+print(f"Cells after mt filtering: {n_cells_after3}")
+
+# Save intermediate result
+filt3_path = os.path.join(tmp_dir, "step3_mt_leq5percent.h5ad")
+adata_filt3.write(filt3_path)
+print(f"Intermediate file saved to: {filt3_path}")
+
+plan[4] = "[✓] 5. Compute mitochondrial percentage per cell, filter cells with >5% mt, and save intermediate result (completed)"
+print("\nUpdated plan after Step 4:")
+for item in plan:
+    print(item)
+
+print("\nStep 5: Save final filtered AnnData object to the specified output path")
+adata_filt3.write(final_path)
+print(f"Final filtered AnnData saved to: {final_path}")
+
+plan[5] = "[✓] 6. Save final filtered AnnData object to the specified output path (completed)"
+print("\nFinal plan status:")
+for item in plan:
+    print(item)
+
+print("\nQuality control pipeline completed successfully.")
+</execute>
+<observation>ModuleNotFoundError("No module named 'scanpy'")</observation>
+<execute>
+import os
+import anndata as ad
+import numpy as np
+import scipy.sparse as sp
+
+print("Step 0: Define plan and paths")
+
+plan = [
+    "[ ] 1. Load the raw PBMC3k dataset from the specified h5ad file",
+    "[ ] 2. Create intermediate output directory for all QC steps",
+    "[ ] 3. Filter out cells expressing fewer than 200 genes and save intermediate result",
+    "[ ] 4. Filter out cells expressing more than 2500 genes and save intermediate result",
+    "[ ] 5. Compute mitochondrial percentage per cell, filter cells with >5% mt, and save intermediate result",
+    "[ ] 6. Save final filtered AnnData object to the specified output path"
+]
+for item in plan:
+    print(item)
+
+# Paths
+raw_path = "./operation_env/database_lake/benchmark/dataset/CellCommuNet/pbmc3k_raw.h5ad"
+tmp_dir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/cellcommunet_refinement"
+final_path = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.1/cellcommunet_refinement.h5ad"
+
+print("\nStep 1 & 2: Create directories (for intermediates and final output)")
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(final_path), exist_ok=True)
+plan[1] = "[✓] 2. Create intermediate output directory for all QC steps (completed)"
+for item in plan:
+    print(item)
+
+print("\nStep 1: Load raw PBMC3k dataset")
+adata = ad.read_h5ad(raw_path)
+print(f"Loaded AnnData: {adata}")
+print(f"Initial shape (cells x genes): {adata.n_obs} x {adata.n_vars}")
+plan[0] = "[✓] 1. Load the raw PBMC3k dataset from the specified h5ad file (completed)"
+for item in plan:
+    print(item)
+
+def _sum_over_genes(X):
+    """Sum counts per cell (over genes). Works for dense or sparse."""
+    if sp.issparse(X):
+        return np.array(X.sum(axis=1)).ravel()
+    else:
+        return X.sum(axis=1)
+
+def _nnz_over_genes(X):
+    """Count non-zero genes per cell. Works for dense or sparse."""
+    if sp.issparse(X):
+        return np.array((X > 0).sum(axis=1)).ravel()
+    else:
+        return (X > 0).sum(axis=1)
+
+print("\nStep 3: Filter out cells expressing fewer than 200 genes")
+# Calculate n_genes per cell
+n_genes_by_counts = _nnz_over_genes(adata.X)
+adata.obs["n_genes_by_counts"] = n_genes_by_counts
+
+min_genes = 200
+n_cells_before = adata.n_obs
+cell_mask_min = adata.obs["n_genes_by_counts"] >= min_genes
+adata_filt1 = adata[cell_mask_min].copy()
+n_cells_after = adata_filt1.n_obs
+
+print(f"Cells before filtering (<{min_genes} genes): {n_cells_before}")
+print(f"Cells after filtering: {n_cells_after}")
+
+filt1_path = os.path.join(tmp_dir, "step1_min200genes.h5ad")
+adata_filt1.write(filt1_path)
+print(f"Intermediate file saved to: {filt1_path}")
+
+plan[2] = "[✓] 3. Filter out cells expressing fewer than 200 genes and save intermediate result (completed)"
+for item in plan:
+    print(item)
+
+print("\nStep 4: Filter out cells expressing more than 2500 genes")
+# n_genes_by_counts already present from previous step; subset for safety
+n_genes_by_counts2 = adata_filt1.obs["n_genes_by_counts"].values
+max_genes = 2500
+n_cells_before2 = adata_filt1.n_obs
+cell_mask_max = n_genes_by_counts2 <= max_genes
+adata_filt2 = adata_filt1[cell_mask_max].copy()
+n_cells_after2 = adata_filt2.n_obs
+
+print(f"Cells before filtering (>{max_genes} genes): {n_cells_before2}")
+print(f"Cells after filtering: {n_cells_after2}")
+
+filt2_path = os.path.join(tmp_dir, "step2_max2500genes.h5ad")
+adata_filt2.write(filt2_path)
+print(f"Intermediate file saved to: {filt2_path}")
+
+plan[3] = "[✓] 4. Filter out cells expressing more than 2500 genes and save intermediate result (completed)"
+for item in plan:
+    print(item)
+
+print("\nStep 5: Compute mitochondrial percentage per cell and filter cells with >5% mt")
+# Identify mitochondrial genes by 'MT-' prefix (case-insensitive)
+var_names_upper = adata_filt2.var_names.str.upper()
+mt_gene_mask = var_names_upper.str.startswith("MT-")
+n_mt_genes = mt_gene_mask.sum()
+print(f"Number of mitochondrial genes detected by 'MT-' prefix: {n_mt_genes}")
+
+# Total counts per cell
+total_counts = _sum_over_genes(adata_filt2.X)
+adata_filt2.obs["total_counts"] = total_counts
+
+# mt counts and percentage
+if n_mt_genes > 0:
+    mt_counts = _sum_over_genes(adata_filt2[:, mt_gene_mask].X)
+    # Avoid division by zero
+    with np.errstate(divide="ignore", invalid="ignore"):
+        pct_counts_mt = np.where(total_counts > 0, (mt_counts / total_counts) * 100.0, 0.0)
+    adata_filt2.obs["pct_counts_mt"] = pct_counts_mt
+    print("Calculated pct_counts_mt based on MT- genes.")
+else:
+    adata_filt2.obs["pct_counts_mt"] = 0.0
+    print("No MT- genes found; pct_counts_mt set to 0 for all cells.")
+
+max_mt = 5.0
+n_cells_before3 = adata_filt2.n_obs
+cell_mask_mt = adata_filt2.obs["pct_counts_mt"] <= max_mt
+adata_filt3 = adata_filt2[cell_mask_mt].copy()
+n_cells_after3 = adata_filt3.n_obs
+
+print(f"Cells before mt filtering (> {max_mt}% mt): {n_cells_before3}")
+print(f"Cells after mt filtering: {n_cells_after3}")
+
+filt3_path = os.path.join(tmp_dir, "step3_mt_leq5percent.h5ad")
+adata_filt3.write(filt3_path)
+print(f"Intermediate file saved to: {filt3_path}")
+
+plan[4] = "[✓] 5. Compute mitochondrial percentage per cell, filter cells with >5% mt, and save intermediate result (completed)"
+for item in plan:
+    print(item)
+
+print("\nStep 6: Save final filtered AnnData object to the specified output path")
+adata_filt3.write(final_path)
+print(f"Final filtered AnnData saved to: {final_path}")
+
+plan[5] = "[✓] 6. Save final filtered AnnData object to the specified output path (completed)"
+print("\nFinal plan status:")
+for item in plan:
+    print(item)
+
+print("\nQuality control pipeline completed successfully.")
+</execute>
+<observation>FileNotFoundError(2, "Unable to synchronously open file (unable to open file: name = './operation_env/database_lake/benchmark/dataset/CellCommuNet/pbmc3k_raw.h5ad', errno = 2, error message = 'No such file or directory', flags = 0, o_flags = 0)")</observation>
+<execute>
+import os
+import anndata as ad
+import numpy as np
+import scipy.sparse as sp
+
+print("Step 0: Define plan and paths")
+
+plan = [
+    "[ ] 1. Locate and load the raw PBMC3k dataset from the data lake",
+    "[ ] 2. Create intermediate output directory for all QC steps",
+    "[ ] 3. Filter out cells expressing fewer than 200 genes and save intermediate result",
+    "[ ] 4. Filter out cells expressing more than 2500 genes and save intermediate result",
+    "[ ] 5. Compute mitochondrial percentage per cell, filter cells with >5% mt, and save intermediate result",
+    "[ ] 6. Save final filtered AnnData object to the specified output path"
+]
+for item in plan:
+    print(item)
+
+# Try to locate the file under the given relative path root
+base_dir = "./operation_env/database_lake"
+target_rel = "benchmark/dataset/CellCommuNet/pbmc3k_raw.h5ad"
+candidate_path = os.path.join(base_dir, target_rel)
+
+print("\nStep 1: Locate raw PBMC3k dataset")
+print(f"Candidate path: {candidate_path}")
+
+if os.path.exists(candidate_path):
+    raw_path = candidate_path
+    print(f"Found dataset at expected path: {raw_path}")
+else:
+    print("Dataset not found at expected path; searching data lake...")
+    found_path = None
+    for root, dirs, files in os.walk(base_dir):
+        for f in files:
+            if f == "pbmc3k_raw.h5ad":
+                found_path = os.path.join(root, f)
+                break
+        if found_path is not None:
+            break
+    if found_path is None:
+        plan[0] = "[✗] 1. Locate and load the raw PBMC3k dataset from the data lake (failed: file not found)"
+        print("\nUpdated plan after failed search:")
+        for item in plan:
+            print(item)
+        raise FileNotFoundError("Could not find pbmc3k_raw.h5ad anywhere under ./operation_env/database_lake")
+    else:
+        raw_path = found_path
+        print(f"Found dataset at: {raw_path}")
+
+plan[0] = "[✓] 1. Locate and load the raw PBMC3k dataset from the data lake (located, pending load)"
+for item in plan:
+    print(item)
+
+# Paths for output
+tmp_dir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/cellcommunet_refinement"
+final_path = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.1/cellcommunet_refinement.h5ad"
+
+print("\nStep 2: Create directories (for intermediates and final output)")
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(final_path), exist_ok=True)
+plan[1] = "[✓] 2. Create intermediate output directory for all QC steps (completed)"
+for item in plan:
+    print(item)
+
+print("\nLoading raw PBMC3k dataset from located path")
+adata = ad.read_h5ad(raw_path)
+print(f"Loaded AnnData: {adata}")
+print(f"Initial shape (cells x genes): {adata.n_obs} x {adata.n_vars}")
+plan[0] = "[✓] 1. Locate and load the raw PBMC3k dataset from the data lake (completed)"
+for item in plan:
+    print(item)
+
+def _sum_over_genes(X):
+    if sp.issparse(X):
+        return np.array(X.sum(axis=1)).ravel()
+    else:
+        return X.sum(axis=1)
+
+def _nnz_over_genes(X):
+    if sp.issparse(X):
+        return np.array((X > 0).sum(axis=1)).ravel()
+    else:
+        return (X > 0).sum(axis=1)
+
+print("\nStep 3: Filter out cells expressing fewer than 200 genes")
+n_genes_by_counts = _nnz_over_genes(adata.X)
+adata.obs["n_genes_by_counts"] = n_genes_by_counts
+
+min_genes = 200
+n_cells_before = adata.n_obs
+cell_mask_min = adata.obs["n_genes_by_counts"] >= min_genes
+adata_filt1 = adata[cell_mask_min].copy()
+n_cells_after = adata_filt1.n_obs
+
+print(f"Cells before filtering (<{min_genes} genes): {n_cells_before}")
+print(f"Cells after filtering: {n_cells_after}")
+
+filt1_path = os.path.join(tmp_dir, "step1_min200genes.h5ad")
+adata_filt1.write(filt1_path)
+print(f"Intermediate file saved to: {filt1_path}")
+
+plan[2] = "[✓] 3. Filter out cells expressing fewer than 200 genes and save intermediate result (completed)"
+for item in plan:
+    print(item)
+
+print("\nStep 4: Filter out cells expressing more than 2500 genes")
+n_genes_by_counts2 = adata_filt1.obs["n_genes_by_counts"].values
+max_genes = 2500
+n_cells_before2 = adata_filt1.n_obs
+cell_mask_max = n_genes_by_counts2 <= max_genes
+adata_filt2 = adata_filt1[cell_mask_max].copy()
+n_cells_after2 = adata_filt2.n_obs
+
+print(f"Cells before filtering (>{max_genes} genes): {n_cells_before2}")
+print(f"Cells after filtering: {n_cells_after2}")
+
+filt2_path = os.path.join(tmp_dir, "step2_max2500genes.h5ad")
+adata_filt2.write(filt2_path)
+print(f"Intermediate file saved to: {filt2_path}")
+
+plan[3] = "[✓] 4. Filter out cells expressing more than 2500 genes and save intermediate result (completed)"
+for item in plan:
+    print(item)
+
+print("\nStep 5: Compute mitochondrial percentage per cell and filter cells with >5% mt")
+var_names_upper = adata_filt2.var_names.str.upper()
+mt_gene_mask = var_names_upper.str.startswith("MT-")
+n_mt_genes = mt_gene_mask.sum()
+print(f"Number of mitochondrial genes detected by 'MT-' prefix: {n_mt_genes}")
+
+total_counts = _sum_over_genes(adata_filt2.X)
+adata_filt2.obs["total_counts"] = total_counts
+
+if n_mt_genes > 0:
+    mt_counts = _sum_over_genes(adata_filt2[:, mt_gene_mask].X)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        pct_counts_mt = np.where(total_counts > 0, (mt_counts / total_counts) * 100.0, 0.0)
+    adata_filt2.obs["pct_counts_mt"] = pct_counts_mt
+    print("Calculated pct_counts_mt based on MT- genes.")
+else:
+    adata_filt2.obs["pct_counts_mt"] = 0.0
+    print("No MT- genes found; pct_counts_mt set to 0 for all cells.")
+
+max_mt = 5.0
+n_cells_before3 = adata_filt2.n_obs
+cell_mask_mt = adata_filt2.obs["pct_counts_mt"] <= max_mt
+adata_filt3 = adata_filt2[cell_mask_mt].copy()
+n_cells_after3 = adata_filt3.n_obs
+
+print(f"Cells before mt filtering (> {max_mt}% mt): {n_cells_before3}")
+print(f"Cells after mt filtering: {n_cells_after3}")
+
+filt3_path = os.path.join(tmp_dir, "step3_mt_leq5percent.h5ad")
+adata_filt3.write(filt3_path)
+print(f"Intermediate file saved to: {filt3_path}")
+
+plan[4] = "[✓] 5. Compute mitochondrial percentage per cell, filter cells with >5% mt, and save intermediate result (completed)"
+for item in plan:
+    print(item)
+
+print("\nStep 6: Save final filtered AnnData object to the specified output path")
+adata_filt3.write(final_path)
+print(f"Final filtered AnnData saved to: {final_path}")
+
+plan[5] = "[✓] 6. Save final filtered AnnData object to the specified output path (completed)"
+print("\nFinal plan status:")
+for item in plan:
+    print(item)
+
+print("\nQuality control pipeline completed successfully.")
+</execute>
+<observation>FileNotFoundError('Could not find pbmc3k_raw.h5ad anywhere under ./operation_env/database_lake')</observation>
+<solution>
+1. [✗] Locate and load the raw PBMC3k dataset from the data lake (failed: `pbmc3k_raw.h5ad` is not present under `./operation_env/database_lake`)
+2. [ ] Create intermediate output directory for all QC steps
+3. [ ] Filter out cells expressing fewer than 200 genes and save intermediate result
+4. [ ] Filter out cells expressing more than 2500 genes and save intermediate result
+5. [ ] Compute mitochondrial percentage per cell, filter cells with >5% mt, and save intermediate result
+6. [ ] Save final filtered AnnData object to the specified output path
+
+What I did:
+- Searched for the file at the path you specified:
+  - `./operation_env/database_lake/benchmark/dataset/CellCommuNet/pbmc3k_raw.h5ad`
+- When that failed, recursively searched the entire data lake root:
+  - `./operation_env/database_lake`
+- The search confirmed that no file named `pbmc3k_raw.h5ad` exists anywhere under that root, causing a `FileNotFoundError` and preventing further QC steps.
+
+Because the required input file is missing from the environment, I cannot actually perform the requested QC or create the intermediate/final AnnData files.
+
+To proceed, one of the following is needed:
+- Place `pbmc3k_raw.h5ad` at the specified path:
+  - `./operation_env/database_lake/benchmark/dataset/CellCommuNet/pbmc3k_raw.h5ad`
+- Or let me know the correct existing path to the raw PBMC3k AnnData file within the environment so I can rerun the QC steps.
+
+Once the file is available, the intended QC pipeline (which I’m ready to execute) is:
+
+1. Load `pbmc3k_raw.h5ad` into an AnnData object.
+2. Compute the number of detected genes per cell (`n_genes_by_counts`).
+3. Filter out cells with `< 200` genes and save to:
+   - `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/cellcommunet_refinement/step1_min200genes.h5ad`
+4. From that, filter out cells with `> 2500` genes and save to:
+   - `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/cellcommunet_refinement/step2_max2500genes.h5ad`
+5. Identify mitochondrial genes with names starting with `MT-`, compute `pct_counts_mt` for each cell, remove cells with `pct_counts_mt > 5`, and save to:
+   - `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.1/cellcommunet_refinement/step3_mt_leq5percent.h5ad`
+6. Save the final filtered AnnData object to:
+   - `/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.1/cellcommunet_refinement.h5ad`
+
+Please provide or correct the path to the PBMC3k raw dataset so I can complete these steps in the environment. </solution>

@@ -1,0 +1,4648 @@
+# Core Task
+Systematically search the PubMed database for research published between 2021/01/01 and 2021/03/01 to identify studies reporting drug-drug interactions (DDIs) involving Ciprofloxacin, acting as either the precipitant or the object drug. The search should employ keywords such as "Drug Interactions"[MeSH] or "drug-drug interaction", while strictly excluding drug-food and drug-gene interactions by filtering out terms like "Food-Drug Interactions"[MeSH Terms], "food"[Title], "Pharmacogenetics"[MeSH Terms], or "gene"[Title/Abstract]. Following the initial search, conduct a detailed abstract analysis to screen for and isolate literature that specifically focuses on clinical or pharmacological interactions between Ciprofloxacin and other pharmaceutical agents, ensuring all irrelevant topics are removed from the final collection.
+
+# Output Requirements & File Path
+- Output format: JSON list of objects. The list must include all articles obtained from the initial PubMed search.
+- Each object must contain exactly two fields:
+  - `"PMID"`: PubMed ID as a string
+  - `"Accepted"`: Boolean value (`true` if the article meets all inclusion and filtering criteria, `false` otherwise)
+- Save Path: Save the complete list to: `/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/ddinter_retrieval.json`
+- Intermediate Storage Path: All intermediate code generated during execution, downloaded files, and temporary results must be stored in `/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/ddinter_retrieval/`
+
+  # Output Example (For Reference Only)
+[
+  {
+    "PMID": "99999999",
+    "Accepted": false
+  },
+  {
+    "PMID": "88888888",
+    "Accepted": true
+  }
+]
+
+<execute>
+#!/usr/bin/env python3
+import os, json, re, textwrap, pathlib
+from datetime import datetime
+from urllib.parse import quote
+import requests
+from bs4 import BeautifulSoup
+
+# ========== Plan ==========
+plan = [
+"Set up required directories and define the PubMed query with inclusion/exclusion filters and date limits.",
+"Run the initial PubMed search (ESearch) and collect all PMIDs.",
+"Fetch article metadata/abstracts in batches (EFetch) and parse titles/abstracts.",
+"Screen abstracts for Ciprofloxacin DDIs (exclude food/gene topics; include clinical/pharmacological DDI with another drug) and assign Accepted flags.",
+"Write the full PMID list with Accepted flags to the required JSON path."
+]
+
+print("PLAN (checklist):")
+for i,s in enumerate(plan,1):
+    print(f"{i}. [ ] {s}")
+
+# ========== Step 1: setup ==========
+tmp_dir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/ddinter_retrieval/"
+out_path = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/ddinter_retrieval.json"
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+# PubMed query per instructions
+# - core terms: ciprofloxacin AND (Drug Interactions[MeSH] OR "drug-drug interaction")
+# - exclude: Food-Drug Interactions[MeSH], food[Title], Pharmacogenetics[MeSH], gene[Title/Abstract]
+# - date filter: 2021/01/01 to 2021/03/01
+query = (
+    '(ciprofloxacin[Title/Abstract] OR Ciprofloxacin[MeSH Terms]) AND '
+    '("Drug Interactions"[MeSH Terms] OR "drug-drug interaction"[Title/Abstract] OR "drug drug interaction"[Title/Abstract] OR DDI[Title/Abstract]) '
+    'NOT ("Food-Drug Interactions"[MeSH Terms] OR food[Title] OR "Pharmacogenetics"[MeSH Terms] OR gene[Title/Abstract])'
+)
+date_params = {"mindate":"2021/01/01","maxdate":"2021/03/01","datetype":"pdat"}
+
+with open(os.path.join(tmp_dir,"query.txt"),"w") as f:
+    f.write(query+"\n")
+    f.write(json.dumps(date_params, indent=2))
+
+print("\nSTEP 1 complete: directories created and query saved.")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i==1 else " "
+    print(f"{i}. [{chk}] {s}")
+
+# ========== Step 2: ESearch ==========
+base = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
+esearch_url = base + "esearch.fcgi"
+params = {
+    "db":"pubmed",
+    "term":query,
+    "retmax":100000,
+    "retmode":"json",
+    **date_params
+}
+r = requests.get(esearch_url, params=params, timeout=60)
+r.raise_for_status()
+data = r.json()
+pmids = data["esearchresult"].get("idlist", [])
+count = int(data["esearchresult"].get("count","0"))
+print(f"\nSTEP 2: ESearch returned count={count}, retrieved PMIDs={len(pmids)}")
+with open(os.path.join(tmp_dir,"esearch.json"),"w") as f:
+    json.dump(data, f, indent=2)
+
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i<=2 else " "
+    print(f"{i}. [{chk}] {s}")
+
+# ========== Step 3: EFetch batch fetch ==========
+efetch_url = base + "efetch.fcgi"
+
+def fetch_batch(id_batch):
+    params = {"db":"pubmed","id":",".join(id_batch),"retmode":"xml"}
+    rr = requests.get(efetch_url, params=params, timeout=60)
+    rr.raise_for_status()
+    return rr.text
+
+articles = {}  # PMID -> dict(title, abstract)
+batch_size = 200
+xml_files = []
+for i in range(0, len(pmids), batch_size):
+    batch = pmids[i:i+batch_size]
+    xml_text = fetch_batch(batch)
+    xml_path = os.path.join(tmp_dir, f"efetch_{i//batch_size:04d}.xml")
+    with open(xml_path,"w") as f:
+        f.write(xml_text)
+    xml_files.append(xml_path)
+
+    soup = BeautifulSoup(xml_text, "xml")
+    for art in soup.find_all("PubmedArticle"):
+        pmid = art.find("PMID").get_text(strip=True) if art.find("PMID") else None
+        if not pmid: 
+            continue
+        title = art.find("ArticleTitle").get_text(" ", strip=True) if art.find("ArticleTitle") else ""
+        abst_nodes = art.find_all("AbstractText")
+        abstract = " ".join([n.get_text(" ", strip=True) for n in abst_nodes]) if abst_nodes else ""
+        articles[pmid] = {"title": title, "abstract": abstract}
+
+print(f"\nSTEP 3: fetched and parsed {len(articles)} articles (xml files: {len(xml_files)})")
+with open(os.path.join(tmp_dir,"parsed_articles.json"),"w") as f:
+    json.dump(articles, f, indent=2)
+
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i<=3 else " "
+    print(f"{i}. [{chk}] {s}")
+
+# ========== Step 4: Screening ==========
+# Heuristic rules:
+# Accept if:
+#  - mentions ciprofloxacin (title/abstract)
+#  - AND indicates interaction with another drug (look for "interaction", "co-admin", "concomitant", "AUC", "Cmax", "pharmacokinetic", "inhibition", "induction")
+#  - AND contains another drug-like entity mention (simple: presence of at least one other known drug keyword pattern: letter+...; 
+#    We'll use a small curated list of common interacting drugs plus generic "warfarin", "theophylline", "tizanidine", etc)
+# Reject if:
+#  - food/nutrition terms prominent or gene/pharmacogenetics terms (already filtered but double-check in abstract)
+#  - focuses on bacteria resistance/antimicrobial efficacy without DDI focus
+#  - in vitro only with no drug-drug focus (e.g., "synergy with antibiotic") unless specifically PK interaction.
+
+other_drug_markers = [
+"warfarin","theophylline","tizanidine","cyclosporine","clozapine","duloxetine","methotrexate",
+"metronidazole","rifampin","rifampicin","probenecid","phenytoin","digoxin","insulin",
+"caffeine","omeprazole","sucralfate","antacid","iron","zinc","calcium","magnesium",
+"clopidogrel","apixaban","rivaroxaban","dabigatran","amiodarone","fluconazole",
+"azithromycin","clarithromycin","linezolid","vancomycin","gentamicin"
+]
+# Note: minerals/antacids are drug products; food excluded separately.
+
+exclude_terms = [
+"food-drug","food drug","diet","meal","nutrition","grapefruit",
+"pharmacogen","genetic","gene ","genes ","genotype","polymorphism","cyp2","cyp3","cyp1a2"
+]
+non_ddi_focus_terms = [
+"antimicrobial susceptibility","minimum inhibitory concentration","MIC",
+"biofilm","resistance","resistant","synergistic activity","checkerboard","time-kill"
+]
+
+def accepted(pmid, title, abstract):
+    text = (title + " " + abstract).lower()
+    if "ciprofloxacin" not in text:
+        return False
+    if any(t in text for t in exclude_terms):
+        return False
+    # must contain DDI concepts
+    ddi_signal = any(k in text for k in ["drug-drug", "drug drug", "interaction", "concomitant", "coadministr", "co-admin", "pharmacokinetic", "auc", "cmax", "clearance", "inhibit", "induc", "exposure"])
+    if not ddi_signal:
+        return False
+    # avoid purely antimicrobial synergy/resistance unless clear PK/clinical DDI language
+    if any(t.lower() in text for t in non_ddi_focus_terms) and not any(k in text for k in ["pharmacokinetic","auc","cmax","clearance","qt","toxicity","bleeding","serum concentration"]):
+        return False
+    # need evidence of another drug
+    other = any(m in text for m in other_drug_markers)
+    # alternatively detect pattern "ciprofloxacin and X" where X is capitalized in title (fallback)
+    if not other:
+        if re.search(r"ciprofloxacin (and|with) [a-z0-9\-]{3,}", text):
+            other = True
+    return other
+
+results = []
+for pmid in pmids:
+    meta = articles.get(pmid, {"title":"","abstract":""})
+    acc = accepted(pmid, meta["title"], meta["abstract"])
+    results.append({"PMID": str(pmid), "Accepted": bool(acc)})
+
+with open(os.path.join(tmp_dir,"screening_results.json"),"w") as f:
+    json.dump(results, f, indent=2)
+
+n_acc = sum(1 for x in results if x["Accepted"])
+print(f"\nSTEP 4: screening complete. Accepted={n_acc}/{len(results)}")
+print("Sample Accepted PMIDs:", [x["PMID"] for x in results if x["Accepted"]][:10])
+
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i<=4 else " "
+    print(f"{i}. [{chk}] {s}")
+
+# ========== Step 5: Write output ==========
+with open(out_path, "w") as f:
+    json.dump(results, f, indent=2)
+
+print(f"\nSTEP 5: wrote final JSON to {out_path}")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓"
+    print(f"{i}. [{chk}] {s}")
+
+# Also write a tiny log summary
+summary = {
+    "query": query,
+    "date_params": date_params,
+    "initial_count": count,
+    "retrieved_pmids": len(pmids),
+    "accepted": n_acc,
+    "timestamp": datetime.utcnow().isoformat()+"Z"
+}
+with open(os.path.join(tmp_dir,"run_summary.json"),"w") as f:
+    json.dump(summary, f, indent=2)
+print("\nRun summary:", summary)
+</execute>
+<observation>NameError("name 'requests' is not defined")</observation>
+<execute>
+#!/usr/bin/env python3
+import os, json, re
+from datetime import datetime
+import requests
+from bs4 import BeautifulSoup
+
+# ========== Plan ==========
+plan = [
+"Set up required directories and define the PubMed query with inclusion/exclusion filters and date limits.",
+"Run the initial PubMed search (ESearch) and collect all PMIDs.",
+"Fetch article metadata/abstracts in batches (EFetch) and parse titles/abstracts.",
+"Screen abstracts for Ciprofloxacin DDIs (exclude food/gene topics; include clinical/pharmacological DDI with another drug) and assign Accepted flags.",
+"Write the full PMID list with Accepted flags to the required JSON path."
+]
+
+print("PLAN (checklist):")
+for i,s in enumerate(plan,1):
+    print(f"{i}. [ ] {s}")
+
+tmp_dir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/ddinter_retrieval/"
+out_path = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/ddinter_retrieval.json"
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+query = (
+    '(ciprofloxacin[Title/Abstract] OR Ciprofloxacin[MeSH Terms]) AND '
+    '("Drug Interactions"[MeSH Terms] OR "drug-drug interaction"[Title/Abstract] OR "drug drug interaction"[Title/Abstract] OR DDI[Title/Abstract]) '
+    'NOT ("Food-Drug Interactions"[MeSH Terms] OR food[Title] OR "Pharmacogenetics"[MeSH Terms] OR gene[Title/Abstract])'
+)
+date_params = {"mindate":"2021/01/01","maxdate":"2021/03/01","datetype":"pdat"}
+
+with open(os.path.join(tmp_dir,"query.txt"),"w") as f:
+    f.write(query+"\n")
+    f.write(json.dumps(date_params, indent=2))
+
+print("\nSTEP 1 complete: directories created and query saved.")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i==1 else " "
+    print(f"{i}. [{chk}] {s}")
+
+# Step 2: ESearch
+base = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
+esearch_url = base + "esearch.fcgi"
+params = {
+    "db":"pubmed",
+    "term":query,
+    "retmax":100000,
+    "retmode":"json",
+    **date_params
+}
+r = requests.get(esearch_url, params=params, timeout=60)
+r.raise_for_status()
+data = r.json()
+pmids = data["esearchresult"].get("idlist", [])
+count = int(data["esearchresult"].get("count","0"))
+print(f"\nSTEP 2: ESearch returned count={count}, retrieved PMIDs={len(pmids)}")
+with open(os.path.join(tmp_dir,"esearch.json"),"w") as f:
+    json.dump(data, f, indent=2)
+
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i<=2 else " "
+    print(f"{i}. [{chk}] {s}")
+
+# Step 3: EFetch in batches
+efetch_url = base + "efetch.fcgi"
+
+def fetch_batch(id_batch):
+    params = {"db":"pubmed","id":",".join(id_batch),"retmode":"xml"}
+    rr = requests.get(efetch_url, params=params, timeout=60)
+    rr.raise_for_status()
+    return rr.text
+
+articles = {}
+batch_size = 200
+xml_files = []
+for i in range(0, len(pmids), batch_size):
+    batch = pmids[i:i+batch_size]
+    xml_text = fetch_batch(batch)
+    xml_path = os.path.join(tmp_dir, f"efetch_{i//batch_size:04d}.xml")
+    with open(xml_path,"w") as f:
+        f.write(xml_text)
+    xml_files.append(xml_path)
+
+    soup = BeautifulSoup(xml_text, "xml")
+    for art in soup.find_all("PubmedArticle"):
+        pmid = art.find("PMID").get_text(strip=True) if art.find("PMID") else None
+        if not pmid:
+            continue
+        title = art.find("ArticleTitle").get_text(" ", strip=True) if art.find("ArticleTitle") else ""
+        abst_nodes = art.find_all("AbstractText")
+        abstract = " ".join([n.get_text(" ", strip=True) for n in abst_nodes]) if abst_nodes else ""
+        articles[pmid] = {"title": title, "abstract": abstract}
+
+print(f"\nSTEP 3: fetched and parsed {len(articles)} articles (xml files: {len(xml_files)})")
+with open(os.path.join(tmp_dir,"parsed_articles.json"),"w") as f:
+    json.dump(articles, f, indent=2)
+
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i<=3 else " "
+    print(f"{i}. [{chk}] {s}")
+
+# Step 4: Screening
+other_drug_markers = [
+"warfarin","theophylline","tizanidine","cyclosporine","clozapine","duloxetine","methotrexate",
+"metronidazole","rifampin","rifampicin","probenecid","phenytoin","digoxin","insulin",
+"caffeine","omeprazole","sucralfate","antacid","iron","zinc","calcium","magnesium",
+"clopidogrel","apixaban","rivaroxaban","dabigatran","amiodarone","fluconazole",
+"azithromycin","clarithromycin","linezolid","vancomycin","gentamicin"
+]
+exclude_terms = [
+"food-drug","food drug","diet","meal","nutrition","grapefruit",
+"pharmacogen","genetic","gene ","genes ","genotype","polymorphism","cyp2","cyp3","cyp1a2"
+]
+non_ddi_focus_terms = [
+"antimicrobial susceptibility","minimum inhibitory concentration","mic",
+"biofilm","resistance","resistant","synergistic activity","checkerboard","time-kill"
+]
+
+def accepted(pmid, title, abstract):
+    text = (title + " " + abstract).lower()
+    if "ciprofloxacin" not in text:
+        return False
+    if any(t in text for t in exclude_terms):
+        return False
+    ddi_signal = any(k in text for k in [
+        "drug-drug","drug drug","interaction","concomitant","coadministr","co-admin",
+        "pharmacokinetic","auc","cmax","clearance","inhibit","induc","exposure","qt"
+    ])
+    if not ddi_signal:
+        return False
+    if any(t in text for t in non_ddi_focus_terms) and not any(k in text for k in [
+        "pharmacokinetic","auc","cmax","clearance","toxicity","bleeding","serum concentration","plasma concentration"
+    ]):
+        return False
+    other = any(m in text for m in other_drug_markers)
+    if not other:
+        if re.search(r"ciprofloxacin (and|with) [a-z0-9\-]{3,}", text):
+            other = True
+    return other
+
+results = []
+for pmid in pmids:
+    meta = articles.get(pmid, {"title":"","abstract":""})
+    results.append({"PMID": str(pmid), "Accepted": bool(accepted(pmid, meta["title"], meta["abstract"]))})
+
+with open(os.path.join(tmp_dir,"screening_results.json"),"w") as f:
+    json.dump(results, f, indent=2)
+
+n_acc = sum(1 for x in results if x["Accepted"])
+print(f"\nSTEP 4: screening complete. Accepted={n_acc}/{len(results)}")
+print("Sample Accepted PMIDs:", [x["PMID"] for x in results if x["Accepted"]][:10])
+
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i<=4 else " "
+    print(f"{i}. [{chk}] {s}")
+
+# Step 5: Write output
+with open(out_path, "w") as f:
+    json.dump(results, f, indent=2)
+
+print(f"\nSTEP 5: wrote final JSON to {out_path}")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    print(f"{i}. [✓] {s}")
+
+summary = {
+    "query": query,
+    "date_params": date_params,
+    "initial_count": count,
+    "retrieved_pmids": len(pmids),
+    "accepted": n_acc,
+    "timestamp": datetime.utcnow().isoformat()+"Z"
+}
+with open(os.path.join(tmp_dir,"run_summary.json"),"w") as f:
+    json.dump(summary, f, indent=2)
+print("\nRun summary:", summary)
+</execute>
+<observation>NameError("name 'requests' is not defined")</observation>
+<execute>
+#!/usr/bin/env python3
+import os, json, re
+from datetime import datetime
+from urllib.request import urlopen
+from urllib.parse import urlencode
+from bs4 import BeautifulSoup
+
+# ========== Plan ==========
+plan = [
+"Set up required directories and define the PubMed query with inclusion/exclusion filters and date limits.",
+"Run the initial PubMed search (ESearch) and collect all PMIDs.",
+"Fetch article metadata/abstracts in batches (EFetch) and parse titles/abstracts.",
+"Screen abstracts for Ciprofloxacin DDIs (exclude food/gene topics; include clinical/pharmacological DDI with another drug) and assign Accepted flags.",
+"Write the full PMID list with Accepted flags to the required JSON path."
+]
+
+print("PLAN (checklist):")
+for i,s in enumerate(plan,1):
+    print(f"{i}. [ ] {s}")
+
+tmp_dir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/ddinter_retrieval/"
+out_path = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/ddinter_retrieval.json"
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+query = (
+    '(ciprofloxacin[Title/Abstract] OR Ciprofloxacin[MeSH Terms]) AND '
+    '("Drug Interactions"[MeSH Terms] OR "drug-drug interaction"[Title/Abstract] OR "drug drug interaction"[Title/Abstract] OR DDI[Title/Abstract]) '
+    'NOT ("Food-Drug Interactions"[MeSH Terms] OR food[Title] OR "Pharmacogenetics"[MeSH Terms] OR gene[Title/Abstract])'
+)
+date_params = {"mindate":"2021/01/01","maxdate":"2021/03/01","datetype":"pdat"}
+
+with open(os.path.join(tmp_dir,"query.txt"),"w") as f:
+    f.write(query+"\n")
+    f.write(json.dumps(date_params, indent=2))
+
+print("\nSTEP 1 complete: directories created and query saved.")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i==1 else " "
+    print(f"{i}. [{chk}] {s}")
+
+base = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
+
+def http_get(url, params, timeout=60):
+    full = url + "?" + urlencode(params)
+    with urlopen(full, timeout=timeout) as resp:
+        return resp.read().decode("utf-8")
+
+# Step 2: ESearch
+esearch_url = base + "esearch.fcgi"
+params = {
+    "db":"pubmed",
+    "term":query,
+    "retmax":100000,
+    "retmode":"json",
+    **date_params
+}
+esearch_text = http_get(esearch_url, params)
+data = json.loads(esearch_text)
+pmids = data["esearchresult"].get("idlist", [])
+count = int(data["esearchresult"].get("count","0"))
+print(f"\nSTEP 2: ESearch returned count={count}, retrieved PMIDs={len(pmids)}")
+with open(os.path.join(tmp_dir,"esearch.json"),"w") as f:
+    json.dump(data, f, indent=2)
+
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i<=2 else " "
+    print(f"{i}. [{chk}] {s}")
+
+# Step 3: EFetch in batches
+efetch_url = base + "efetch.fcgi"
+
+def fetch_batch(id_batch):
+    params = {"db":"pubmed","id":",".join(id_batch),"retmode":"xml"}
+    return http_get(efetch_url, params, timeout=120)
+
+articles = {}
+batch_size = 200
+xml_files = []
+for i in range(0, len(pmids), batch_size):
+    batch = pmids[i:i+batch_size]
+    xml_text = fetch_batch(batch)
+    xml_path = os.path.join(tmp_dir, f"efetch_{i//batch_size:04d}.xml")
+    with open(xml_path,"w") as f:
+        f.write(xml_text)
+    xml_files.append(xml_path)
+
+    soup = BeautifulSoup(xml_text, "xml")
+    for art in soup.find_all("PubmedArticle"):
+        pmid = art.find("PMID").get_text(strip=True) if art.find("PMID") else None
+        if not pmid:
+            continue
+        title = art.find("ArticleTitle").get_text(" ", strip=True) if art.find("ArticleTitle") else ""
+        abst_nodes = art.find_all("AbstractText")
+        abstract = " ".join([n.get_text(" ", strip=True) for n in abst_nodes]) if abst_nodes else ""
+        articles[pmid] = {"title": title, "abstract": abstract}
+
+print(f"\nSTEP 3: fetched and parsed {len(articles)} articles (xml files: {len(xml_files)})")
+with open(os.path.join(tmp_dir,"parsed_articles.json"),"w") as f:
+    json.dump(articles, f, indent=2)
+
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i<=3 else " "
+    print(f"{i}. [{chk}] {s}")
+
+# Step 4: Screening
+other_drug_markers = [
+"warfarin","theophylline","tizanidine","cyclosporine","clozapine","duloxetine","methotrexate",
+"metronidazole","rifampin","rifampicin","probenecid","phenytoin","digoxin","insulin",
+"caffeine","omeprazole","sucralfate","antacid","iron","zinc","calcium","magnesium",
+"clopidogrel","apixaban","rivaroxaban","dabigatran","amiodarone","fluconazole",
+"azithromycin","clarithromycin","linezolid","vancomycin","gentamicin"
+]
+exclude_terms = [
+"food-drug","food drug","diet","meal","nutrition","grapefruit",
+"pharmacogen","genetic","gene ","genes ","genotype","polymorphism","cyp2","cyp3","cyp1a2"
+]
+non_ddi_focus_terms = [
+"antimicrobial susceptibility","minimum inhibitory concentration","mic",
+"biofilm","resistance","resistant","synergistic activity","checkerboard","time-kill"
+]
+
+def accepted(title, abstract):
+    text = (title + " " + abstract).lower()
+    if "ciprofloxacin" not in text:
+        return False
+    if any(t in text for t in exclude_terms):
+        return False
+    ddi_signal = any(k in text for k in [
+        "drug-drug","drug drug","interaction","concomitant","coadministr","co-admin",
+        "pharmacokinetic","auc","cmax","clearance","inhibit","induc","exposure","qt"
+    ])
+    if not ddi_signal:
+        return False
+    if any(t in text for t in non_ddi_focus_terms) and not any(k in text for k in [
+        "pharmacokinetic","auc","cmax","clearance","toxicity","bleeding","serum concentration","plasma concentration"
+    ]):
+        return False
+    other = any(m in text for m in other_drug_markers)
+    if not other and re.search(r"ciprofloxacin (and|with) [a-z0-9\-]{3,}", text):
+        other = True
+    return other
+
+results = []
+for pmid in pmids:
+    meta = articles.get(pmid, {"title":"","abstract":""})
+    results.append({"PMID": str(pmid), "Accepted": bool(accepted(meta["title"], meta["abstract"]))})
+
+with open(os.path.join(tmp_dir,"screening_results.json"),"w") as f:
+    json.dump(results, f, indent=2)
+
+n_acc = sum(1 for x in results if x["Accepted"])
+print(f"\nSTEP 4: screening complete. Accepted={n_acc}/{len(results)}")
+print("Sample Accepted PMIDs:", [x["PMID"] for x in results if x["Accepted"]][:10])
+
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i<=4 else " "
+    print(f"{i}. [{chk}] {s}")
+
+# Step 5: Write output
+with open(out_path, "w") as f:
+    json.dump(results, f, indent=2)
+
+print(f"\nSTEP 5: wrote final JSON to {out_path}")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    print(f"{i}. [✓] {s}")
+
+summary = {
+    "query": query,
+    "date_params": date_params,
+    "initial_count": count,
+    "retrieved_pmids": len(pmids),
+    "accepted": n_acc,
+    "timestamp": datetime.utcnow().isoformat()+"Z"
+}
+with open(os.path.join(tmp_dir,"run_summary.json"),"w") as f:
+    json.dump(summary, f, indent=2)
+print("\nRun summary:", summary)
+</execute>
+<observation>NameError("name 'urlencode' is not defined")</observation>
+<execute>
+#!/usr/bin/env python3
+import os, json, re
+from datetime import datetime
+from urllib.request import urlopen
+from urllib.parse import urlencode
+from bs4 import BeautifulSoup
+
+# ========== Plan ==========
+plan = [
+"Set up required directories and define the PubMed query with inclusion/exclusion filters and date limits.",
+"Run the initial PubMed search (ESearch) and collect all PMIDs.",
+"Fetch article metadata/abstracts in batches (EFetch) and parse titles/abstracts.",
+"Screen abstracts for Ciprofloxacin DDIs (exclude food/gene topics; include clinical/pharmacological DDI with another drug) and assign Accepted flags.",
+"Write the full PMID list with Accepted flags to the required JSON path."
+]
+
+print("PLAN (checklist):")
+for i,s in enumerate(plan,1):
+    print(f"{i}. [ ] {s}")
+
+tmp_dir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/ddinter_retrieval/"
+out_path = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/ddinter_retrieval.json"
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+query = (
+    '(ciprofloxacin[Title/Abstract] OR Ciprofloxacin[MeSH Terms]) AND '
+    '("Drug Interactions"[MeSH Terms] OR "drug-drug interaction"[Title/Abstract] OR "drug drug interaction"[Title/Abstract] OR DDI[Title/Abstract]) '
+    'NOT ("Food-Drug Interactions"[MeSH Terms] OR food[Title] OR "Pharmacogenetics"[MeSH Terms] OR gene[Title/Abstract])'
+)
+date_params = {"mindate":"2021/01/01","maxdate":"2021/03/01","datetype":"pdat"}
+
+with open(os.path.join(tmp_dir,"query.txt"),"w") as f:
+    f.write(query+"\n")
+    f.write(json.dumps(date_params, indent=2))
+
+print("\nSTEP 1 complete: directories created and query saved.")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i==1 else " "
+    print(f"{i}. [{chk}] {s}")
+
+base = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
+
+def http_get(url, params, timeout=60):
+    full = url + "?" + urlencode(params)
+    with urlopen(full, timeout=timeout) as resp:
+        return resp.read().decode("utf-8")
+
+# Step 2: ESearch
+esearch_url = base + "esearch.fcgi"
+params = {
+    "db":"pubmed",
+    "term":query,
+    "retmax":100000,
+    "retmode":"json",
+    **date_params
+}
+esearch_text = http_get(esearch_url, params)
+data = json.loads(esearch_text)
+pmids = data["esearchresult"].get("idlist", [])
+count = int(data["esearchresult"].get("count","0"))
+print(f"\nSTEP 2: ESearch returned count={count}, retrieved PMIDs={len(pmids)}")
+with open(os.path.join(tmp_dir,"esearch.json"),"w") as f:
+    json.dump(data, f, indent=2)
+
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i<=2 else " "
+    print(f"{i}. [{chk}] {s}")
+
+# Step 3: EFetch in batches
+efetch_url = base + "efetch.fcgi"
+
+def fetch_batch(id_batch):
+    params = {"db":"pubmed","id":",".join(id_batch),"retmode":"xml"}
+    return http_get(efetch_url, params, timeout=120)
+
+articles = {}
+batch_size = 200
+xml_files = []
+for i in range(0, len(pmids), batch_size):
+    batch = pmids[i:i+batch_size]
+    xml_text = fetch_batch(batch)
+    xml_path = os.path.join(tmp_dir, f"efetch_{i//batch_size:04d}.xml")
+    with open(xml_path,"w") as f:
+        f.write(xml_text)
+    xml_files.append(xml_path)
+
+    soup = BeautifulSoup(xml_text, "xml")
+    for art in soup.find_all("PubmedArticle"):
+        pmid = art.find("PMID").get_text(strip=True) if art.find("PMID") else None
+        if not pmid:
+            continue
+        title = art.find("ArticleTitle").get_text(" ", strip=True) if art.find("ArticleTitle") else ""
+        abst_nodes = art.find_all("AbstractText")
+        abstract = " ".join([n.get_text(" ", strip=True) for n in abst_nodes]) if abst_nodes else ""
+        articles[pmid] = {"title": title, "abstract": abstract}
+
+print(f"\nSTEP 3: fetched and parsed {len(articles)} articles (xml files: {len(xml_files)})")
+with open(os.path.join(tmp_dir,"parsed_articles.json"),"w") as f:
+    json.dump(articles, f, indent=2)
+
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i<=3 else " "
+    print(f"{i}. [{chk}] {s}")
+
+# Step 4: Screening
+other_drug_markers = [
+"warfarin","theophylline","tizanidine","cyclosporine","clozapine","duloxetine","methotrexate",
+"metronidazole","rifampin","rifampicin","probenecid","phenytoin","digoxin","insulin",
+"caffeine","omeprazole","sucralfate","antacid","iron","zinc","calcium","magnesium",
+"clopidogrel","apixaban","rivaroxaban","dabigatran","amiodarone","fluconazole",
+"azithromycin","clarithromycin","linezolid","vancomycin","gentamicin"
+]
+exclude_terms = [
+"food-drug","food drug","diet","meal","nutrition","grapefruit",
+"pharmacogen","genetic","gene ","genes ","genotype","polymorphism","cyp2","cyp3","cyp1a2"
+]
+non_ddi_focus_terms = [
+"antimicrobial susceptibility","minimum inhibitory concentration","mic",
+"biofilm","resistance","resistant","synergistic activity","checkerboard","time-kill"
+]
+
+def accepted(title, abstract):
+    text = (title + " " + abstract).lower()
+    if "ciprofloxacin" not in text:
+        return False
+    if any(t in text for t in exclude_terms):
+        return False
+    ddi_signal = any(k in text for k in [
+        "drug-drug","drug drug","interaction","concomitant","coadministr","co-admin",
+        "pharmacokinetic","auc","cmax","clearance","inhibit","induc","exposure","qt"
+    ])
+    if not ddi_signal:
+        return False
+    if any(t in text for t in non_ddi_focus_terms) and not any(k in text for k in [
+        "pharmacokinetic","auc","cmax","clearance","toxicity","bleeding","serum concentration","plasma concentration"
+    ]):
+        return False
+    other = any(m in text for m in other_drug_markers)
+    if not other and re.search(r"ciprofloxacin (and|with) [a-z0-9\-]{3,}", text):
+        other = True
+    return other
+
+results = []
+for pmid in pmids:
+    meta = articles.get(pmid, {"title":"","abstract":""})
+    results.append({"PMID": str(pmid), "Accepted": bool(accepted(meta["title"], meta["abstract"]))})
+
+with open(os.path.join(tmp_dir,"screening_results.json"),"w") as f:
+    json.dump(results, f, indent=2)
+
+n_acc = sum(1 for x in results if x["Accepted"])
+print(f"\nSTEP 4: screening complete. Accepted={n_acc}/{len(results)}")
+print("Sample Accepted PMIDs:", [x["PMID"] for x in results if x["Accepted"]][:10])
+
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i<=4 else " "
+    print(f"{i}. [{chk}] {s}")
+
+# Step 5: Write output
+with open(out_path, "w") as f:
+    json.dump(results, f, indent=2)
+
+print(f"\nSTEP 5: wrote final JSON to {out_path}")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    print(f"{i}. [✓] {s}")
+
+summary = {
+    "query": query,
+    "date_params": date_params,
+    "initial_count": count,
+    "retrieved_pmids": len(pmids),
+    "accepted": n_acc,
+    "timestamp": datetime.utcnow().isoformat()+"Z"
+}
+with open(os.path.join(tmp_dir,"run_summary.json"),"w") as f:
+    json.dump(summary, f, indent=2)
+print("\nRun summary:", summary)
+</execute>
+<observation>NameError("name 'urlencode' is not defined")</observation>
+<execute>
+#!/usr/bin/env python3
+import os, json, re
+from datetime import datetime
+import urllib.request
+import urllib.parse
+from bs4 import BeautifulSoup
+
+# ========== Plan ==========
+plan = [
+"Set up required directories and define the PubMed query with inclusion/exclusion filters and date limits.",
+"Run the initial PubMed search (ESearch) and collect all PMIDs.",
+"Fetch article metadata/abstracts in batches (EFetch) and parse titles/abstracts.",
+"Screen abstracts for Ciprofloxacin DDIs (exclude food/gene topics; include clinical/pharmacological DDI with another drug) and assign Accepted flags.",
+"Write the full PMID list with Accepted flags to the required JSON path."
+]
+
+print("PLAN (checklist):")
+for i,s in enumerate(plan,1):
+    print(f"{i}. [ ] {s}")
+
+tmp_dir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/ddinter_retrieval/"
+out_path = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/ddinter_retrieval.json"
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+query = (
+    '(ciprofloxacin[Title/Abstract] OR Ciprofloxacin[MeSH Terms]) AND '
+    '("Drug Interactions"[MeSH Terms] OR "drug-drug interaction"[Title/Abstract] OR "drug drug interaction"[Title/Abstract] OR DDI[Title/Abstract]) '
+    'NOT ("Food-Drug Interactions"[MeSH Terms] OR food[Title] OR "Pharmacogenetics"[MeSH Terms] OR gene[Title/Abstract])'
+)
+date_params = {"mindate":"2021/01/01","maxdate":"2021/03/01","datetype":"pdat"}
+
+with open(os.path.join(tmp_dir,"query.txt"),"w") as f:
+    f.write(query+"\n")
+    f.write(json.dumps(date_params, indent=2))
+
+print("\nSTEP 1 complete: directories created and query saved.")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i==1 else " "
+    print(f"{i}. [{chk}] {s}")
+
+base = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
+
+def http_get(url, params, timeout=60):
+    full = url + "?" + urllib.parse.urlencode(params)
+    with urllib.request.urlopen(full, timeout=timeout) as resp:
+        return resp.read().decode("utf-8")
+
+# Step 2: ESearch
+esearch_url = base + "esearch.fcgi"
+params = {"db":"pubmed","term":query,"retmax":100000,"retmode":"json", **date_params}
+esearch_text = http_get(esearch_url, params)
+data = json.loads(esearch_text)
+pmids = data["esearchresult"].get("idlist", [])
+count = int(data["esearchresult"].get("count","0"))
+print(f"\nSTEP 2: ESearch returned count={count}, retrieved PMIDs={len(pmids)}")
+with open(os.path.join(tmp_dir,"esearch.json"),"w") as f:
+    json.dump(data, f, indent=2)
+
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i<=2 else " "
+    print(f"{i}. [{chk}] {s}")
+
+# Step 3: EFetch in batches
+efetch_url = base + "efetch.fcgi"
+
+def fetch_batch(id_batch):
+    params = {"db":"pubmed","id":",".join(id_batch),"retmode":"xml"}
+    return http_get(efetch_url, params, timeout=120)
+
+articles = {}
+batch_size = 200
+for i in range(0, len(pmids), batch_size):
+    batch = pmids[i:i+batch_size]
+    xml_text = fetch_batch(batch)
+    xml_path = os.path.join(tmp_dir, f"efetch_{i//batch_size:04d}.xml")
+    with open(xml_path,"w") as f:
+        f.write(xml_text)
+
+    soup = BeautifulSoup(xml_text, "xml")
+    for art in soup.find_all("PubmedArticle"):
+        pmid = art.find("PMID").get_text(strip=True) if art.find("PMID") else None
+        if not pmid:
+            continue
+        title = art.find("ArticleTitle").get_text(" ", strip=True) if art.find("ArticleTitle") else ""
+        abst_nodes = art.find_all("AbstractText")
+        abstract = " ".join([n.get_text(" ", strip=True) for n in abst_nodes]) if abst_nodes else ""
+        articles[pmid] = {"title": title, "abstract": abstract}
+
+print(f"\nSTEP 3: fetched and parsed {len(articles)} articles")
+with open(os.path.join(tmp_dir,"parsed_articles.json"),"w") as f:
+    json.dump(articles, f, indent=2)
+
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i<=3 else " "
+    print(f"{i}. [{chk}] {s}")
+
+# Step 4: Screening
+other_drug_markers = [
+"warfarin","theophylline","tizanidine","cyclosporine","clozapine","duloxetine","methotrexate",
+"metronidazole","rifampin","rifampicin","probenecid","phenytoin","digoxin","insulin",
+"caffeine","omeprazole","sucralfate","antacid","iron","zinc","calcium","magnesium",
+"clopidogrel","apixaban","rivaroxaban","dabigatran","amiodarone","fluconazole",
+"azithromycin","clarithromycin","linezolid","vancomycin","gentamicin"
+]
+exclude_terms = [
+"food-drug","food drug","diet","meal","nutrition","grapefruit",
+"pharmacogen","genetic","gene ","genes ","genotype","polymorphism","cyp2","cyp3","cyp1a2"
+]
+non_ddi_focus_terms = [
+"antimicrobial susceptibility","minimum inhibitory concentration","mic",
+"biofilm","resistance","resistant","synergistic activity","checkerboard","time-kill"
+]
+
+def accepted(title, abstract):
+    text = (title + " " + abstract).lower()
+    if "ciprofloxacin" not in text:
+        return False
+    if any(t in text for t in exclude_terms):
+        return False
+    ddi_signal = any(k in text for k in [
+        "drug-drug","drug drug","interaction","concomitant","coadministr","co-admin",
+        "pharmacokinetic","auc","cmax","clearance","inhibit","induc","exposure","qt"
+    ])
+    if not ddi_signal:
+        return False
+    if any(t in text for t in non_ddi_focus_terms) and not any(k in text for k in [
+        "pharmacokinetic","auc","cmax","clearance","toxicity","bleeding","serum concentration","plasma concentration"
+    ]):
+        return False
+    other = any(m in text for m in other_drug_markers)
+    if not other and re.search(r"ciprofloxacin (and|with) [a-z0-9\-]{3,}", text):
+        other = True
+    return other
+
+results = []
+for pmid in pmids:
+    meta = articles.get(pmid, {"title":"","abstract":""})
+    results.append({"PMID": str(pmid), "Accepted": bool(accepted(meta["title"], meta["abstract"]))})
+
+with open(os.path.join(tmp_dir,"screening_results.json"),"w") as f:
+    json.dump(results, f, indent=2)
+
+n_acc = sum(1 for x in results if x["Accepted"])
+print(f"\nSTEP 4: screening complete. Accepted={n_acc}/{len(results)}")
+print("Sample Accepted PMIDs:", [x["PMID"] for x in results if x["Accepted"]][:10])
+
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i<=4 else " "
+    print(f"{i}. [{chk}] {s}")
+
+# Step 5: Write output
+with open(out_path, "w") as f:
+    json.dump(results, f, indent=2)
+
+print(f"\nSTEP 5: wrote final JSON to {out_path}")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    print(f"{i}. [✓] {s}")
+
+summary = {
+    "query": query,
+    "date_params": date_params,
+    "initial_count": count,
+    "retrieved_pmids": len(pmids),
+    "accepted": n_acc,
+    "timestamp": datetime.utcnow().isoformat()+"Z"
+}
+with open(os.path.join(tmp_dir,"run_summary.json"),"w") as f:
+    json.dump(summary, f, indent=2)
+print("\nRun summary:", summary)
+</execute>
+<observation>NameError("name 'urllib' is not defined")</observation>
+<execute>
+#!/usr/bin/env python3
+import os, json, re
+from datetime import datetime
+import urllib
+import urllib.request
+import urllib.parse
+from bs4 import BeautifulSoup
+
+# ========== Plan ==========
+plan = [
+"Set up required directories and define the PubMed query with inclusion/exclusion filters and date limits.",
+"Run the initial PubMed search (ESearch) and collect all PMIDs.",
+"Fetch article metadata/abstracts in batches (EFetch) and parse titles/abstracts.",
+"Screen abstracts for Ciprofloxacin DDIs (exclude food/gene topics; include clinical/pharmacological DDI with another drug) and assign Accepted flags.",
+"Write the full PMID list with Accepted flags to the required JSON path."
+]
+
+print("PLAN (checklist):")
+for i,s in enumerate(plan,1):
+    print(f"{i}. [ ] {s}")
+
+tmp_dir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/ddinter_retrieval/"
+out_path = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/ddinter_retrieval.json"
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+query = (
+    '(ciprofloxacin[Title/Abstract] OR Ciprofloxacin[MeSH Terms]) AND '
+    '("Drug Interactions"[MeSH Terms] OR "drug-drug interaction"[Title/Abstract] OR "drug drug interaction"[Title/Abstract] OR DDI[Title/Abstract]) '
+    'NOT ("Food-Drug Interactions"[MeSH Terms] OR food[Title] OR "Pharmacogenetics"[MeSH Terms] OR gene[Title/Abstract])'
+)
+date_params = {"mindate":"2021/01/01","maxdate":"2021/03/01","datetype":"pdat"}
+
+with open(os.path.join(tmp_dir,"query.txt"),"w") as f:
+    f.write(query+"\n")
+    f.write(json.dumps(date_params, indent=2))
+
+print("\nSTEP 1 complete: directories created and query saved.")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i==1 else " "
+    print(f"{i}. [{chk}] {s}")
+
+base = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
+
+def http_get(url, params, timeout=60):
+    full = url + "?" + urllib.parse.urlencode(params)
+    with urllib.request.urlopen(full, timeout=timeout) as resp:
+        return resp.read().decode("utf-8")
+
+# Step 2: ESearch
+esearch_url = base + "esearch.fcgi"
+params = {"db":"pubmed","term":query,"retmax":100000,"retmode":"json", **date_params}
+esearch_text = http_get(esearch_url, params)
+data = json.loads(esearch_text)
+pmids = data["esearchresult"].get("idlist", [])
+count = int(data["esearchresult"].get("count","0"))
+print(f"\nSTEP 2: ESearch returned count={count}, retrieved PMIDs={len(pmids)}")
+with open(os.path.join(tmp_dir,"esearch.json"),"w") as f:
+    json.dump(data, f, indent=2)
+
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i<=2 else " "
+    print(f"{i}. [{chk}] {s}")
+
+# Step 3: EFetch in batches
+efetch_url = base + "efetch.fcgi"
+
+def fetch_batch(id_batch):
+    params = {"db":"pubmed","id":",".join(id_batch),"retmode":"xml"}
+    return http_get(efetch_url, params, timeout=120)
+
+articles = {}
+batch_size = 200
+for i in range(0, len(pmids), batch_size):
+    batch = pmids[i:i+batch_size]
+    xml_text = fetch_batch(batch)
+    xml_path = os.path.join(tmp_dir, f"efetch_{i//batch_size:04d}.xml")
+    with open(xml_path,"w") as f:
+        f.write(xml_text)
+
+    soup = BeautifulSoup(xml_text, "xml")
+    for art in soup.find_all("PubmedArticle"):
+        pmid = art.find("PMID").get_text(strip=True) if art.find("PMID") else None
+        if not pmid:
+            continue
+        title = art.find("ArticleTitle").get_text(" ", strip=True) if art.find("ArticleTitle") else ""
+        abst_nodes = art.find_all("AbstractText")
+        abstract = " ".join([n.get_text(" ", strip=True) for n in abst_nodes]) if abst_nodes else ""
+        articles[pmid] = {"title": title, "abstract": abstract}
+
+print(f"\nSTEP 3: fetched and parsed {len(articles)} articles")
+with open(os.path.join(tmp_dir,"parsed_articles.json"),"w") as f:
+    json.dump(articles, f, indent=2)
+
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i<=3 else " "
+    print(f"{i}. [{chk}] {s}")
+
+# Step 4: Screening
+other_drug_markers = [
+"warfarin","theophylline","tizanidine","cyclosporine","clozapine","duloxetine","methotrexate",
+"metronidazole","rifampin","rifampicin","probenecid","phenytoin","digoxin","insulin",
+"caffeine","omeprazole","sucralfate","antacid","iron","zinc","calcium","magnesium",
+"clopidogrel","apixaban","rivaroxaban","dabigatran","amiodarone","fluconazole",
+"azithromycin","clarithromycin","linezolid","vancomycin","gentamicin"
+]
+exclude_terms = [
+"food-drug","food drug","diet","meal","nutrition","grapefruit",
+"pharmacogen","genetic","gene ","genes ","genotype","polymorphism","cyp2","cyp3","cyp1a2"
+]
+non_ddi_focus_terms = [
+"antimicrobial susceptibility","minimum inhibitory concentration","mic",
+"biofilm","resistance","resistant","synergistic activity","checkerboard","time-kill"
+]
+
+def accepted(title, abstract):
+    text = (title + " " + abstract).lower()
+    if "ciprofloxacin" not in text:
+        return False
+    if any(t in text for t in exclude_terms):
+        return False
+    ddi_signal = any(k in text for k in [
+        "drug-drug","drug drug","interaction","concomitant","coadministr","co-admin",
+        "pharmacokinetic","auc","cmax","clearance","inhibit","induc","exposure","qt"
+    ])
+    if not ddi_signal:
+        return False
+    if any(t in text for t in non_ddi_focus_terms) and not any(k in text for k in [
+        "pharmacokinetic","auc","cmax","clearance","toxicity","bleeding","serum concentration","plasma concentration"
+    ]):
+        return False
+    other = any(m in text for m in other_drug_markers)
+    if not other and re.search(r"ciprofloxacin (and|with) [a-z0-9\-]{3,}", text):
+        other = True
+    return other
+
+results = []
+for pmid in pmids:
+    meta = articles.get(pmid, {"title":"","abstract":""})
+    results.append({"PMID": str(pmid), "Accepted": bool(accepted(meta["title"], meta["abstract"]))})
+
+with open(os.path.join(tmp_dir,"screening_results.json"),"w") as f:
+    json.dump(results, f, indent=2)
+
+n_acc = sum(1 for x in results if x["Accepted"])
+print(f"\nSTEP 4: screening complete. Accepted={n_acc}/{len(results)}")
+print("Sample Accepted PMIDs:", [x["PMID"] for x in results if x["Accepted"]][:10])
+
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i<=4 else " "
+    print(f"{i}. [{chk}] {s}")
+
+# Step 5: Write output
+with open(out_path, "w") as f:
+    json.dump(results, f, indent=2)
+
+print(f"\nSTEP 5: wrote final JSON to {out_path}")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    print(f"{i}. [✓] {s}")
+
+summary = {
+    "query": query,
+    "date_params": date_params,
+    "initial_count": count,
+    "retrieved_pmids": len(pmids),
+    "accepted": n_acc,
+    "timestamp": datetime.utcnow().isoformat()+"Z"
+}
+with open(os.path.join(tmp_dir,"run_summary.json"),"w") as f:
+    json.dump(summary, f, indent=2)
+print("\nRun summary:", summary)
+</execute>
+<observation>NameError("name 'urllib' is not defined")</observation>
+<execute>
+#!/usr/bin/env python3
+import os, json, re
+from datetime import datetime
+from urllib.request import urlopen
+from urllib.parse import urlencode
+from bs4 import BeautifulSoup
+
+# ========== Plan ==========
+plan = [
+"Set up required directories and define the PubMed query with inclusion/exclusion filters and date limits.",
+"Run the initial PubMed search (ESearch) and collect all PMIDs.",
+"Fetch article metadata/abstracts in batches (EFetch) and parse titles/abstracts.",
+"Screen abstracts for Ciprofloxacin DDIs (exclude food/gene topics; include clinical/pharmacological DDI with another drug) and assign Accepted flags.",
+"Write the full PMID list with Accepted flags to the required JSON path."
+]
+
+print("PLAN (checklist):")
+for i,s in enumerate(plan,1):
+    print(f"{i}. [ ] {s}")
+
+tmp_dir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/ddinter_retrieval/"
+out_path = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/ddinter_retrieval.json"
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+query = (
+    '(ciprofloxacin[Title/Abstract] OR Ciprofloxacin[MeSH Terms]) AND '
+    '("Drug Interactions"[MeSH Terms] OR "drug-drug interaction"[Title/Abstract] OR "drug drug interaction"[Title/Abstract] OR DDI[Title/Abstract]) '
+    'NOT ("Food-Drug Interactions"[MeSH Terms] OR food[Title] OR "Pharmacogenetics"[MeSH Terms] OR gene[Title/Abstract])'
+)
+date_params = {"mindate":"2021/01/01","maxdate":"2021/03/01","datetype":"pdat"}
+
+with open(os.path.join(tmp_dir,"query.txt"),"w") as f:
+    f.write(query+"\n")
+    f.write(json.dumps(date_params, indent=2))
+
+print("\nSTEP 1 complete: directories created and query saved.")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i==1 else " "
+    print(f"{i}. [{chk}] {s}")
+
+base = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
+
+def http_get(url, params, timeout=60):
+    full = url + "?" + urlencode(params)
+    with urlopen(full, timeout=timeout) as resp:
+        return resp.read().decode("utf-8")
+
+# Step 2: ESearch
+esearch_url = base + "esearch.fcgi"
+params = {"db":"pubmed","term":query,"retmax":100000,"retmode":"json", **date_params}
+esearch_text = http_get(esearch_url, params)
+data = json.loads(esearch_text)
+pmids = data["esearchresult"].get("idlist", [])
+count = int(data["esearchresult"].get("count","0"))
+print(f"\nSTEP 2: ESearch returned count={count}, retrieved PMIDs={len(pmids)}")
+with open(os.path.join(tmp_dir,"esearch.json"),"w") as f:
+    json.dump(data, f, indent=2)
+
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i<=2 else " "
+    print(f"{i}. [{chk}] {s}")
+
+# Step 3: EFetch in batches
+efetch_url = base + "efetch.fcgi"
+
+def fetch_batch(id_batch):
+    params = {"db":"pubmed","id":",".join(id_batch),"retmode":"xml"}
+    return http_get(efetch_url, params, timeout=120)
+
+articles = {}
+batch_size = 200
+for i in range(0, len(pmids), batch_size):
+    batch = pmids[i:i+batch_size]
+    xml_text = fetch_batch(batch)
+    xml_path = os.path.join(tmp_dir, f"efetch_{i//batch_size:04d}.xml")
+    with open(xml_path,"w") as f:
+        f.write(xml_text)
+
+    soup = BeautifulSoup(xml_text, "xml")
+    for art in soup.find_all("PubmedArticle"):
+        pmid = art.find("PMID").get_text(strip=True) if art.find("PMID") else None
+        if not pmid:
+            continue
+        title = art.find("ArticleTitle").get_text(" ", strip=True) if art.find("ArticleTitle") else ""
+        abst_nodes = art.find_all("AbstractText")
+        abstract = " ".join([n.get_text(" ", strip=True) for n in abst_nodes]) if abst_nodes else ""
+        articles[pmid] = {"title": title, "abstract": abstract}
+
+print(f"\nSTEP 3: fetched and parsed {len(articles)} articles")
+with open(os.path.join(tmp_dir,"parsed_articles.json"),"w") as f:
+    json.dump(articles, f, indent=2)
+
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i<=3 else " "
+    print(f"{i}. [{chk}] {s}")
+
+# Step 4: Screening
+other_drug_markers = [
+"warfarin","theophylline","tizanidine","cyclosporine","clozapine","duloxetine","methotrexate",
+"metronidazole","rifampin","rifampicin","probenecid","phenytoin","digoxin","insulin",
+"caffeine","omeprazole","sucralfate","antacid","iron","zinc","calcium","magnesium",
+"clopidogrel","apixaban","rivaroxaban","dabigatran","amiodarone","fluconazole",
+"azithromycin","clarithromycin","linezolid","vancomycin","gentamicin"
+]
+exclude_terms = [
+"food-drug","food drug","diet","meal","nutrition","grapefruit",
+"pharmacogen","genetic","gene ","genes ","genotype","polymorphism","cyp2","cyp3","cyp1a2"
+]
+non_ddi_focus_terms = [
+"antimicrobial susceptibility","minimum inhibitory concentration","mic",
+"biofilm","resistance","resistant","synergistic activity","checkerboard","time-kill"
+]
+
+def accepted(title, abstract):
+    text = (title + " " + abstract).lower()
+    if "ciprofloxacin" not in text:
+        return False
+    if any(t in text for t in exclude_terms):
+        return False
+    ddi_signal = any(k in text for k in [
+        "drug-drug","drug drug","interaction","concomitant","coadministr","co-admin",
+        "pharmacokinetic","auc","cmax","clearance","inhibit","induc","exposure","qt"
+    ])
+    if not ddi_signal:
+        return False
+    if any(t in text for t in non_ddi_focus_terms) and not any(k in text for k in [
+        "pharmacokinetic","auc","cmax","clearance","toxicity","bleeding","serum concentration","plasma concentration"
+    ]):
+        return False
+    other = any(m in text for m in other_drug_markers)
+    if not other and re.search(r"ciprofloxacin (and|with) [a-z0-9\-]{3,}", text):
+        other = True
+    return other
+
+results = []
+for pmid in pmids:
+    meta = articles.get(pmid, {"title":"","abstract":""})
+    results.append({"PMID": str(pmid), "Accepted": bool(accepted(meta["title"], meta["abstract"]))})
+
+with open(os.path.join(tmp_dir,"screening_results.json"),"w") as f:
+    json.dump(results, f, indent=2)
+
+n_acc = sum(1 for x in results if x["Accepted"])
+print(f"\nSTEP 4: screening complete. Accepted={n_acc}/{len(results)}")
+print("Sample Accepted PMIDs:", [x["PMID"] for x in results if x["Accepted"]][:10])
+
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i<=4 else " "
+    print(f"{i}. [{chk}] {s}")
+
+# Step 5: Write output
+with open(out_path, "w") as f:
+    json.dump(results, f, indent=2)
+
+print(f"\nSTEP 5: wrote final JSON to {out_path}")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    print(f"{i}. [✓] {s}")
+
+summary = {
+    "query": query,
+    "date_params": date_params,
+    "initial_count": count,
+    "retrieved_pmids": len(pmids),
+    "accepted": n_acc,
+    "timestamp": datetime.utcnow().isoformat()+"Z"
+}
+with open(os.path.join(tmp_dir,"run_summary.json"),"w") as f:
+    json.dump(summary, f, indent=2)
+print("\nRun summary:", summary)
+</execute>
+<observation>NameError("name 'urlencode' is not defined")</observation>
+<execute>
+#!/usr/bin/env python3
+import os, json, re
+from datetime import datetime
+from urllib.request import urlopen
+import urllib.parse
+from bs4 import BeautifulSoup
+
+# ========== Plan ==========
+plan = [
+"Set up required directories and define the PubMed query with inclusion/exclusion filters and date limits.",
+"Run the initial PubMed search (ESearch) and collect all PMIDs.",
+"Fetch article metadata/abstracts in batches (EFetch) and parse titles/abstracts.",
+"Screen abstracts for Ciprofloxacin DDIs (exclude food/gene topics; include clinical/pharmacological DDI with another drug) and assign Accepted flags.",
+"Write the full PMID list with Accepted flags to the required JSON path."
+]
+
+print("PLAN (checklist):")
+for i,s in enumerate(plan,1):
+    print(f"{i}. [ ] {s}")
+
+tmp_dir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/ddinter_retrieval/"
+out_path = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/ddinter_retrieval.json"
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+query = (
+    '(ciprofloxacin[Title/Abstract] OR Ciprofloxacin[MeSH Terms]) AND '
+    '("Drug Interactions"[MeSH Terms] OR "drug-drug interaction"[Title/Abstract] OR "drug drug interaction"[Title/Abstract] OR DDI[Title/Abstract]) '
+    'NOT ("Food-Drug Interactions"[MeSH Terms] OR food[Title] OR "Pharmacogenetics"[MeSH Terms] OR gene[Title/Abstract])'
+)
+date_params = {"mindate":"2021/01/01","maxdate":"2021/03/01","datetype":"pdat"}
+
+with open(os.path.join(tmp_dir,"query.txt"),"w") as f:
+    f.write(query+"\n")
+    f.write(json.dumps(date_params, indent=2))
+
+print("\nSTEP 1 complete: directories created and query saved.")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i==1 else " "
+    print(f"{i}. [{chk}] {s}")
+
+base = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
+
+def http_get(url, params, timeout=60):
+    full = url + "?" + urllib.parse.urlencode(params)
+    with urlopen(full, timeout=timeout) as resp:
+        return resp.read().decode("utf-8")
+
+# Step 2: ESearch
+esearch_url = base + "esearch.fcgi"
+params = {"db":"pubmed","term":query,"retmax":100000,"retmode":"json", **date_params}
+esearch_text = http_get(esearch_url, params)
+data = json.loads(esearch_text)
+pmids = data["esearchresult"].get("idlist", [])
+count = int(data["esearchresult"].get("count","0"))
+print(f"\nSTEP 2: ESearch returned count={count}, retrieved PMIDs={len(pmids)}")
+with open(os.path.join(tmp_dir,"esearch.json"),"w") as f:
+    json.dump(data, f, indent=2)
+
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i<=2 else " "
+    print(f"{i}. [{chk}] {s}")
+
+# Step 3: EFetch in batches
+efetch_url = base + "efetch.fcgi"
+
+def fetch_batch(id_batch):
+    params = {"db":"pubmed","id":",".join(id_batch),"retmode":"xml"}
+    return http_get(efetch_url, params, timeout=120)
+
+articles = {}
+batch_size = 200
+for i in range(0, len(pmids), batch_size):
+    batch = pmids[i:i+batch_size]
+    xml_text = fetch_batch(batch)
+    xml_path = os.path.join(tmp_dir, f"efetch_{i//batch_size:04d}.xml")
+    with open(xml_path,"w") as f:
+        f.write(xml_text)
+
+    soup = BeautifulSoup(xml_text, "xml")
+    for art in soup.find_all("PubmedArticle"):
+        pmid = art.find("PMID").get_text(strip=True) if art.find("PMID") else None
+        if not pmid:
+            continue
+        title = art.find("ArticleTitle").get_text(" ", strip=True) if art.find("ArticleTitle") else ""
+        abst_nodes = art.find_all("AbstractText")
+        abstract = " ".join([n.get_text(" ", strip=True) for n in abst_nodes]) if abst_nodes else ""
+        articles[pmid] = {"title": title, "abstract": abstract}
+
+print(f"\nSTEP 3: fetched and parsed {len(articles)} articles")
+with open(os.path.join(tmp_dir,"parsed_articles.json"),"w") as f:
+    json.dump(articles, f, indent=2)
+
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i<=3 else " "
+    print(f"{i}. [{chk}] {s}")
+
+# Step 4: Screening
+other_drug_markers = [
+"warfarin","theophylline","tizanidine","cyclosporine","clozapine","duloxetine","methotrexate",
+"metronidazole","rifampin","rifampicin","probenecid","phenytoin","digoxin","insulin",
+"caffeine","omeprazole","sucralfate","antacid","iron","zinc","calcium","magnesium",
+"clopidogrel","apixaban","rivaroxaban","dabigatran","amiodarone","fluconazole",
+"azithromycin","clarithromycin","linezolid","vancomycin","gentamicin"
+]
+exclude_terms = [
+"food-drug","food drug","diet","meal","nutrition","grapefruit",
+"pharmacogen","genetic","gene ","genes ","genotype","polymorphism","cyp2","cyp3","cyp1a2"
+]
+non_ddi_focus_terms = [
+"antimicrobial susceptibility","minimum inhibitory concentration","mic",
+"biofilm","resistance","resistant","synergistic activity","checkerboard","time-kill"
+]
+
+def accepted(title, abstract):
+    text = (title + " " + abstract).lower()
+    if "ciprofloxacin" not in text:
+        return False
+    if any(t in text for t in exclude_terms):
+        return False
+    ddi_signal = any(k in text for k in [
+        "drug-drug","drug drug","interaction","concomitant","coadministr","co-admin",
+        "pharmacokinetic","auc","cmax","clearance","inhibit","induc","exposure","qt"
+    ])
+    if not ddi_signal:
+        return False
+    if any(t in text for t in non_ddi_focus_terms) and not any(k in text for k in [
+        "pharmacokinetic","auc","cmax","clearance","toxicity","bleeding","serum concentration","plasma concentration"
+    ]):
+        return False
+    other = any(m in text for m in other_drug_markers)
+    if not other and re.search(r"ciprofloxacin (and|with) [a-z0-9\-]{3,}", text):
+        other = True
+    return other
+
+results = []
+for pmid in pmids:
+    meta = articles.get(pmid, {"title":"","abstract":""})
+    results.append({"PMID": str(pmid), "Accepted": bool(accepted(meta["title"], meta["abstract"]))})
+
+with open(os.path.join(tmp_dir,"screening_results.json"),"w") as f:
+    json.dump(results, f, indent=2)
+
+n_acc = sum(1 for x in results if x["Accepted"])
+print(f"\nSTEP 4: screening complete. Accepted={n_acc}/{len(results)}")
+print("Sample Accepted PMIDs:", [x["PMID"] for x in results if x["Accepted"]][:10])
+
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i<=4 else " "
+    print(f"{i}. [{chk}] {s}")
+
+# Step 5: Write output
+with open(out_path, "w") as f:
+    json.dump(results, f, indent=2)
+
+print(f"\nSTEP 5: wrote final JSON to {out_path}")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    print(f"{i}. [✓] {s}")
+
+summary = {
+    "query": query,
+    "date_params": date_params,
+    "initial_count": count,
+    "retrieved_pmids": len(pmids),
+    "accepted": n_acc,
+    "timestamp": datetime.utcnow().isoformat()+"Z"
+}
+with open(os.path.join(tmp_dir,"run_summary.json"),"w") as f:
+    json.dump(summary, f, indent=2)
+print("\nRun summary:", summary)
+</execute>
+<observation>NameError("name 'urllib' is not defined")</observation>
+<execute>
+#!/usr/bin/env python3
+import os, json, re
+from datetime import datetime
+from urllib.request import urlopen
+import urllib.parse as uparse
+from bs4 import BeautifulSoup
+
+# ========== Plan ==========
+plan = [
+"Set up required directories and define the PubMed query with inclusion/exclusion filters and date limits.",
+"Run the initial PubMed search (ESearch) and collect all PMIDs.",
+"Fetch article metadata/abstracts in batches (EFetch) and parse titles/abstracts.",
+"Screen abstracts for Ciprofloxacin DDIs (exclude food/gene topics; include clinical/pharmacological DDI with another drug) and assign Accepted flags.",
+"Write the full PMID list with Accepted flags to the required JSON path."
+]
+
+print("PLAN (checklist):")
+for i,s in enumerate(plan,1):
+    print(f"{i}. [ ] {s}")
+
+tmp_dir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/ddinter_retrieval/"
+out_path = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/ddinter_retrieval.json"
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+query = (
+    '(ciprofloxacin[Title/Abstract] OR Ciprofloxacin[MeSH Terms]) AND '
+    '("Drug Interactions"[MeSH Terms] OR "drug-drug interaction"[Title/Abstract] OR "drug drug interaction"[Title/Abstract] OR DDI[Title/Abstract]) '
+    'NOT ("Food-Drug Interactions"[MeSH Terms] OR food[Title] OR "Pharmacogenetics"[MeSH Terms] OR gene[Title/Abstract])'
+)
+date_params = {"mindate":"2021/01/01","maxdate":"2021/03/01","datetype":"pdat"}
+
+with open(os.path.join(tmp_dir,"query.txt"),"w") as f:
+    f.write(query+"\n")
+    f.write(json.dumps(date_params, indent=2))
+
+print("\nSTEP 1 complete: directories created and query saved.")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i==1 else " "
+    print(f"{i}. [{chk}] {s}")
+
+base = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
+
+def http_get(url, params, timeout=60):
+    full = url + "?" + uparse.urlencode(params)
+    with urlopen(full, timeout=timeout) as resp:
+        return resp.read().decode("utf-8")
+
+# Step 2: ESearch
+esearch_url = base + "esearch.fcgi"
+params = {"db":"pubmed","term":query,"retmax":100000,"retmode":"json", **date_params}
+esearch_text = http_get(esearch_url, params)
+data = json.loads(esearch_text)
+pmids = data["esearchresult"].get("idlist", [])
+count = int(data["esearchresult"].get("count","0"))
+print(f"\nSTEP 2: ESearch returned count={count}, retrieved PMIDs={len(pmids)}")
+with open(os.path.join(tmp_dir,"esearch.json"),"w") as f:
+    json.dump(data, f, indent=2)
+
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i<=2 else " "
+    print(f"{i}. [{chk}] {s}")
+
+# Step 3: EFetch in batches
+efetch_url = base + "efetch.fcgi"
+
+def fetch_batch(id_batch):
+    params = {"db":"pubmed","id":",".join(id_batch),"retmode":"xml"}
+    return http_get(efetch_url, params, timeout=120)
+
+articles = {}
+batch_size = 200
+for i in range(0, len(pmids), batch_size):
+    batch = pmids[i:i+batch_size]
+    xml_text = fetch_batch(batch)
+    xml_path = os.path.join(tmp_dir, f"efetch_{i//batch_size:04d}.xml")
+    with open(xml_path,"w") as f:
+        f.write(xml_text)
+
+    soup = BeautifulSoup(xml_text, "xml")
+    for art in soup.find_all("PubmedArticle"):
+        pmid = art.find("PMID").get_text(strip=True) if art.find("PMID") else None
+        if not pmid:
+            continue
+        title = art.find("ArticleTitle").get_text(" ", strip=True) if art.find("ArticleTitle") else ""
+        abst_nodes = art.find_all("AbstractText")
+        abstract = " ".join([n.get_text(" ", strip=True) for n in abst_nodes]) if abst_nodes else ""
+        articles[pmid] = {"title": title, "abstract": abstract}
+
+print(f"\nSTEP 3: fetched and parsed {len(articles)} articles")
+with open(os.path.join(tmp_dir,"parsed_articles.json"),"w") as f:
+    json.dump(articles, f, indent=2)
+
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i<=3 else " "
+    print(f"{i}. [{chk}] {s}")
+
+# Step 4: Screening
+other_drug_markers = [
+"warfarin","theophylline","tizanidine","cyclosporine","clozapine","duloxetine","methotrexate",
+"metronidazole","rifampin","rifampicin","probenecid","phenytoin","digoxin","insulin",
+"caffeine","omeprazole","sucralfate","antacid","iron","zinc","calcium","magnesium",
+"clopidogrel","apixaban","rivaroxaban","dabigatran","amiodarone","fluconazole",
+"azithromycin","clarithromycin","linezolid","vancomycin","gentamicin"
+]
+exclude_terms = [
+"food-drug","food drug","diet","meal","nutrition","grapefruit",
+"pharmacogen","genetic","gene ","genes ","genotype","polymorphism","cyp2","cyp3","cyp1a2"
+]
+non_ddi_focus_terms = [
+"antimicrobial susceptibility","minimum inhibitory concentration","mic",
+"biofilm","resistance","resistant","synergistic activity","checkerboard","time-kill"
+]
+
+def accepted(title, abstract):
+    text = (title + " " + abstract).lower()
+    if "ciprofloxacin" not in text:
+        return False
+    if any(t in text for t in exclude_terms):
+        return False
+    ddi_signal = any(k in text for k in [
+        "drug-drug","drug drug","interaction","concomitant","coadministr","co-admin",
+        "pharmacokinetic","auc","cmax","clearance","inhibit","induc","exposure","qt"
+    ])
+    if not ddi_signal:
+        return False
+    if any(t in text for t in non_ddi_focus_terms) and not any(k in text for k in [
+        "pharmacokinetic","auc","cmax","clearance","toxicity","bleeding","serum concentration","plasma concentration"
+    ]):
+        return False
+    other = any(m in text for m in other_drug_markers)
+    if not other and re.search(r"ciprofloxacin (and|with) [a-z0-9\-]{3,}", text):
+        other = True
+    return other
+
+results = []
+for pmid in pmids:
+    meta = articles.get(pmid, {"title":"","abstract":""})
+    results.append({"PMID": str(pmid), "Accepted": bool(accepted(meta["title"], meta["abstract"]))})
+
+with open(os.path.join(tmp_dir,"screening_results.json"),"w") as f:
+    json.dump(results, f, indent=2)
+
+n_acc = sum(1 for x in results if x["Accepted"])
+print(f"\nSTEP 4: screening complete. Accepted={n_acc}/{len(results)}")
+print("Sample Accepted PMIDs:", [x["PMID"] for x in results if x["Accepted"]][:10])
+
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i<=4 else " "
+    print(f"{i}. [{chk}] {s}")
+
+# Step 5: Write output
+with open(out_path, "w") as f:
+    json.dump(results, f, indent=2)
+
+print(f"\nSTEP 5: wrote final JSON to {out_path}")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    print(f"{i}. [✓] {s}")
+
+summary = {
+    "query": query,
+    "date_params": date_params,
+    "initial_count": count,
+    "retrieved_pmids": len(pmids),
+    "accepted": n_acc,
+    "timestamp": datetime.utcnow().isoformat()+"Z"
+}
+with open(os.path.join(tmp_dir,"run_summary.json"),"w") as f:
+    json.dump(summary, f, indent=2)
+print("\nRun summary:", summary)
+</execute>
+<observation>NameError("name 'uparse' is not defined")</observation>
+<execute>
+#!/usr/bin/env python3
+import os, json, re
+from datetime import datetime
+from urllib.request import urlopen
+from urllib.parse import urlencode
+from bs4 import BeautifulSoup
+
+# ========== Plan ==========
+plan = [
+"Set up required directories and define the PubMed query with inclusion/exclusion filters and date limits.",
+"Run the initial PubMed search (ESearch) and collect all PMIDs.",
+"Fetch article metadata/abstracts in batches (EFetch) and parse titles/abstracts.",
+"Screen abstracts for Ciprofloxacin DDIs (exclude food/gene topics; include clinical/pharmacological DDI with another drug) and assign Accepted flags.",
+"Write the full PMID list with Accepted flags to the required JSON path."
+]
+
+print("PLAN (checklist):")
+for i,s in enumerate(plan,1):
+    print(f"{i}. [ ] {s}")
+
+tmp_dir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/ddinter_retrieval/"
+out_path = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/ddinter_retrieval.json"
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+query = (
+    '(ciprofloxacin[Title/Abstract] OR Ciprofloxacin[MeSH Terms]) AND '
+    '("Drug Interactions"[MeSH Terms] OR "drug-drug interaction"[Title/Abstract] OR "drug drug interaction"[Title/Abstract] OR DDI[Title/Abstract]) '
+    'NOT ("Food-Drug Interactions"[MeSH Terms] OR food[Title] OR "Pharmacogenetics"[MeSH Terms] OR gene[Title/Abstract])'
+)
+date_params = {"mindate":"2021/01/01","maxdate":"2021/03/01","datetype":"pdat"}
+
+with open(os.path.join(tmp_dir,"query.txt"),"w") as f:
+    f.write(query+"\n")
+    f.write(json.dumps(date_params, indent=2))
+
+print("\nSTEP 1 complete: directories created and query saved.")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i==1 else " "
+    print(f"{i}. [{chk}] {s}")
+
+base = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
+
+def http_get(url, params, timeout=60):
+    full = url + "?" + urlencode(params)
+    with urlopen(full, timeout=timeout) as resp:
+        return resp.read().decode("utf-8")
+
+# Step 2: ESearch
+esearch_url = base + "esearch.fcgi"
+params = {"db":"pubmed","term":query,"retmax":100000,"retmode":"json", **date_params}
+esearch_text = http_get(esearch_url, params)
+data = json.loads(esearch_text)
+pmids = data["esearchresult"].get("idlist", [])
+count = int(data["esearchresult"].get("count","0"))
+print(f"\nSTEP 2: ESearch returned count={count}, retrieved PMIDs={len(pmids)}")
+with open(os.path.join(tmp_dir,"esearch.json"),"w") as f:
+    json.dump(data, f, indent=2)
+
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i<=2 else " "
+    print(f"{i}. [{chk}] {s}")
+
+# Step 3: EFetch in batches
+efetch_url = base + "efetch.fcgi"
+
+def fetch_batch(id_batch):
+    params = {"db":"pubmed","id":",".join(id_batch),"retmode":"xml"}
+    return http_get(efetch_url, params, timeout=120)
+
+articles = {}
+batch_size = 200
+for i in range(0, len(pmids), batch_size):
+    batch = pmids[i:i+batch_size]
+    xml_text = fetch_batch(batch)
+    xml_path = os.path.join(tmp_dir, f"efetch_{i//batch_size:04d}.xml")
+    with open(xml_path,"w") as f:
+        f.write(xml_text)
+
+    soup = BeautifulSoup(xml_text, "xml")
+    for art in soup.find_all("PubmedArticle"):
+        pmid = art.find("PMID").get_text(strip=True) if art.find("PMID") else None
+        if not pmid:
+            continue
+        title = art.find("ArticleTitle").get_text(" ", strip=True) if art.find("ArticleTitle") else ""
+        abst_nodes = art.find_all("AbstractText")
+        abstract = " ".join([n.get_text(" ", strip=True) for n in abst_nodes]) if abst_nodes else ""
+        articles[pmid] = {"title": title, "abstract": abstract}
+
+print(f"\nSTEP 3: fetched and parsed {len(articles)} articles")
+with open(os.path.join(tmp_dir,"parsed_articles.json"),"w") as f:
+    json.dump(articles, f, indent=2)
+
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i<=3 else " "
+    print(f"{i}. [{chk}] {s}")
+
+# Step 4: Screening
+other_drug_markers = [
+"warfarin","theophylline","tizanidine","cyclosporine","clozapine","duloxetine","methotrexate",
+"metronidazole","rifampin","rifampicin","probenecid","phenytoin","digoxin","insulin",
+"caffeine","omeprazole","sucralfate","antacid","iron","zinc","calcium","magnesium",
+"clopidogrel","apixaban","rivaroxaban","dabigatran","amiodarone","fluconazole",
+"azithromycin","clarithromycin","linezolid","vancomycin","gentamicin"
+]
+exclude_terms = [
+"food-drug","food drug","diet","meal","nutrition","grapefruit",
+"pharmacogen","genetic","gene ","genes ","genotype","polymorphism","cyp2","cyp3","cyp1a2"
+]
+non_ddi_focus_terms = [
+"antimicrobial susceptibility","minimum inhibitory concentration","mic",
+"biofilm","resistance","resistant","synergistic activity","checkerboard","time-kill"
+]
+
+def accepted(title, abstract):
+    text = (title + " " + abstract).lower()
+    if "ciprofloxacin" not in text:
+        return False
+    if any(t in text for t in exclude_terms):
+        return False
+    ddi_signal = any(k in text for k in [
+        "drug-drug","drug drug","interaction","concomitant","coadministr","co-admin",
+        "pharmacokinetic","auc","cmax","clearance","inhibit","induc","exposure","qt"
+    ])
+    if not ddi_signal:
+        return False
+    if any(t in text for t in non_ddi_focus_terms) and not any(k in text for k in [
+        "pharmacokinetic","auc","cmax","clearance","toxicity","bleeding","serum concentration","plasma concentration"
+    ]):
+        return False
+    other = any(m in text for m in other_drug_markers)
+    if not other and re.search(r"ciprofloxacin (and|with) [a-z0-9\-]{3,}", text):
+        other = True
+    return other
+
+results = []
+for pmid in pmids:
+    meta = articles.get(pmid, {"title":"","abstract":""})
+    results.append({"PMID": str(pmid), "Accepted": bool(accepted(meta["title"], meta["abstract"]))})
+
+with open(os.path.join(tmp_dir,"screening_results.json"),"w") as f:
+    json.dump(results, f, indent=2)
+
+n_acc = sum(1 for x in results if x["Accepted"])
+print(f"\nSTEP 4: screening complete. Accepted={n_acc}/{len(results)}")
+print("Sample Accepted PMIDs:", [x["PMID"] for x in results if x["Accepted"]][:10])
+
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i<=4 else " "
+    print(f"{i}. [{chk}] {s}")
+
+# Step 5: Write output
+with open(out_path, "w") as f:
+    json.dump(results, f, indent=2)
+
+print(f"\nSTEP 5: wrote final JSON to {out_path}")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    print(f"{i}. [✓] {s}")
+
+summary = {
+    "query": query,
+    "date_params": date_params,
+    "initial_count": count,
+    "retrieved_pmids": len(pmids),
+    "accepted": n_acc,
+    "timestamp": datetime.utcnow().isoformat()+"Z"
+}
+with open(os.path.join(tmp_dir,"run_summary.json"),"w") as f:
+    json.dump(summary, f, indent=2)
+print("\nRun summary:", summary)
+</execute>
+<observation>NameError("name 'urlencode' is not defined")</observation>
+<execute>
+#!/usr/bin/env python3
+import os, json, re
+from datetime import datetime
+import urllib.parse
+from urllib.request import urlopen
+from bs4 import BeautifulSoup
+
+# ========== Plan ==========
+plan = [
+"Set up required directories and define the PubMed query with inclusion/exclusion filters and date limits.",
+"Run the initial PubMed search (ESearch) and collect all PMIDs.",
+"Fetch article metadata/abstracts in batches (EFetch) and parse titles/abstracts.",
+"Screen abstracts for Ciprofloxacin DDIs (exclude food/gene topics; include clinical/pharmacological DDI with another drug) and assign Accepted flags.",
+"Write the full PMID list with Accepted flags to the required JSON path."
+]
+
+print("PLAN (checklist):")
+for i,s in enumerate(plan,1):
+    print(f"{i}. [ ] {s}")
+
+tmp_dir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/ddinter_retrieval/"
+out_path = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/ddinter_retrieval.json"
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+query = (
+    '(ciprofloxacin[Title/Abstract] OR Ciprofloxacin[MeSH Terms]) AND '
+    '("Drug Interactions"[MeSH Terms] OR "drug-drug interaction"[Title/Abstract] OR "drug drug interaction"[Title/Abstract] OR DDI[Title/Abstract]) '
+    'NOT ("Food-Drug Interactions"[MeSH Terms] OR food[Title] OR "Pharmacogenetics"[MeSH Terms] OR gene[Title/Abstract])'
+)
+date_params = {"mindate":"2021/01/01","maxdate":"2021/03/01","datetype":"pdat"}
+
+with open(os.path.join(tmp_dir,"query.txt"),"w") as f:
+    f.write(query+"\n")
+    f.write(json.dumps(date_params, indent=2))
+
+print("\nSTEP 1 complete: directories created and query saved.")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i==1 else " "
+    print(f"{i}. [{chk}] {s}")
+
+base = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
+
+def http_get(url, params, timeout=60):
+    full = url + "?" + urllib.parse.urlencode(params)
+    with urlopen(full, timeout=timeout) as resp:
+        return resp.read().decode("utf-8")
+
+# Step 2: ESearch
+esearch_url = base + "esearch.fcgi"
+params = {"db":"pubmed","term":query,"retmax":100000,"retmode":"json", **date_params}
+esearch_text = http_get(esearch_url, params)
+data = json.loads(esearch_text)
+pmids = data["esearchresult"].get("idlist", [])
+count = int(data["esearchresult"].get("count","0"))
+print(f"\nSTEP 2: ESearch returned count={count}, retrieved PMIDs={len(pmids)}")
+with open(os.path.join(tmp_dir,"esearch.json"),"w") as f:
+    json.dump(data, f, indent=2)
+
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i<=2 else " "
+    print(f"{i}. [{chk}] {s}")
+
+# Step 3: EFetch in batches
+efetch_url = base + "efetch.fcgi"
+
+def fetch_batch(id_batch):
+    params = {"db":"pubmed","id":",".join(id_batch),"retmode":"xml"}
+    return http_get(efetch_url, params, timeout=120)
+
+articles = {}
+batch_size = 200
+for i in range(0, len(pmids), batch_size):
+    batch = pmids[i:i+batch_size]
+    xml_text = fetch_batch(batch)
+    xml_path = os.path.join(tmp_dir, f"efetch_{i//batch_size:04d}.xml")
+    with open(xml_path,"w") as f:
+        f.write(xml_text)
+
+    soup = BeautifulSoup(xml_text, "xml")
+    for art in soup.find_all("PubmedArticle"):
+        pmid = art.find("PMID").get_text(strip=True) if art.find("PMID") else None
+        if not pmid:
+            continue
+        title = art.find("ArticleTitle").get_text(" ", strip=True) if art.find("ArticleTitle") else ""
+        abst_nodes = art.find_all("AbstractText")
+        abstract = " ".join([n.get_text(" ", strip=True) for n in abst_nodes]) if abst_nodes else ""
+        articles[pmid] = {"title": title, "abstract": abstract}
+
+print(f"\nSTEP 3: fetched and parsed {len(articles)} articles")
+with open(os.path.join(tmp_dir,"parsed_articles.json"),"w") as f:
+    json.dump(articles, f, indent=2)
+
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i<=3 else " "
+    print(f"{i}. [{chk}] {s}")
+
+# Step 4: Screening
+other_drug_markers = [
+"warfarin","theophylline","tizanidine","cyclosporine","clozapine","duloxetine","methotrexate",
+"metronidazole","rifampin","rifampicin","probenecid","phenytoin","digoxin","insulin",
+"caffeine","omeprazole","sucralfate","antacid","iron","zinc","calcium","magnesium",
+"clopidogrel","apixaban","rivaroxaban","dabigatran","amiodarone","fluconazole",
+"azithromycin","clarithromycin","linezolid","vancomycin","gentamicin"
+]
+exclude_terms = [
+"food-drug","food drug","diet","meal","nutrition","grapefruit",
+"pharmacogen","genetic","gene ","genes ","genotype","polymorphism","cyp2","cyp3","cyp1a2"
+]
+non_ddi_focus_terms = [
+"antimicrobial susceptibility","minimum inhibitory concentration","mic",
+"biofilm","resistance","resistant","synergistic activity","checkerboard","time-kill"
+]
+
+def accepted(title, abstract):
+    text = (title + " " + abstract).lower()
+    if "ciprofloxacin" not in text:
+        return False
+    if any(t in text for t in exclude_terms):
+        return False
+    ddi_signal = any(k in text for k in [
+        "drug-drug","drug drug","interaction","concomitant","coadministr","co-admin",
+        "pharmacokinetic","auc","cmax","clearance","inhibit","induc","exposure","qt"
+    ])
+    if not ddi_signal:
+        return False
+    if any(t in text for t in non_ddi_focus_terms) and not any(k in text for k in [
+        "pharmacokinetic","auc","cmax","clearance","toxicity","bleeding","serum concentration","plasma concentration"
+    ]):
+        return False
+    other = any(m in text for m in other_drug_markers)
+    if not other and re.search(r"ciprofloxacin (and|with) [a-z0-9\-]{3,}", text):
+        other = True
+    return other
+
+results = []
+for pmid in pmids:
+    meta = articles.get(pmid, {"title":"","abstract":""})
+    results.append({"PMID": str(pmid), "Accepted": bool(accepted(meta["title"], meta["abstract"]))})
+
+with open(os.path.join(tmp_dir,"screening_results.json"),"w") as f:
+    json.dump(results, f, indent=2)
+
+n_acc = sum(1 for x in results if x["Accepted"])
+print(f"\nSTEP 4: screening complete. Accepted={n_acc}/{len(results)}")
+print("Sample Accepted PMIDs:", [x["PMID"] for x in results if x["Accepted"]][:10])
+
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i<=4 else " "
+    print(f"{i}. [{chk}] {s}")
+
+# Step 5: Write output
+with open(out_path, "w") as f:
+    json.dump(results, f, indent=2)
+
+print(f"\nSTEP 5: wrote final JSON to {out_path}")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    print(f"{i}. [✓] {s}")
+
+summary = {
+    "query": query,
+    "date_params": date_params,
+    "initial_count": count,
+    "retrieved_pmids": len(pmids),
+    "accepted": n_acc,
+    "timestamp": datetime.utcnow().isoformat()+"Z"
+}
+with open(os.path.join(tmp_dir,"run_summary.json"),"w") as f:
+    json.dump(summary, f, indent=2)
+print("\nRun summary:", summary)
+</execute>
+<observation>NameError("name 'urllib' is not defined")</observation>
+<execute>
+#!/usr/bin/env python3
+# NOTE: Using only fully-qualified imports to avoid NameError issues in this environment.
+
+import os, json, re
+from datetime import datetime
+from urllib.request import urlopen
+from urllib.parse import urlencode
+from bs4 import BeautifulSoup
+
+# ========== Plan ==========
+plan = [
+"Set up required directories and define the PubMed query with inclusion/exclusion filters and date limits.",
+"Run the initial PubMed search (ESearch) and collect all PMIDs.",
+"Fetch article metadata/abstracts in batches (EFetch) and parse titles/abstracts.",
+"Screen abstracts for Ciprofloxacin DDIs (exclude food/gene topics; include clinical/pharmacological DDI with another drug) and assign Accepted flags.",
+"Write the full PMID list with Accepted flags to the required JSON path."
+]
+
+def print_plan(done_upto=0, failed_step=None, fail_reason=None, extra_steps=None):
+    steps = plan[:]
+    if extra_steps:
+        steps = steps[:failed_step] + extra_steps + steps[failed_step:]
+    for i,s in enumerate(steps,1):
+        if failed_step is not None and i == failed_step:
+            print(f"{i}. [✗] {s} (failed because {fail_reason})")
+        else:
+            chk = "✓" if i<=done_upto else " "
+            print(f"{i}. [{chk}] {s}")
+
+print("PLAN (checklist):")
+print_plan(done_upto=0)
+
+# ========== Step 1 ==========
+tmp_dir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/ddinter_retrieval/"
+out_path = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/ddinter_retrieval.json"
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+query = (
+    '(ciprofloxacin[Title/Abstract] OR Ciprofloxacin[MeSH Terms]) AND '
+    '("Drug Interactions"[MeSH Terms] OR "drug-drug interaction"[Title/Abstract] OR "drug drug interaction"[Title/Abstract] OR DDI[Title/Abstract]) '
+    'NOT ("Food-Drug Interactions"[MeSH Terms] OR food[Title] OR "Pharmacogenetics"[MeSH Terms] OR gene[Title/Abstract])'
+)
+date_params = {"mindate":"2021/01/01","maxdate":"2021/03/01","datetype":"pdat"}
+
+with open(os.path.join(tmp_dir,"query.txt"),"w") as f:
+    f.write(query+"\n")
+    f.write(json.dumps(date_params, indent=2))
+
+print("\nSTEP 1 complete.")
+print("\nUPDATED PLAN:")
+print_plan(done_upto=1)
+
+# Helper HTTP GET
+base = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
+def http_get(url, params, timeout=60):
+    # IMPORTANT: use urlencode imported directly; do not reference urllib.*
+    full = url + "?" + urlencode(params)
+    with urlopen(full, timeout=timeout) as resp:
+        return resp.read().decode("utf-8")
+
+# ========== Step 2: ESearch ==========
+esearch_url = base + "esearch.fcgi"
+params = {"db":"pubmed","term":query,"retmax":100000,"retmode":"json", **date_params}
+esearch_text = http_get(esearch_url, params, timeout=60)
+data = json.loads(esearch_text)
+pmids = data["esearchresult"].get("idlist", [])
+count = int(data["esearchresult"].get("count","0"))
+
+print(f"\nSTEP 2 complete: count={count}, retrieved={len(pmids)}")
+with open(os.path.join(tmp_dir,"esearch.json"),"w") as f:
+    json.dump(data, f, indent=2)
+
+print("\nUPDATED PLAN:")
+print_plan(done_upto=2)
+
+# ========== Step 3: EFetch + parse ==========
+efetch_url = base + "efetch.fcgi"
+def fetch_batch(id_batch):
+    params = {"db":"pubmed","id":",".join(id_batch),"retmode":"xml"}
+    return http_get(efetch_url, params, timeout=120)
+
+articles = {}
+batch_size = 200
+for i in range(0, len(pmids), batch_size):
+    batch = pmids[i:i+batch_size]
+    xml_text = fetch_batch(batch)
+    xml_path = os.path.join(tmp_dir, f"efetch_{i//batch_size:04d}.xml")
+    with open(xml_path,"w") as f:
+        f.write(xml_text)
+
+    soup = BeautifulSoup(xml_text, "xml")
+    for art in soup.find_all("PubmedArticle"):
+        pmid = art.find("PMID").get_text(strip=True) if art.find("PMID") else None
+        if not pmid:
+            continue
+        title = art.find("ArticleTitle").get_text(" ", strip=True) if art.find("ArticleTitle") else ""
+        abst_nodes = art.find_all("AbstractText")
+        abstract = " ".join([n.get_text(" ", strip=True) for n in abst_nodes]) if abst_nodes else ""
+        articles[pmid] = {"title": title, "abstract": abstract}
+
+print(f"\nSTEP 3 complete: parsed_articles={len(articles)}")
+with open(os.path.join(tmp_dir,"parsed_articles.json"),"w") as f:
+    json.dump(articles, f, indent=2)
+
+print("\nUPDATED PLAN:")
+print_plan(done_upto=3)
+
+# ========== Step 4: Screening ==========
+other_drug_markers = [
+"warfarin","theophylline","tizanidine","cyclosporine","clozapine","duloxetine","methotrexate",
+"metronidazole","rifampin","rifampicin","probenecid","phenytoin","digoxin",
+"clopidogrel","apixaban","rivaroxaban","dabigatran","amiodarone","fluconazole",
+"azithromycin","clarithromycin","linezolid","vancomycin","gentamicin",
+# include common formulation interaction agents (not food)
+"sucralfate","antacid","iron","zinc","calcium","magnesium"
+]
+exclude_terms = [
+"food-drug","food drug","diet","meal","nutrition","grapefruit",
+"pharmacogen","pharmacogenetic","genetic","genotype","polymorphism",
+" gene"," genes","cyp2","cyp3","cyp1a2"
+]
+non_ddi_focus_terms = [
+"antimicrobial susceptibility","minimum inhibitory concentration"," mic",
+"biofilm","resistance","resistant","synergistic activity","checkerboard","time-kill"
+]
+
+def is_accepted(title, abstract):
+    text = (title + " " + abstract).lower()
+    if "ciprofloxacin" not in text:
+        return False
+    if any(t in text for t in exclude_terms):
+        return False
+    ddi_signal = any(k in text for k in [
+        "drug-drug","drug drug","interaction","concomitant","coadministr","co-admin",
+        "pharmacokinetic","auc","cmax","clearance","inhibit","induc","exposure","qt"
+    ])
+    if not ddi_signal:
+        return False
+    if any(t in text for t in non_ddi_focus_terms) and not any(k in text for k in [
+        "pharmacokinetic","auc","cmax","clearance","toxicity","bleeding","serum concentration","plasma concentration"
+    ]):
+        return False
+    other = any(m in text for m in other_drug_markers)
+    if not other and re.search(r"ciprofloxacin (and|with) [a-z0-9\-]{3,}", text):
+        other = True
+    return other
+
+results = []
+for pmid in pmids:
+    meta = articles.get(pmid, {"title":"","abstract":""})
+    results.append({"PMID": str(pmid), "Accepted": bool(is_accepted(meta["title"], meta["abstract"]))})
+
+n_acc = sum(1 for x in results if x["Accepted"])
+with open(os.path.join(tmp_dir,"screening_results.json"),"w") as f:
+    json.dump(results, f, indent=2)
+
+print(f"\nSTEP 4 complete: Accepted={n_acc}/{len(results)}")
+print("Sample Accepted PMIDs:", [x["PMID"] for x in results if x["Accepted"]][:10])
+
+print("\nUPDATED PLAN:")
+print_plan(done_upto=4)
+
+# ========== Step 5: Write final JSON ==========
+with open(out_path, "w") as f:
+    json.dump(results, f, indent=2)
+
+summary = {
+    "query": query,
+    "date_params": date_params,
+    "initial_count": count,
+    "retrieved_pmids": len(pmids),
+    "accepted": n_acc,
+    "timestamp": datetime.utcnow().isoformat()+"Z"
+}
+with open(os.path.join(tmp_dir,"run_summary.json"),"w") as f:
+    json.dump(summary, f, indent=2)
+
+print(f"\nSTEP 5 complete: wrote {out_path}")
+print("\nUPDATED PLAN:")
+print_plan(done_upto=5)
+print("\nRun summary:", summary)
+</execute>
+<observation>NameError("name 'plan' is not defined")</observation>
+<execute>
+#!/usr/bin/env python3
+# Clean, single-run script without cross-cell state reliance.
+
+import os, json, re
+from datetime import datetime
+from urllib.request import urlopen
+from urllib.parse import urlencode
+from bs4 import BeautifulSoup
+
+# ========== Plan ==========
+PLAN = [
+"Set up required directories and define the PubMed query with inclusion/exclusion filters and date limits.",
+"Run the initial PubMed search (ESearch) and collect all PMIDs.",
+"Fetch article metadata/abstracts in batches (EFetch) and parse titles/abstracts.",
+"Screen abstracts for Ciprofloxacin DDIs (exclude food/gene topics; include clinical/pharmacological DDI with another drug) and assign Accepted flags.",
+"Write the full PMID list with Accepted flags to the required JSON path."
+]
+
+def show_plan(done_upto=0):
+    for i, s in enumerate(PLAN, 1):
+        chk = "✓" if i <= done_upto else " "
+        print(f"{i}. [{chk}] {s}")
+
+print("PLAN (checklist):")
+show_plan(0)
+
+# ========== Step 1 ==========
+tmp_dir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/ddinter_retrieval/"
+out_path = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/ddinter_retrieval.json"
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+query = (
+    '(ciprofloxacin[Title/Abstract] OR Ciprofloxacin[MeSH Terms]) AND '
+    '("Drug Interactions"[MeSH Terms] OR "drug-drug interaction"[Title/Abstract] OR "drug drug interaction"[Title/Abstract] OR DDI[Title/Abstract]) '
+    'NOT ("Food-Drug Interactions"[MeSH Terms] OR food[Title] OR "Pharmacogenetics"[MeSH Terms] OR gene[Title/Abstract])'
+)
+date_params = {"mindate": "2021/01/01", "maxdate": "2021/03/01", "datetype": "pdat"}
+
+with open(os.path.join(tmp_dir, "query.txt"), "w") as f:
+    f.write(query + "\n")
+    f.write(json.dumps(date_params, indent=2))
+
+print("\nSTEP 1 complete.")
+print("\nUPDATED PLAN:")
+show_plan(1)
+
+# HTTP helper
+BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
+def http_get(endpoint, params, timeout=60):
+    url = BASE + endpoint + "?" + urlencode(params)
+    with urlopen(url, timeout=timeout) as resp:
+        return resp.read().decode("utf-8")
+
+# ========== Step 2: ESearch ==========
+esearch_params = {"db": "pubmed", "term": query, "retmax": 100000, "retmode": "json", **date_params}
+esearch_text = http_get("esearch.fcgi", esearch_params, timeout=60)
+esearch_json = json.loads(esearch_text)
+
+pmids = esearch_json["esearchresult"].get("idlist", [])
+count = int(esearch_json["esearchresult"].get("count", "0"))
+
+with open(os.path.join(tmp_dir, "esearch.json"), "w") as f:
+    json.dump(esearch_json, f, indent=2)
+
+print(f"\nSTEP 2 complete: count={count}, retrieved={len(pmids)} PMIDs.")
+print("\nUPDATED PLAN:")
+show_plan(2)
+
+# ========== Step 3: EFetch + parse ==========
+def efetch_xml(id_batch):
+    params = {"db": "pubmed", "id": ",".join(id_batch), "retmode": "xml"}
+    return http_get("efetch.fcgi", params, timeout=120)
+
+articles = {}
+batch_size = 200
+for i in range(0, len(pmids), batch_size):
+    batch = pmids[i:i+batch_size]
+    xml_text = efetch_xml(batch)
+
+    xml_path = os.path.join(tmp_dir, f"efetch_{i//batch_size:04d}.xml")
+    with open(xml_path, "w") as f:
+        f.write(xml_text)
+
+    soup = BeautifulSoup(xml_text, "xml")
+    for art in soup.find_all("PubmedArticle"):
+        pmid_tag = art.find("PMID")
+        if not pmid_tag:
+            continue
+        pmid = pmid_tag.get_text(strip=True)
+        title_tag = art.find("ArticleTitle")
+        title = title_tag.get_text(" ", strip=True) if title_tag else ""
+        abst_nodes = art.find_all("AbstractText")
+        abstract = " ".join(n.get_text(" ", strip=True) for n in abst_nodes) if abst_nodes else ""
+        articles[pmid] = {"title": title, "abstract": abstract}
+
+with open(os.path.join(tmp_dir, "parsed_articles.json"), "w") as f:
+    json.dump(articles, f, indent=2)
+
+print(f"\nSTEP 3 complete: parsed={len(articles)} articles.")
+print("\nUPDATED PLAN:")
+show_plan(3)
+
+# ========== Step 4: Screening ==========
+other_drug_markers = [
+    "warfarin","theophylline","tizanidine","cyclosporine","clozapine","duloxetine","methotrexate",
+    "metronidazole","rifampin","rifampicin","probenecid","phenytoin","digoxin",
+    "clopidogrel","apixaban","rivaroxaban","dabigatran","amiodarone","fluconazole",
+    "azithromycin","clarithromycin","linezolid","vancomycin","gentamicin",
+    "sucralfate","antacid","iron","zinc","calcium","magnesium"
+]
+exclude_terms = [
+    "food-drug","food drug","diet","meal","nutrition","grapefruit",
+    "pharmacogen","pharmacogenetic","genetic","genotype","polymorphism",
+    " gene"," genes","cyp2","cyp3","cyp1a2"
+]
+non_ddi_focus_terms = [
+    "antimicrobial susceptibility","minimum inhibitory concentration"," mic",
+    "biofilm","resistance","resistant","synergistic activity","checkerboard","time-kill"
+]
+
+def is_accepted(title, abstract):
+    text = (title + " " + abstract).lower()
+    if "ciprofloxacin" not in text:
+        return False
+    if any(t in text for t in exclude_terms):
+        return False
+    ddi_signal = any(k in text for k in [
+        "drug-drug","drug drug","interaction","concomitant","coadministr","co-admin",
+        "pharmacokinetic","auc","cmax","clearance","inhibit","induc","exposure","qt"
+    ])
+    if not ddi_signal:
+        return False
+    if any(t in text for t in non_ddi_focus_terms) and not any(k in text for k in [
+        "pharmacokinetic","auc","cmax","clearance","toxicity","bleeding","serum concentration","plasma concentration"
+    ]):
+        return False
+    other = any(m in text for m in other_drug_markers)
+    if not other and re.search(r"ciprofloxacin (and|with) [a-z0-9\-]{3,}", text):
+        other = True
+    return other
+
+results = []
+for pmid in pmids:
+    meta = articles.get(pmid, {"title": "", "abstract": ""})
+    results.append({"PMID": str(pmid), "Accepted": bool(is_accepted(meta["title"], meta["abstract"]))})
+
+n_acc = sum(1 for x in results if x["Accepted"])
+with open(os.path.join(tmp_dir, "screening_results.json"), "w") as f:
+    json.dump(results, f, indent=2)
+
+print(f"\nSTEP 4 complete: Accepted={n_acc}/{len(results)}")
+print("Sample Accepted PMIDs:", [x["PMID"] for x in results if x["Accepted"]][:10])
+
+print("\nUPDATED PLAN:")
+show_plan(4)
+
+# ========== Step 5: Write final ==========
+with open(out_path, "w") as f:
+    json.dump(results, f, indent=2)
+
+summary = {
+    "query": query,
+    "date_params": date_params,
+    "initial_count": count,
+    "retrieved_pmids": len(pmids),
+    "accepted": n_acc,
+    "timestamp": datetime.utcnow().isoformat() + "Z"
+}
+with open(os.path.join(tmp_dir, "run_summary.json"), "w") as f:
+    json.dump(summary, f, indent=2)
+
+print(f"\nSTEP 5 complete: wrote output JSON to {out_path}")
+print("\nUPDATED PLAN:")
+show_plan(5)
+print("\nRun summary:", summary)
+</execute>
+<observation>NameError("name 'PLAN' is not defined")</observation>
+<execute>
+#!/usr/bin/env python3
+# This cell only defines the plan and prints it, to ensure state is set.
+
+PLAN = [
+"Set up required directories and define the PubMed query with inclusion/exclusion filters and date limits.",
+"Run the initial PubMed search (ESearch) and collect all PMIDs.",
+"Fetch article metadata/abstracts in batches (EFetch) and parse titles/abstracts.",
+"Screen abstracts for Ciprofloxacin DDIs (exclude food/gene topics; include clinical/pharmacological DDI with another drug) and assign Accepted flags.",
+"Write the full PMID list with Accepted flags to the required JSON path."
+]
+
+def show_plan(done_upto=0):
+    for i, s in enumerate(PLAN, 1):
+        chk = "✓" if i <= done_upto else " "
+        print(f"{i}. [{chk}] {s}")
+
+print("PLAN (checklist):")
+show_plan(0)
+</execute>
+<observation>NameError("name 'PLAN' is not defined")</observation>
+<execute>
+#!/usr/bin/env python3
+# Single-step run WITHOUT any plan variables to avoid environment state issues.
+
+import os, json, re
+from datetime import datetime
+from urllib.request import urlopen
+from urllib.parse import urlencode
+from bs4 import BeautifulSoup
+
+# ---------- Checklist (printed once) ----------
+checklist = [
+"Set up required directories and define the PubMed query with inclusion/exclusion filters and date limits.",
+"Run the initial PubMed search (ESearch) and collect all PMIDs.",
+"Fetch article metadata/abstracts in batches (EFetch) and parse titles/abstracts.",
+"Screen abstracts for Ciprofloxacin DDIs (exclude food/gene topics; include clinical/pharmacological DDI with another drug) and assign Accepted flags.",
+"Write the full PMID list with Accepted flags to the required JSON path."
+]
+print("PLAN (checklist):")
+for i,s in enumerate(checklist,1):
+    print(f"{i}. [ ] {s}")
+
+# ---------- Step 1 ----------
+tmp_dir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/ddinter_retrieval/"
+out_path = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/ddinter_retrieval.json"
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+query = (
+    '(ciprofloxacin[Title/Abstract] OR Ciprofloxacin[MeSH Terms]) AND '
+    '("Drug Interactions"[MeSH Terms] OR "drug-drug interaction"[Title/Abstract] OR "drug drug interaction"[Title/Abstract] OR DDI[Title/Abstract]) '
+    'NOT ("Food-Drug Interactions"[MeSH Terms] OR food[Title] OR "Pharmacogenetics"[MeSH Terms] OR gene[Title/Abstract])'
+)
+date_params = {"mindate": "2021/01/01", "maxdate": "2021/03/01", "datetype": "pdat"}
+
+with open(os.path.join(tmp_dir, "query.txt"), "w") as f:
+    f.write(query + "\n")
+    f.write(json.dumps(date_params, indent=2))
+
+print("\nUPDATED PLAN:")
+for i,s in enumerate(checklist,1):
+    print(f"{i}. [{'✓' if i<=1 else ' '}] {s}")
+
+# HTTP helper
+BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
+def http_get(endpoint, params, timeout=60):
+    url = BASE + endpoint + "?" + urlencode(params)
+    with urlopen(url, timeout=timeout) as resp:
+        return resp.read().decode("utf-8")
+
+# ---------- Step 2: ESearch ----------
+esearch_params = {"db": "pubmed", "term": query, "retmax": 100000, "retmode": "json", **date_params}
+esearch_text = http_get("esearch.fcgi", esearch_params, timeout=60)
+esearch_json = json.loads(esearch_text)
+
+pmids = esearch_json["esearchresult"].get("idlist", [])
+count = int(esearch_json["esearchresult"].get("count", "0"))
+
+with open(os.path.join(tmp_dir, "esearch.json"), "w") as f:
+    json.dump(esearch_json, f, indent=2)
+
+print(f"\nSTEP 2: count={count}, retrieved={len(pmids)} PMIDs")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(checklist,1):
+    print(f"{i}. [{'✓' if i<=2 else ' '}] {s}")
+
+# ---------- Step 3: EFetch + parse ----------
+def efetch_xml(id_batch):
+    params = {"db": "pubmed", "id": ",".join(id_batch), "retmode": "xml"}
+    return http_get("efetch.fcgi", params, timeout=120)
+
+articles = {}
+batch_size = 200
+for i in range(0, len(pmids), batch_size):
+    batch = pmids[i:i+batch_size]
+    xml_text = efetch_xml(batch)
+
+    xml_path = os.path.join(tmp_dir, f"efetch_{i//batch_size:04d}.xml")
+    with open(xml_path, "w") as f:
+        f.write(xml_text)
+
+    soup = BeautifulSoup(xml_text, "xml")
+    for art in soup.find_all("PubmedArticle"):
+        pmid_tag = art.find("PMID")
+        if not pmid_tag:
+            continue
+        pmid = pmid_tag.get_text(strip=True)
+        title_tag = art.find("ArticleTitle")
+        title = title_tag.get_text(" ", strip=True) if title_tag else ""
+        abst_nodes = art.find_all("AbstractText")
+        abstract = " ".join(n.get_text(" ", strip=True) for n in abst_nodes) if abst_nodes else ""
+        articles[pmid] = {"title": title, "abstract": abstract}
+
+with open(os.path.join(tmp_dir, "parsed_articles.json"), "w") as f:
+    json.dump(articles, f, indent=2)
+
+print(f"\nSTEP 3: parsed={len(articles)} articles")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(checklist,1):
+    print(f"{i}. [{'✓' if i<=3 else ' '}] {s}")
+
+# ---------- Step 4: Screening ----------
+other_drug_markers = [
+    "warfarin","theophylline","tizanidine","cyclosporine","clozapine","duloxetine","methotrexate",
+    "metronidazole","rifampin","rifampicin","probenecid","phenytoin","digoxin",
+    "clopidogrel","apixaban","rivaroxaban","dabigatran","amiodarone","fluconazole",
+    "azithromycin","clarithromycin","linezolid","vancomycin","gentamicin",
+    "sucralfate","antacid","iron","zinc","calcium","magnesium"
+]
+exclude_terms = [
+    "food-drug","food drug","diet","meal","nutrition","grapefruit",
+    "pharmacogen","pharmacogenetic","genetic","genotype","polymorphism",
+    " gene"," genes","cyp2","cyp3","cyp1a2"
+]
+non_ddi_focus_terms = [
+    "antimicrobial susceptibility","minimum inhibitory concentration"," mic",
+    "biofilm","resistance","resistant","synergistic activity","checkerboard","time-kill"
+]
+
+def is_accepted(title, abstract):
+    text = (title + " " + abstract).lower()
+    if "ciprofloxacin" not in text:
+        return False
+    if any(t in text for t in exclude_terms):
+        return False
+    ddi_signal = any(k in text for k in [
+        "drug-drug","drug drug","interaction","concomitant","coadministr","co-admin",
+        "pharmacokinetic","auc","cmax","clearance","inhibit","induc","exposure","qt"
+    ])
+    if not ddi_signal:
+        return False
+    if any(t in text for t in non_ddi_focus_terms) and not any(k in text for k in [
+        "pharmacokinetic","auc","cmax","clearance","toxicity","bleeding","serum concentration","plasma concentration"
+    ]):
+        return False
+    other = any(m in text for m in other_drug_markers)
+    if not other and re.search(r"ciprofloxacin (and|with) [a-z0-9\-]{3,}", text):
+        other = True
+    return other
+
+results = []
+for pmid in pmids:
+    meta = articles.get(pmid, {"title": "", "abstract": ""})
+    results.append({"PMID": str(pmid), "Accepted": bool(is_accepted(meta["title"], meta["abstract"]))})
+
+n_acc = sum(1 for x in results if x["Accepted"])
+with open(os.path.join(tmp_dir, "screening_results.json"), "w") as f:
+    json.dump(results, f, indent=2)
+
+print(f"\nSTEP 4: Accepted={n_acc}/{len(results)}")
+print("Sample Accepted PMIDs:", [x["PMID"] for x in results if x["Accepted"]][:10])
+
+print("\nUPDATED PLAN:")
+for i,s in enumerate(checklist,1):
+    print(f"{i}. [{'✓' if i<=4 else ' '}] {s}")
+
+# ---------- Step 5: Write final ----------
+with open(out_path, "w") as f:
+    json.dump(results, f, indent=2)
+
+summary = {
+    "query": query,
+    "date_params": date_params,
+    "initial_count": count,
+    "retrieved_pmids": len(pmids),
+    "accepted": n_acc,
+    "timestamp": datetime.utcnow().isoformat() + "Z"
+}
+with open(os.path.join(tmp_dir, "run_summary.json"), "w") as f:
+    json.dump(summary, f, indent=2)
+
+print(f"\nSTEP 5: wrote output JSON to {out_path}")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(checklist,1):
+    print(f"{i}. [✓] {s}")
+
+print("\nRun summary:", summary)
+</execute>
+<observation>NameError("name 'BASE' is not defined")</observation>
+<execute>
+#!/usr/bin/env python3
+# Minimal, robust rerun: no helper functions depending on outer-scope variables.
+
+import os, json, re
+from datetime import datetime
+from urllib.request import urlopen
+from urllib.parse import urlencode
+from bs4 import BeautifulSoup
+
+tmp_dir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/ddinter_retrieval/"
+out_path = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/ddinter_retrieval.json"
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+checklist = [
+"Set up required directories and define the PubMed query with inclusion/exclusion filters and date limits.",
+"Run the initial PubMed search (ESearch) and collect all PMIDs.",
+"Fetch article metadata/abstracts in batches (EFetch) and parse titles/abstracts.",
+"Screen abstracts for Ciprofloxacin DDIs (exclude food/gene topics; include clinical/pharmacological DDI with another drug) and assign Accepted flags.",
+"Write the full PMID list with Accepted flags to the required JSON path."
+]
+print("PLAN (checklist):")
+for i,s in enumerate(checklist,1):
+    print(f"{i}. [ ] {s}")
+
+BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
+
+def get_text(full_url, timeout=60):
+    with urlopen(full_url, timeout=timeout) as resp:
+        return resp.read().decode("utf-8")
+
+# Step 1
+query = (
+    '(ciprofloxacin[Title/Abstract] OR Ciprofloxacin[MeSH Terms]) AND '
+    '("Drug Interactions"[MeSH Terms] OR "drug-drug interaction"[Title/Abstract] OR "drug drug interaction"[Title/Abstract] OR DDI[Title/Abstract]) '
+    'NOT ("Food-Drug Interactions"[MeSH Terms] OR food[Title] OR "Pharmacogenetics"[MeSH Terms] OR gene[Title/Abstract])'
+)
+date_params = {"mindate": "2021/01/01", "maxdate": "2021/03/01", "datetype": "pdat"}
+
+with open(os.path.join(tmp_dir, "query.txt"), "w") as f:
+    f.write(query + "\n")
+    f.write(json.dumps(date_params, indent=2))
+
+print("\nUPDATED PLAN:")
+for i,s in enumerate(checklist,1):
+    print(f"{i}. [{'✓' if i<=1 else ' '}] {s}")
+
+# Step 2: ESearch
+esearch_params = {"db": "pubmed", "term": query, "retmax": 100000, "retmode": "json", **date_params}
+esearch_url = BASE + "esearch.fcgi?" + urlencode(esearch_params)
+esearch_json = json.loads(get_text(esearch_url, timeout=60))
+pmids = esearch_json["esearchresult"].get("idlist", [])
+count = int(esearch_json["esearchresult"].get("count", "0"))
+
+with open(os.path.join(tmp_dir, "esearch.json"), "w") as f:
+    json.dump(esearch_json, f, indent=2)
+
+print(f"\nSTEP 2: count={count}, retrieved={len(pmids)} PMIDs")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(checklist,1):
+    print(f"{i}. [{'✓' if i<=2 else ' '}] {s}")
+
+# Step 3: EFetch + parse
+articles = {}
+batch_size = 200
+for i in range(0, len(pmids), batch_size):
+    batch = pmids[i:i+batch_size]
+    efetch_params = {"db": "pubmed", "id": ",".join(batch), "retmode": "xml"}
+    efetch_url = BASE + "efetch.fcgi?" + urlencode(efetch_params)
+    xml_text = get_text(efetch_url, timeout=120)
+
+    xml_path = os.path.join(tmp_dir, f"efetch_{i//batch_size:04d}.xml")
+    with open(xml_path, "w") as f:
+        f.write(xml_text)
+
+    soup = BeautifulSoup(xml_text, "xml")
+    for art in soup.find_all("PubmedArticle"):
+        pmid_tag = art.find("PMID")
+        if not pmid_tag:
+            continue
+        pmid = pmid_tag.get_text(strip=True)
+        title_tag = art.find("ArticleTitle")
+        title = title_tag.get_text(" ", strip=True) if title_tag else ""
+        abst_nodes = art.find_all("AbstractText")
+        abstract = " ".join(n.get_text(" ", strip=True) for n in abst_nodes) if abst_nodes else ""
+        articles[pmid] = {"title": title, "abstract": abstract}
+
+with open(os.path.join(tmp_dir, "parsed_articles.json"), "w") as f:
+    json.dump(articles, f, indent=2)
+
+print(f"\nSTEP 3: parsed={len(articles)} articles")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(checklist,1):
+    print(f"{i}. [{'✓' if i<=3 else ' '}] {s}")
+
+# Step 4: Screening
+other_drug_markers = [
+    "warfarin","theophylline","tizanidine","cyclosporine","clozapine","duloxetine","methotrexate",
+    "metronidazole","rifampin","rifampicin","probenecid","phenytoin","digoxin",
+    "clopidogrel","apixaban","rivaroxaban","dabigatran","amiodarone","fluconazole",
+    "azithromycin","clarithromycin","linezolid","vancomycin","gentamicin",
+    "sucralfate","antacid","iron","zinc","calcium","magnesium"
+]
+exclude_terms = [
+    "food-drug","food drug","diet","meal","nutrition","grapefruit",
+    "pharmacogen","pharmacogenetic","genetic","genotype","polymorphism",
+    " gene"," genes","cyp2","cyp3","cyp1a2"
+]
+non_ddi_focus_terms = [
+    "antimicrobial susceptibility","minimum inhibitory concentration"," mic",
+    "biofilm","resistance","resistant","synergistic activity","checkerboard","time-kill"
+]
+
+def is_accepted(title, abstract):
+    text = (title + " " + abstract).lower()
+    if "ciprofloxacin" not in text:
+        return False
+    if any(t in text for t in exclude_terms):
+        return False
+    ddi_signal = any(k in text for k in [
+        "drug-drug","drug drug","interaction","concomitant","coadministr","co-admin",
+        "pharmacokinetic","auc","cmax","clearance","inhibit","induc","exposure","qt"
+    ])
+    if not ddi_signal:
+        return False
+    if any(t in text for t in non_ddi_focus_terms) and not any(k in text for k in [
+        "pharmacokinetic","auc","cmax","clearance","toxicity","bleeding","serum concentration","plasma concentration"
+    ]):
+        return False
+    other = any(m in text for m in other_drug_markers)
+    if not other and re.search(r"ciprofloxacin (and|with) [a-z0-9\-]{3,}", text):
+        other = True
+    return other
+
+results = []
+for pmid in pmids:
+    meta = articles.get(pmid, {"title": "", "abstract": ""})
+    results.append({"PMID": str(pmid), "Accepted": bool(is_accepted(meta["title"], meta["abstract"]))})
+
+n_acc = sum(1 for x in results if x["Accepted"])
+with open(os.path.join(tmp_dir, "screening_results.json"), "w") as f:
+    json.dump(results, f, indent=2)
+
+print(f"\nSTEP 4: Accepted={n_acc}/{len(results)}")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(checklist,1):
+    print(f"{i}. [{'✓' if i<=4 else ' '}] {s}")
+
+# Step 5: Write output
+with open(out_path, "w") as f:
+    json.dump(results, f, indent=2)
+
+summary = {
+    "query": query,
+    "date_params": date_params,
+    "initial_count": count,
+    "retrieved_pmids": len(pmids),
+    "accepted": n_acc,
+    "timestamp": datetime.utcnow().isoformat() + "Z"
+}
+with open(os.path.join(tmp_dir, "run_summary.json"), "w") as f:
+    json.dump(summary, f, indent=2)
+
+print(f"\nSTEP 5: wrote {out_path}")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(checklist,1):
+    print(f"{i}. [✓] {s}")
+
+print("\nRun summary:", summary)
+</execute>
+<observation>NameError("name 'urlopen' is not defined")</observation>
+<execute>
+#!/usr/bin/env python3
+# Use fully-qualified stdlib names to avoid missing symbol issues.
+
+import os, json, re
+from datetime import datetime
+import urllib.request
+import urllib.parse
+from bs4 import BeautifulSoup
+
+tmp_dir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/ddinter_retrieval/"
+out_path = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/ddinter_retrieval.json"
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+checklist = [
+"Set up required directories and define the PubMed query with inclusion/exclusion filters and date limits.",
+"Run the initial PubMed search (ESearch) and collect all PMIDs.",
+"Fetch article metadata/abstracts in batches (EFetch) and parse titles/abstracts.",
+"Screen abstracts for Ciprofloxacin DDIs (exclude food/gene topics; include clinical/pharmacological DDI with another drug) and assign Accepted flags.",
+"Write the full PMID list with Accepted flags to the required JSON path."
+]
+print("PLAN (checklist):")
+for i,s in enumerate(checklist,1):
+    print(f"{i}. [ ] {s}")
+
+BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
+
+def get_text(full_url, timeout=60):
+    with urllib.request.urlopen(full_url, timeout=timeout) as resp:
+        return resp.read().decode("utf-8")
+
+# Step 1
+query = (
+    '(ciprofloxacin[Title/Abstract] OR Ciprofloxacin[MeSH Terms]) AND '
+    '("Drug Interactions"[MeSH Terms] OR "drug-drug interaction"[Title/Abstract] OR "drug drug interaction"[Title/Abstract] OR DDI[Title/Abstract]) '
+    'NOT ("Food-Drug Interactions"[MeSH Terms] OR food[Title] OR "Pharmacogenetics"[MeSH Terms] OR gene[Title/Abstract])'
+)
+date_params = {"mindate": "2021/01/01", "maxdate": "2021/03/01", "datetype": "pdat"}
+
+with open(os.path.join(tmp_dir, "query.txt"), "w") as f:
+    f.write(query + "\n")
+    f.write(json.dumps(date_params, indent=2))
+
+print("\nUPDATED PLAN:")
+for i,s in enumerate(checklist,1):
+    print(f"{i}. [{'✓' if i<=1 else ' '}] {s}")
+
+# Step 2
+esearch_params = {"db": "pubmed", "term": query, "retmax": 100000, "retmode": "json", **date_params}
+esearch_url = BASE + "esearch.fcgi?" + urllib.parse.urlencode(esearch_params)
+esearch_json = json.loads(get_text(esearch_url, timeout=60))
+pmids = esearch_json["esearchresult"].get("idlist", [])
+count = int(esearch_json["esearchresult"].get("count", "0"))
+
+with open(os.path.join(tmp_dir, "esearch.json"), "w") as f:
+    json.dump(esearch_json, f, indent=2)
+
+print(f"\nSTEP 2: count={count}, retrieved={len(pmids)} PMIDs")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(checklist,1):
+    print(f"{i}. [{'✓' if i<=2 else ' '}] {s}")
+
+# Step 3
+articles = {}
+batch_size = 200
+for i in range(0, len(pmids), batch_size):
+    batch = pmids[i:i+batch_size]
+    efetch_params = {"db": "pubmed", "id": ",".join(batch), "retmode": "xml"}
+    efetch_url = BASE + "efetch.fcgi?" + urllib.parse.urlencode(efetch_params)
+    xml_text = get_text(efetch_url, timeout=120)
+
+    xml_path = os.path.join(tmp_dir, f"efetch_{i//batch_size:04d}.xml")
+    with open(xml_path, "w") as f:
+        f.write(xml_text)
+
+    soup = BeautifulSoup(xml_text, "xml")
+    for art in soup.find_all("PubmedArticle"):
+        pmid_tag = art.find("PMID")
+        if not pmid_tag:
+            continue
+        pmid = pmid_tag.get_text(strip=True)
+        title_tag = art.find("ArticleTitle")
+        title = title_tag.get_text(" ", strip=True) if title_tag else ""
+        abst_nodes = art.find_all("AbstractText")
+        abstract = " ".join(n.get_text(" ", strip=True) for n in abst_nodes) if abst_nodes else ""
+        articles[pmid] = {"title": title, "abstract": abstract}
+
+with open(os.path.join(tmp_dir, "parsed_articles.json"), "w") as f:
+    json.dump(articles, f, indent=2)
+
+print(f"\nSTEP 3: parsed={len(articles)} articles")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(checklist,1):
+    print(f"{i}. [{'✓' if i<=3 else ' '}] {s}")
+
+# Step 4
+other_drug_markers = [
+    "warfarin","theophylline","tizanidine","cyclosporine","clozapine","duloxetine","methotrexate",
+    "metronidazole","rifampin","rifampicin","probenecid","phenytoin","digoxin",
+    "clopidogrel","apixaban","rivaroxaban","dabigatran","amiodarone","fluconazole",
+    "azithromycin","clarithromycin","linezolid","vancomycin","gentamicin",
+    "sucralfate","antacid","iron","zinc","calcium","magnesium"
+]
+exclude_terms = [
+    "food-drug","food drug","diet","meal","nutrition","grapefruit",
+    "pharmacogen","pharmacogenetic","genetic","genotype","polymorphism",
+    " gene"," genes","cyp2","cyp3","cyp1a2"
+]
+non_ddi_focus_terms = [
+    "antimicrobial susceptibility","minimum inhibitory concentration"," mic",
+    "biofilm","resistance","resistant","synergistic activity","checkerboard","time-kill"
+]
+
+def is_accepted(title, abstract):
+    text = (title + " " + abstract).lower()
+    if "ciprofloxacin" not in text:
+        return False
+    if any(t in text for t in exclude_terms):
+        return False
+    ddi_signal = any(k in text for k in [
+        "drug-drug","drug drug","interaction","concomitant","coadministr","co-admin",
+        "pharmacokinetic","auc","cmax","clearance","inhibit","induc","exposure","qt"
+    ])
+    if not ddi_signal:
+        return False
+    if any(t in text for t in non_ddi_focus_terms) and not any(k in text for k in [
+        "pharmacokinetic","auc","cmax","clearance","toxicity","bleeding","serum concentration","plasma concentration"
+    ]):
+        return False
+    other = any(m in text for m in other_drug_markers)
+    if not other and re.search(r"ciprofloxacin (and|with) [a-z0-9\-]{3,}", text):
+        other = True
+    return other
+
+results = []
+for pmid in pmids:
+    meta = articles.get(pmid, {"title": "", "abstract": ""})
+    results.append({"PMID": str(pmid), "Accepted": bool(is_accepted(meta["title"], meta["abstract"]))})
+
+n_acc = sum(1 for x in results if x["Accepted"])
+with open(os.path.join(tmp_dir, "screening_results.json"), "w") as f:
+    json.dump(results, f, indent=2)
+
+print(f"\nSTEP 4: Accepted={n_acc}/{len(results)}")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(checklist,1):
+    print(f"{i}. [{'✓' if i<=4 else ' '}] {s}")
+
+# Step 5
+with open(out_path, "w") as f:
+    json.dump(results, f, indent=2)
+
+summary = {
+    "query": query,
+    "date_params": date_params,
+    "initial_count": count,
+    "retrieved_pmids": len(pmids),
+    "accepted": n_acc,
+    "timestamp": datetime.utcnow().isoformat() + "Z"
+}
+with open(os.path.join(tmp_dir, "run_summary.json"), "w") as f:
+    json.dump(summary, f, indent=2)
+
+print(f"\nSTEP 5: wrote {out_path}")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(checklist,1):
+    print(f"{i}. [✓] {s}")
+
+print("\nRun summary:", summary)
+</execute>
+<observation>NameError("name 'urllib' is not defined")</observation>
+<execute>
+#!/usr/bin/env python3
+# Avoid any 'urllib' module name usage; import functions directly.
+
+import os, json, re
+from datetime import datetime
+from urllib.request import urlopen
+from urllib.parse import urlencode
+from bs4 import BeautifulSoup
+
+tmp_dir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/ddinter_retrieval/"
+out_path = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/ddinter_retrieval.json"
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+checklist = [
+"Set up required directories and define the PubMed query with inclusion/exclusion filters and date limits.",
+"Run the initial PubMed search (ESearch) and collect all PMIDs.",
+"Fetch article metadata/abstracts in batches (EFetch) and parse titles/abstracts.",
+"Screen abstracts for Ciprofloxacin DDIs (exclude food/gene topics; include clinical/pharmacological DDI with another drug) and assign Accepted flags.",
+"Write the full PMID list with Accepted flags to the required JSON path."
+]
+print("PLAN (checklist):")
+for i,s in enumerate(checklist,1):
+    print(f"{i}. [ ] {s}")
+
+BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
+
+def get_text(full_url, timeout=60):
+    with urlopen(full_url, timeout=timeout) as resp:
+        return resp.read().decode("utf-8")
+
+# Step 1
+query = (
+    '(ciprofloxacin[Title/Abstract] OR Ciprofloxacin[MeSH Terms]) AND '
+    '("Drug Interactions"[MeSH Terms] OR "drug-drug interaction"[Title/Abstract] OR "drug drug interaction"[Title/Abstract] OR DDI[Title/Abstract]) '
+    'NOT ("Food-Drug Interactions"[MeSH Terms] OR food[Title] OR "Pharmacogenetics"[MeSH Terms] OR gene[Title/Abstract])'
+)
+date_params = {"mindate": "2021/01/01", "maxdate": "2021/03/01", "datetype": "pdat"}
+
+with open(os.path.join(tmp_dir, "query.txt"), "w") as f:
+    f.write(query + "\n")
+    f.write(json.dumps(date_params, indent=2))
+
+print("\nUPDATED PLAN:")
+for i,s in enumerate(checklist,1):
+    print(f"{i}. [{'✓' if i<=1 else ' '}] {s}")
+
+# Step 2
+esearch_params = {"db": "pubmed", "term": query, "retmax": 100000, "retmode": "json", **date_params}
+esearch_url = BASE + "esearch.fcgi?" + urlencode(esearch_params)
+esearch_json = json.loads(get_text(esearch_url, timeout=60))
+pmids = esearch_json["esearchresult"].get("idlist", [])
+count = int(esearch_json["esearchresult"].get("count", "0"))
+
+with open(os.path.join(tmp_dir, "esearch.json"), "w") as f:
+    json.dump(esearch_json, f, indent=2)
+
+print(f"\nSTEP 2: count={count}, retrieved={len(pmids)} PMIDs")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(checklist,1):
+    print(f"{i}. [{'✓' if i<=2 else ' '}] {s}")
+
+# Step 3
+articles = {}
+batch_size = 200
+for i in range(0, len(pmids), batch_size):
+    batch = pmids[i:i+batch_size]
+    efetch_params = {"db": "pubmed", "id": ",".join(batch), "retmode": "xml"}
+    efetch_url = BASE + "efetch.fcgi?" + urlencode(efetch_params)
+    xml_text = get_text(efetch_url, timeout=120)
+
+    xml_path = os.path.join(tmp_dir, f"efetch_{i//batch_size:04d}.xml")
+    with open(xml_path, "w") as f:
+        f.write(xml_text)
+
+    soup = BeautifulSoup(xml_text, "xml")
+    for art in soup.find_all("PubmedArticle"):
+        pmid_tag = art.find("PMID")
+        if not pmid_tag:
+            continue
+        pmid = pmid_tag.get_text(strip=True)
+        title_tag = art.find("ArticleTitle")
+        title = title_tag.get_text(" ", strip=True) if title_tag else ""
+        abst_nodes = art.find_all("AbstractText")
+        abstract = " ".join(n.get_text(" ", strip=True) for n in abst_nodes) if abst_nodes else ""
+        articles[pmid] = {"title": title, "abstract": abstract}
+
+with open(os.path.join(tmp_dir, "parsed_articles.json"), "w") as f:
+    json.dump(articles, f, indent=2)
+
+print(f"\nSTEP 3: parsed={len(articles)} articles")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(checklist,1):
+    print(f"{i}. [{'✓' if i<=3 else ' '}] {s}")
+
+# Step 4
+other_drug_markers = [
+    "warfarin","theophylline","tizanidine","cyclosporine","clozapine","duloxetine","methotrexate",
+    "metronidazole","rifampin","rifampicin","probenecid","phenytoin","digoxin",
+    "clopidogrel","apixaban","rivaroxaban","dabigatran","amiodarone","fluconazole",
+    "azithromycin","clarithromycin","linezolid","vancomycin","gentamicin",
+    "sucralfate","antacid","iron","zinc","calcium","magnesium"
+]
+exclude_terms = [
+    "food-drug","food drug","diet","meal","nutrition","grapefruit",
+    "pharmacogen","pharmacogenetic","genetic","genotype","polymorphism",
+    " gene"," genes","cyp2","cyp3","cyp1a2"
+]
+non_ddi_focus_terms = [
+    "antimicrobial susceptibility","minimum inhibitory concentration"," mic",
+    "biofilm","resistance","resistant","synergistic activity","checkerboard","time-kill"
+]
+
+def is_accepted(title, abstract):
+    text = (title + " " + abstract).lower()
+    if "ciprofloxacin" not in text:
+        return False
+    if any(t in text for t in exclude_terms):
+        return False
+    ddi_signal = any(k in text for k in [
+        "drug-drug","drug drug","interaction","concomitant","coadministr","co-admin",
+        "pharmacokinetic","auc","cmax","clearance","inhibit","induc","exposure","qt"
+    ])
+    if not ddi_signal:
+        return False
+    if any(t in text for t in non_ddi_focus_terms) and not any(k in text for k in [
+        "pharmacokinetic","auc","cmax","clearance","toxicity","bleeding","serum concentration","plasma concentration"
+    ]):
+        return False
+    other = any(m in text for m in other_drug_markers)
+    if not other and re.search(r"ciprofloxacin (and|with) [a-z0-9\-]{3,}", text):
+        other = True
+    return other
+
+results = []
+for pmid in pmids:
+    meta = articles.get(pmid, {"title": "", "abstract": ""})
+    results.append({"PMID": str(pmid), "Accepted": bool(is_accepted(meta["title"], meta["abstract"]))})
+
+n_acc = sum(1 for x in results if x["Accepted"])
+with open(os.path.join(tmp_dir, "screening_results.json"), "w") as f:
+    json.dump(results, f, indent=2)
+
+print(f"\nSTEP 4: Accepted={n_acc}/{len(results)}")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(checklist,1):
+    print(f"{i}. [{'✓' if i<=4 else ' '}] {s}")
+
+# Step 5
+with open(out_path, "w") as f:
+    json.dump(results, f, indent=2)
+
+summary = {
+    "query": query,
+    "date_params": date_params,
+    "initial_count": count,
+    "retrieved_pmids": len(pmids),
+    "accepted": n_acc,
+    "timestamp": datetime.utcnow().isoformat() + "Z"
+}
+with open(os.path.join(tmp_dir, "run_summary.json"), "w") as f:
+    json.dump(summary, f, indent=2)
+
+print(f"\nSTEP 5: wrote {out_path}")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(checklist,1):
+    print(f"{i}. [✓] {s}")
+
+print("\nRun summary:", summary)
+</execute>
+<observation>NameError("name 'urlopen' is not defined")</observation>
+<execute>
+#!/usr/bin/env python3
+# Final attempt: call functions through their modules, no direct imports of symbols.
+
+import os, json, re
+from datetime import datetime
+import urllib.request as ureq
+import urllib.parse as uparse
+from bs4 import BeautifulSoup
+
+tmp_dir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/ddinter_retrieval/"
+out_path = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/ddinter_retrieval.json"
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+checklist = [
+"Set up required directories and define the PubMed query with inclusion/exclusion filters and date limits.",
+"Run the initial PubMed search (ESearch) and collect all PMIDs.",
+"Fetch article metadata/abstracts in batches (EFetch) and parse titles/abstracts.",
+"Screen abstracts for Ciprofloxacin DDIs (exclude food/gene topics; include clinical/pharmacological DDI with another drug) and assign Accepted flags.",
+"Write the full PMID list with Accepted flags to the required JSON path."
+]
+print("PLAN (checklist):")
+for i,s in enumerate(checklist,1):
+    print(f"{i}. [ ] {s}")
+
+BASE = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/"
+
+def get_text(full_url, timeout=60):
+    with ureq.urlopen(full_url, timeout=timeout) as resp:
+        return resp.read().decode("utf-8")
+
+# Step 1
+query = (
+    '(ciprofloxacin[Title/Abstract] OR Ciprofloxacin[MeSH Terms]) AND '
+    '("Drug Interactions"[MeSH Terms] OR "drug-drug interaction"[Title/Abstract] OR "drug drug interaction"[Title/Abstract] OR DDI[Title/Abstract]) '
+    'NOT ("Food-Drug Interactions"[MeSH Terms] OR food[Title] OR "Pharmacogenetics"[MeSH Terms] OR gene[Title/Abstract])'
+)
+date_params = {"mindate": "2021/01/01", "maxdate": "2021/03/01", "datetype": "pdat"}
+
+with open(os.path.join(tmp_dir, "query.txt"), "w") as f:
+    f.write(query + "\n")
+    f.write(json.dumps(date_params, indent=2))
+
+print("\nUPDATED PLAN:")
+for i,s in enumerate(checklist,1):
+    print(f"{i}. [{'✓' if i<=1 else ' '}] {s}")
+
+# Step 2
+esearch_params = {"db": "pubmed", "term": query, "retmax": 100000, "retmode": "json", **date_params}
+esearch_url = BASE + "esearch.fcgi?" + uparse.urlencode(esearch_params)
+esearch_json = json.loads(get_text(esearch_url, timeout=60))
+pmids = esearch_json["esearchresult"].get("idlist", [])
+count = int(esearch_json["esearchresult"].get("count", "0"))
+
+with open(os.path.join(tmp_dir, "esearch.json"), "w") as f:
+    json.dump(esearch_json, f, indent=2)
+
+print(f"\nSTEP 2: count={count}, retrieved={len(pmids)} PMIDs")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(checklist,1):
+    print(f"{i}. [{'✓' if i<=2 else ' '}] {s}")
+
+# Step 3
+articles = {}
+batch_size = 200
+for i in range(0, len(pmids), batch_size):
+    batch = pmids[i:i+batch_size]
+    efetch_params = {"db": "pubmed", "id": ",".join(batch), "retmode": "xml"}
+    efetch_url = BASE + "efetch.fcgi?" + uparse.urlencode(efetch_params)
+    xml_text = get_text(efetch_url, timeout=120)
+
+    xml_path = os.path.join(tmp_dir, f"efetch_{i//batch_size:04d}.xml")
+    with open(xml_path, "w") as f:
+        f.write(xml_text)
+
+    soup = BeautifulSoup(xml_text, "xml")
+    for art in soup.find_all("PubmedArticle"):
+        pmid_tag = art.find("PMID")
+        if not pmid_tag:
+            continue
+        pmid = pmid_tag.get_text(strip=True)
+        title_tag = art.find("ArticleTitle")
+        title = title_tag.get_text(" ", strip=True) if title_tag else ""
+        abst_nodes = art.find_all("AbstractText")
+        abstract = " ".join(n.get_text(" ", strip=True) for n in abst_nodes) if abst_nodes else ""
+        articles[pmid] = {"title": title, "abstract": abstract}
+
+with open(os.path.join(tmp_dir, "parsed_articles.json"), "w") as f:
+    json.dump(articles, f, indent=2)
+
+print(f"\nSTEP 3: parsed={len(articles)} articles")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(checklist,1):
+    print(f"{i}. [{'✓' if i<=3 else ' '}] {s}")
+
+# Step 4
+other_drug_markers = [
+    "warfarin","theophylline","tizanidine","cyclosporine","clozapine","duloxetine","methotrexate",
+    "metronidazole","rifampin","rifampicin","probenecid","phenytoin","digoxin",
+    "clopidogrel","apixaban","rivaroxaban","dabigatran","amiodarone","fluconazole",
+    "azithromycin","clarithromycin","linezolid","vancomycin","gentamicin",
+    "sucralfate","antacid","iron","zinc","calcium","magnesium"
+]
+exclude_terms = [
+    "food-drug","food drug","diet","meal","nutrition","grapefruit",
+    "pharmacogen","pharmacogenetic","genetic","genotype","polymorphism",
+    " gene"," genes","cyp2","cyp3","cyp1a2"
+]
+non_ddi_focus_terms = [
+    "antimicrobial susceptibility","minimum inhibitory concentration"," mic",
+    "biofilm","resistance","resistant","synergistic activity","checkerboard","time-kill"
+]
+
+def is_accepted(title, abstract):
+    text = (title + " " + abstract).lower()
+    if "ciprofloxacin" not in text:
+        return False
+    if any(t in text for t in exclude_terms):
+        return False
+    ddi_signal = any(k in text for k in [
+        "drug-drug","drug drug","interaction","concomitant","coadministr","co-admin",
+        "pharmacokinetic","auc","cmax","clearance","inhibit","induc","exposure","qt"
+    ])
+    if not ddi_signal:
+        return False
+    if any(t in text for t in non_ddi_focus_terms) and not any(k in text for k in [
+        "pharmacokinetic","auc","cmax","clearance","toxicity","bleeding","serum concentration","plasma concentration"
+    ]):
+        return False
+    other = any(m in text for m in other_drug_markers)
+    if not other and re.search(r"ciprofloxacin (and|with) [a-z0-9\-]{3,}", text):
+        other = True
+    return other
+
+results = []
+for pmid in pmids:
+    meta = articles.get(pmid, {"title": "", "abstract": ""})
+    results.append({"PMID": str(pmid), "Accepted": bool(is_accepted(meta["title"], meta["abstract"]))})
+
+n_acc = sum(1 for x in results if x["Accepted"])
+with open(os.path.join(tmp_dir, "screening_results.json"), "w") as f:
+    json.dump(results, f, indent=2)
+
+print(f"\nSTEP 4: Accepted={n_acc}/{len(results)}")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(checklist,1):
+    print(f"{i}. [{'✓' if i<=4 else ' '}] {s}")
+
+# Step 5
+with open(out_path, "w") as f:
+    json.dump(results, f, indent=2)
+
+summary = {
+    "query": query,
+    "date_params": date_params,
+    "initial_count": count,
+    "retrieved_pmids": len(pmids),
+    "accepted": n_acc,
+    "timestamp": datetime.utcnow().isoformat() + "Z"
+}
+with open(os.path.join(tmp_dir, "run_summary.json"), "w") as f:
+    json.dump(summary, f, indent=2)
+
+print(f"\nSTEP 5: wrote {out_path}")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(checklist,1):
+    print(f"{i}. [✓] {s}")
+
+print("\nRun summary:", summary)
+</execute>
+<observation>NameError("name 'ureq' is not defined")</observation>
+<execute>
+#!/usr/bin/env python3
+# Use ncbi-datasets CLI? No: use NCBI EDirect via curl in bash to avoid python NameError issues.
+
+import os, json, subprocess, textwrap
+
+tmp_dir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/ddinter_retrieval/"
+out_path = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/ddinter_retrieval.json"
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+plan = [
+"Set up required directories and define the PubMed query with inclusion/exclusion filters and date limits.",
+"Run the initial PubMed search (ESearch) and collect all PMIDs.",
+"Fetch article metadata/abstracts in batches (EFetch) and parse titles/abstracts.",
+"Screen abstracts for Ciprofloxacin DDIs (exclude food/gene topics; include clinical/pharmacological DDI with another drug) and assign Accepted flags.",
+"Write the full PMID list with Accepted flags to the required JSON path."
+]
+print("PLAN (checklist):")
+for i,s in enumerate(plan,1):
+    print(f"{i}. [ ] {s}")
+
+query = (
+    '(ciprofloxacin[Title/Abstract] OR Ciprofloxacin[MeSH Terms]) AND '
+    '("Drug Interactions"[MeSH Terms] OR "drug-drug interaction"[Title/Abstract] OR "drug drug interaction"[Title/Abstract] OR DDI[Title/Abstract]) '
+    'NOT ("Food-Drug Interactions"[MeSH Terms] OR food[Title] OR "Pharmacogenetics"[MeSH Terms] OR gene[Title/Abstract])'
+)
+
+# Write bash script to tmp_dir and run
+bash_script = f"""#!/usr/bin/env bash
+set -euo pipefail
+TMP="{tmp_dir}"
+mkdir -p "$TMP"
+
+QUERY={json.dumps(query)}
+MINDATE="2021/01/01"
+MAXDATE="2021/03/01"
+
+# Step 2: ESearch (JSON) using curl
+ES_URL="https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+curl -sG "$ES_URL" --data-urlencode "db=pubmed" --data-urlencode "term=$QUERY" \\
+  --data-urlencode "retmax=100000" --data-urlencode "retmode=json" \\
+  --data-urlencode "mindate=$MINDATE" --data-urlencode "maxdate=$MAXDATE" --data-urlencode "datetype=pdat" \\
+  > "$TMP/esearch.json"
+
+python3 - <<'PY'
+import json, pathlib
+tmp = pathlib.Path({json.dumps(tmp_dir)})
+data = json.loads((tmp/"esearch.json").read_text())
+pmids = data["esearchresult"].get("idlist", [])
+(tmp/"pmids.txt").write_text("\\n".join(pmids))
+print("PMIDs:", len(pmids))
+PY
+
+# Step 3: EFetch XML (batch)
+EF_URL="https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+split -l 200 "$TMP/pmids.txt" "$TMP/pmids_chunk_"
+for f in "$TMP"/pmids_chunk_*; do
+  IDS=$(paste -sd, "$f")
+  out="$TMP/efetch_$(basename "$f").xml"
+  curl -sG "$EF_URL" --data-urlencode "db=pubmed" --data-urlencode "id=$IDS" --data-urlencode "retmode=xml" > "$out"
+done
+"""
+script_path = os.path.join(tmp_dir, "run_pubmed.sh")
+with open(script_path, "w") as f:
+    f.write(bash_script)
+os.chmod(script_path, 0o755)
+
+print("\nSTEP 1 complete (query + script written).")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    print(f"{i}. [{'✓' if i<=1 else ' '}] {s}")
+
+print("\nRunning bash retrieval pipeline...")
+res = subprocess.run(["bash", script_path], capture_output=True, text=True)
+print("STDOUT:\n", res.stdout)
+print("STDERR:\n", res.stderr)
+if res.returncode != 0:
+    raise SystemExit(f"Bash pipeline failed with code {res.returncode}")
+
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    print(f"{i}. [{'✓' if i<=3 else ' '}] {s}")
+
+# Step 4-5: parse efetch xml files + screen + write output
+import glob
+from bs4 import BeautifulSoup
+import re
+from datetime import datetime
+
+pmids = open(os.path.join(tmp_dir,"pmids.txt")).read().strip().splitlines()
+articles = {}
+for xmlf in sorted(glob.glob(os.path.join(tmp_dir,"efetch_pmids_chunk_*.xml"))):
+    xml_text = open(xmlf).read()
+    soup = BeautifulSoup(xml_text, "xml")
+    for art in soup.find_all("PubmedArticle"):
+        pmid_tag = art.find("PMID")
+        if not pmid_tag:
+            continue
+        pmid = pmid_tag.get_text(strip=True)
+        title_tag = art.find("ArticleTitle")
+        title = title_tag.get_text(" ", strip=True) if title_tag else ""
+        abst_nodes = art.find_all("AbstractText")
+        abstract = " ".join(n.get_text(" ", strip=True) for n in abst_nodes) if abst_nodes else ""
+        articles[pmid] = {"title": title, "abstract": abstract}
+
+other_drug_markers = [
+"warfarin","theophylline","tizanidine","cyclosporine","clozapine","duloxetine","methotrexate",
+"metronidazole","rifampin","rifampicin","probenecid","phenytoin","digoxin",
+"clopidogrel","apixaban","rivaroxaban","dabigatran","amiodarone","fluconazole",
+"azithromycin","clarithromycin","linezolid","vancomycin","gentamicin",
+"sucralfate","antacid","iron","zinc","calcium","magnesium"
+]
+exclude_terms = [
+"food-drug","food drug","diet","meal","nutrition","grapefruit",
+"pharmacogen","pharmacogenetic","genetic","genotype","polymorphism",
+" gene"," genes","cyp2","cyp3","cyp1a2"
+]
+non_ddi_focus_terms = [
+"antimicrobial susceptibility","minimum inhibitory concentration"," mic",
+"biofilm","resistance","resistant","synergistic activity","checkerboard","time-kill"
+]
+
+def is_accepted(title, abstract):
+    text = (title + " " + abstract).lower()
+    if "ciprofloxacin" not in text:
+        return False
+    if any(t in text for t in exclude_terms):
+        return False
+    ddi_signal = any(k in text for k in [
+        "drug-drug","drug drug","interaction","concomitant","coadministr","co-admin",
+        "pharmacokinetic","auc","cmax","clearance","inhibit","induc","exposure","qt"
+    ])
+    if not ddi_signal:
+        return False
+    if any(t in text for t in non_ddi_focus_terms) and not any(k in text for k in [
+        "pharmacokinetic","auc","cmax","clearance","toxicity","bleeding","serum concentration","plasma concentration"
+    ]):
+        return False
+    other = any(m in text for m in other_drug_markers)
+    if not other and re.search(r"ciprofloxacin (and|with) [a-z0-9\-]{3,}", text):
+        other = True
+    return other
+
+results = [{"PMID": str(p), "Accepted": bool(is_accepted(articles.get(p,{}).get("title",""), articles.get(p,{}).get("abstract","")))} for p in pmids]
+
+with open(os.path.join(tmp_dir,"screening_results.json"),"w") as f:
+    json.dump(results, f, indent=2)
+
+with open(out_path, "w") as f:
+    json.dump(results, f, indent=2)
+
+n_acc = sum(1 for x in results if x["Accepted"])
+summary = {
+    "initial_pmids": len(pmids),
+    "parsed_articles": len(articles),
+    "accepted": n_acc,
+    "timestamp": datetime.utcnow().isoformat()+"Z"
+}
+with open(os.path.join(tmp_dir,"run_summary.json"),"w") as f:
+    json.dump(summary, f, indent=2)
+
+print(f"\nSTEP 4-5 complete: Accepted={n_acc}/{len(results)}")
+print(f"Wrote: {out_path}")
+
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    print(f"{i}. [✓] {s}")
+</execute>
+<observation>FeatureNotFound("Couldn't find a tree builder with the features you requested: xml. Do you need to install a parser library?")</observation>
+<execute>
+#!/usr/bin/env python3
+import os, json, re, glob, subprocess
+from datetime import datetime
+from bs4 import BeautifulSoup
+
+tmp_dir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/ddinter_retrieval/"
+out_path = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/ddinter_retrieval.json"
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+plan = [
+"Set up required directories and define the PubMed query with inclusion/exclusion filters and date limits.",
+"Run the initial PubMed search (ESearch) and collect all PMIDs.",
+"Fetch article metadata/abstracts in batches (EFetch) and parse titles/abstracts.",
+"Screen abstracts for Ciprofloxacin DDIs (exclude food/gene topics; include clinical/pharmacological DDI with another drug) and assign Accepted flags.",
+"Write the full PMID list with Accepted flags to the required JSON path."
+]
+print("UPDATED PLAN (assuming retrieval already done; fixing parsing step):")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i in (1,2,3) else " "
+    print(f"{i}. [{chk}] {s}")
+
+# If XML parser not available for BeautifulSoup("xml"), use lxml.etree if present, else xml.etree.ElementTree
+def parse_pubmed_xml(xml_text):
+    # Use stdlib ElementTree (no external parser needed)
+    import xml.etree.ElementTree as ET
+    root = ET.fromstring(xml_text)
+    recs = []
+    for art in root.findall(".//PubmedArticle"):
+        pmid_el = art.find(".//MedlineCitation/PMID")
+        pmid = pmid_el.text.strip() if pmid_el is not None and pmid_el.text else None
+        if not pmid:
+            continue
+        title_el = art.find(".//Article/ArticleTitle")
+        title = "".join(title_el.itertext()).strip() if title_el is not None else ""
+        abst_parts = []
+        for abst_el in art.findall(".//Article/Abstract/AbstractText"):
+            abst_parts.append("".join(abst_el.itertext()).strip())
+        abstract = " ".join([p for p in abst_parts if p])
+        recs.append((pmid, title, abstract))
+    return recs
+
+# Load pmids
+pmids_path = os.path.join(tmp_dir, "pmids.txt")
+if not os.path.exists(pmids_path):
+    raise SystemExit(f"Missing {pmids_path}. Retrieval step may not have completed.")
+
+pmids = open(pmids_path).read().strip().splitlines()
+
+# Parse efetch XML files
+articles = {}
+xml_files = sorted(glob.glob(os.path.join(tmp_dir, "efetch_pmids_chunk_*.xml")))
+if not xml_files:
+    # fallback: any efetch_*.xml
+    xml_files = sorted(glob.glob(os.path.join(tmp_dir, "efetch_*.xml")))
+print(f"Parsing XML files: {len(xml_files)}")
+
+for xf in xml_files:
+    xml_text = open(xf).read()
+    for pmid, title, abstract in parse_pubmed_xml(xml_text):
+        articles[pmid] = {"title": title, "abstract": abstract}
+
+with open(os.path.join(tmp_dir, "parsed_articles.json"), "w") as f:
+    json.dump(articles, f, indent=2)
+
+# Screening rules
+other_drug_markers = [
+"warfarin","theophylline","tizanidine","cyclosporine","clozapine","duloxetine","methotrexate",
+"metronidazole","rifampin","rifampicin","probenecid","phenytoin","digoxin",
+"clopidogrel","apixaban","rivaroxaban","dabigatran","amiodarone","fluconazole",
+"azithromycin","clarithromycin","linezolid","vancomycin","gentamicin",
+"sucralfate","antacid","iron","zinc","calcium","magnesium"
+]
+exclude_terms = [
+"food-drug","food drug","diet","meal","nutrition","grapefruit",
+"pharmacogen","pharmacogenetic","genetic","genotype","polymorphism",
+" gene"," genes","cyp2","cyp3","cyp1a2"
+]
+non_ddi_focus_terms = [
+"antimicrobial susceptibility","minimum inhibitory concentration"," mic",
+"biofilm","resistance","resistant","synergistic activity","checkerboard","time-kill"
+]
+
+def is_accepted(title, abstract):
+    text = (title + " " + abstract).lower()
+    if "ciprofloxacin" not in text:
+        return False
+    if any(t in text for t in exclude_terms):
+        return False
+    ddi_signal = any(k in text for k in [
+        "drug-drug","drug drug","interaction","concomitant","coadministr","co-admin",
+        "pharmacokinetic","auc","cmax","clearance","inhibit","induc","exposure","qt"
+    ])
+    if not ddi_signal:
+        return False
+    if any(t in text for t in non_ddi_focus_terms) and not any(k in text for k in [
+        "pharmacokinetic","auc","cmax","clearance","toxicity","bleeding","serum concentration","plasma concentration"
+    ]):
+        return False
+    other = any(m in text for m in other_drug_markers)
+    if not other and re.search(r"ciprofloxacin (and|with) [a-z0-9\-]{3,}", text):
+        other = True
+    return other
+
+results = []
+for p in pmids:
+    meta = articles.get(p, {"title":"","abstract":""})
+    results.append({"PMID": str(p), "Accepted": bool(is_accepted(meta["title"], meta["abstract"]))})
+
+with open(os.path.join(tmp_dir, "screening_results.json"), "w") as f:
+    json.dump(results, f, indent=2)
+
+with open(out_path, "w") as f:
+    json.dump(results, f, indent=2)
+
+n_acc = sum(1 for x in results if x["Accepted"])
+summary = {
+    "initial_pmids": len(pmids),
+    "parsed_articles": len(articles),
+    "accepted": n_acc,
+    "timestamp": datetime.utcnow().isoformat()+"Z"
+}
+with open(os.path.join(tmp_dir, "run_summary.json"), "w") as f:
+    json.dump(summary, f, indent=2)
+
+print(f"\nDone. Parsed={len(articles)}; Accepted={n_acc}/{len(results)}")
+print(f"Wrote output JSON: {out_path}")
+
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓"
+    print(f"{i}. [{chk}] {s}")
+</execute>
+<observation>NameError("name 'exclude_terms' is not defined")</observation>
+<execute>
+#!/usr/bin/env python3
+# Re-run screening + write with all variables defined in local scope.
+
+import os, json, re, glob
+from datetime import datetime
+
+tmp_dir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/ddinter_retrieval/"
+out_path = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/ddinter_retrieval.json"
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+plan = [
+"Set up required directories and define the PubMed query with inclusion/exclusion filters and date limits.",
+"Run the initial PubMed search (ESearch) and collect all PMIDs.",
+"Fetch article metadata/abstracts in batches (EFetch) and parse titles/abstracts.",
+"Screen abstracts for Ciprofloxacin DDIs (exclude food/gene topics; include clinical/pharmacological DDI with another drug) and assign Accepted flags.",
+"Write the full PMID list with Accepted flags to the required JSON path."
+]
+
+print("PLAN (checklist):")
+for i,s in enumerate(plan,1):
+    print(f"{i}. [{'✓' if i<=3 else ' '}] {s}")
+
+# Load PMIDs and parsed articles (assumed already created)
+pmids_path = os.path.join(tmp_dir, "pmids.txt")
+parsed_path = os.path.join(tmp_dir, "parsed_articles.json")
+if not os.path.exists(pmids_path):
+    raise SystemExit(f"Missing {pmids_path}")
+if not os.path.exists(parsed_path):
+    raise SystemExit(f"Missing {parsed_path}")
+
+pmids = open(pmids_path).read().strip().splitlines()
+articles = json.loads(open(parsed_path).read())
+
+# Define screening vocab (ALL local)
+other_drug_markers = [
+"warfarin","theophylline","tizanidine","cyclosporine","clozapine","duloxetine","methotrexate",
+"metronidazole","rifampin","rifampicin","probenecid","phenytoin","digoxin",
+"clopidogrel","apixaban","rivaroxaban","dabigatran","amiodarone","fluconazole",
+"azithromycin","clarithromycin","linezolid","vancomycin","gentamicin",
+"sucralfate","antacid","iron","zinc","calcium","magnesium"
+]
+exclude_terms = [
+"food-drug","food drug","diet","meal","nutrition","grapefruit",
+"pharmacogen","pharmacogenetic","genetic","genotype","polymorphism",
+" gene"," genes","cyp2","cyp3","cyp1a2"
+]
+non_ddi_focus_terms = [
+"antimicrobial susceptibility","minimum inhibitory concentration"," mic",
+"biofilm","resistance","resistant","synergistic activity","checkerboard","time-kill"
+]
+
+def is_accepted(title, abstract):
+    text = (title + " " + abstract).lower()
+    if "ciprofloxacin" not in text:
+        return False
+    if any(t in text for t in exclude_terms):
+        return False
+    ddi_signal = any(k in text for k in [
+        "drug-drug","drug drug","interaction","concomitant","coadministr","co-admin",
+        "pharmacokinetic","auc","cmax","clearance","inhibit","induc","exposure","qt"
+    ])
+    if not ddi_signal:
+        return False
+    if any(t in text for t in non_ddi_focus_terms) and not any(k in text for k in [
+        "pharmacokinetic","auc","cmax","clearance","toxicity","bleeding",
+        "serum concentration","plasma concentration"
+    ]):
+        return False
+    other = any(m in text for m in other_drug_markers)
+    if not other and re.search(r"ciprofloxacin (and|with) [a-z0-9\-]{3,}", text):
+        other = True
+    return other
+
+results = []
+for p in pmids:
+    meta = articles.get(p, {"title":"","abstract":""})
+    results.append({"PMID": str(p), "Accepted": bool(is_accepted(meta.get("title",""), meta.get("abstract","")))})
+
+n_acc = sum(1 for x in results if x["Accepted"])
+with open(os.path.join(tmp_dir, "screening_results.json"), "w") as f:
+    json.dump(results, f, indent=2)
+
+with open(out_path, "w") as f:
+    json.dump(results, f, indent=2)
+
+summary = {
+    "initial_pmids": len(pmids),
+    "parsed_articles": len(articles),
+    "accepted": n_acc,
+    "timestamp": datetime.utcnow().isoformat()+"Z"
+}
+with open(os.path.join(tmp_dir, "run_summary.json"), "w") as f:
+    json.dump(summary, f, indent=2)
+
+print(f"\nSTEP 4 complete: Accepted={n_acc}/{len(results)}")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    print(f"{i}. [{'✓' if i<=4 else ' '}] {s}")
+
+print(f"\nSTEP 5 complete: wrote {out_path}")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    print(f"{i}. [✓] {s}")
+
+print("\nRun summary:", summary)
+</execute>
+<observation>NameError("name 'exclude_terms' is not defined")</observation>
+<execute>
+#!/usr/bin/env python3
+# Hard reset in a single cell: rebuild everything from scratch with bash (curl) + stdlib XML parser + screening.
+# Avoids BeautifulSoup XML parser dependency and avoids relying on prior state.
+
+import os, json, re, subprocess, glob
+from datetime import datetime
+import xml.etree.ElementTree as ET
+
+tmp_dir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/ddinter_retrieval/"
+out_path = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/ddinter_retrieval.json"
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+plan = [
+"Set up required directories and define the PubMed query with inclusion/exclusion filters and date limits.",
+"Run the initial PubMed search (ESearch) and collect all PMIDs.",
+"Fetch article metadata/abstracts in batches (EFetch) and parse titles/abstracts.",
+"Screen abstracts for Ciprofloxacin DDIs (exclude food/gene topics; include clinical/pharmacological DDI with another drug) and assign Accepted flags.",
+"Write the full PMID list with Accepted flags to the required JSON path."
+]
+print("PLAN (checklist):")
+for i,s in enumerate(plan,1):
+    print(f"{i}. [ ] {s}")
+
+query = (
+    '(ciprofloxacin[Title/Abstract] OR Ciprofloxacin[MeSH Terms]) AND '
+    '("Drug Interactions"[MeSH Terms] OR "drug-drug interaction"[Title/Abstract] OR "drug drug interaction"[Title/Abstract] OR DDI[Title/Abstract]) '
+    'NOT ("Food-Drug Interactions"[MeSH Terms] OR food[Title] OR "Pharmacogenetics"[MeSH Terms] OR gene[Title/Abstract])'
+)
+mindate="2021/01/01"
+maxdate="2021/03/01"
+
+# Step 1 done
+with open(os.path.join(tmp_dir,"query.txt"),"w") as f:
+    f.write(query+"\n")
+    f.write(json.dumps({"mindate":mindate,"maxdate":maxdate,"datetype":"pdat"}, indent=2))
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    print(f"{i}. [{'✓' if i<=1 else ' '}] {s}")
+
+# Step 2-3 via bash/curl
+bash = f"""#!/usr/bin/env bash
+set -euo pipefail
+TMP="{tmp_dir}"
+QUERY={json.dumps(query)}
+MINDATE="{mindate}"
+MAXDATE="{maxdate}"
+
+ES_URL="https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+curl -sG "$ES_URL" --data-urlencode "db=pubmed" --data-urlencode "term=$QUERY" \\
+  --data-urlencode "retmax=100000" --data-urlencode "retmode=json" \\
+  --data-urlencode "mindate=$MINDATE" --data-urlencode "maxdate=$MAXDATE" --data-urlencode "datetype=pdat" \\
+  > "$TMP/esearch.json"
+
+python3 - <<'PY'
+import json, pathlib
+tmp = pathlib.Path({json.dumps(tmp_dir)})
+data = json.loads((tmp/"esearch.json").read_text())
+pmids = data["esearchresult"].get("idlist", [])
+(tmp/"pmids.txt").write_text("\\n".join(pmids))
+print("COUNT", data["esearchresult"].get("count"))
+print("PMIDS", len(pmids))
+PY
+
+EF_URL="https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+# split can fail if pmids empty; handle
+if [ -s "$TMP/pmids.txt" ]; then
+  split -l 200 "$TMP/pmids.txt" "$TMP/pmids_chunk_"
+  for f in "$TMP"/pmids_chunk_*; do
+    IDS=$(paste -sd, "$f")
+    out="$TMP/efetch_$(basename "$f").xml"
+    curl -sG "$EF_URL" --data-urlencode "db=pubmed" --data-urlencode "id=$IDS" --data-urlencode "retmode=xml" > "$out"
+  done
+else
+  echo "No PMIDs retrieved."
+fi
+"""
+script_path = os.path.join(tmp_dir,"run_pubmed.sh")
+open(script_path,"w").write(bash)
+os.chmod(script_path,0o755)
+
+res = subprocess.run(["bash", script_path], capture_output=True, text=True)
+print("\nBASH STDOUT:\n", res.stdout)
+print("BASH STDERR:\n", res.stderr)
+if res.returncode != 0:
+    raise SystemExit(f"Retrieval failed: {res.returncode}")
+
+# Mark steps 2-3
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    print(f"{i}. [{'✓' if i<=3 else ' '}] {s}")
+
+# Load pmids
+pmids_path = os.path.join(tmp_dir,"pmids.txt")
+pmids = open(pmids_path).read().strip().splitlines() if os.path.exists(pmids_path) else []
+print(f"\nLoaded PMIDs: {len(pmids)}")
+
+# Parse XML with stdlib
+def parse_pubmed_file(path):
+    xml_text = open(path).read()
+    root = ET.fromstring(xml_text)
+    for art in root.findall(".//PubmedArticle"):
+        pmid_el = art.find(".//MedlineCitation/PMID")
+        pmid = pmid_el.text.strip() if pmid_el is not None and pmid_el.text else None
+        if not pmid:
+            continue
+        title_el = art.find(".//Article/ArticleTitle")
+        title = "".join(title_el.itertext()).strip() if title_el is not None else ""
+        abs_parts = []
+        for abs_el in art.findall(".//Article/Abstract/AbstractText"):
+            abs_parts.append("".join(abs_el.itertext()).strip())
+        abstract = " ".join([p for p in abs_parts if p])
+        yield pmid, title, abstract
+
+articles = {}
+for xf in sorted(glob.glob(os.path.join(tmp_dir,"efetch_pmids_chunk_*.xml"))):
+    for pmid, title, abstract in parse_pubmed_file(xf):
+        articles[pmid] = {"title": title, "abstract": abstract}
+
+with open(os.path.join(tmp_dir,"parsed_articles.json"),"w") as f:
+    json.dump(articles, f, indent=2)
+
+print(f"Parsed articles with metadata: {len(articles)}")
+
+# Step 4: screening (ALL variables defined right here)
+OTHER_DRUG_MARKERS = [
+"warfarin","theophylline","tizanidine","cyclosporine","clozapine","duloxetine","methotrexate",
+"metronidazole","rifampin","rifampicin","probenecid","phenytoin","digoxin",
+"clopidogrel","apixaban","rivaroxaban","dabigatran","amiodarone","fluconazole",
+"azithromycin","clarithromycin","linezolid","vancomycin","gentamicin",
+"sucralfate","antacid","iron","zinc","calcium","magnesium"
+]
+EXCLUDE_TERMS = [
+"food-drug","food drug","diet","meal","nutrition","grapefruit",
+"pharmacogen","pharmacogenetic","genetic","genotype","polymorphism",
+" gene"," genes","cyp2","cyp3","cyp1a2"
+]
+NON_DDI_FOCUS_TERMS = [
+"antimicrobial susceptibility","minimum inhibitory concentration"," mic",
+"biofilm","resistance","resistant","synergistic activity","checkerboard","time-kill"
+]
+
+def is_accepted(title, abstract):
+    text = (title + " " + abstract).lower()
+    if "ciprofloxacin" not in text:
+        return False
+    if any(t in text for t in EXCLUDE_TERMS):
+        return False
+    ddi_signal = any(k in text for k in [
+        "drug-drug","drug drug","interaction","concomitant","coadministr","co-admin",
+        "pharmacokinetic","auc","cmax","clearance","inhibit","induc","exposure","qt"
+    ])
+    if not ddi_signal:
+        return False
+    if any(t in text for t in NON_DDI_FOCUS_TERMS) and not any(k in text for k in [
+        "pharmacokinetic","auc","cmax","clearance","toxicity","bleeding",
+        "serum concentration","plasma concentration"
+    ]):
+        return False
+    other = any(m in text for m in OTHER_DRUG_MARKERS)
+    if not other and re.search(r"ciprofloxacin (and|with) [a-z0-9\-]{3,}", text):
+        other = True
+    return other
+
+results = []
+for p in pmids:
+    meta = articles.get(p, {"title":"","abstract":""})
+    results.append({"PMID": str(p), "Accepted": bool(is_accepted(meta["title"], meta["abstract"]))})
+
+n_acc = sum(1 for x in results if x["Accepted"])
+with open(os.path.join(tmp_dir,"screening_results.json"),"w") as f:
+    json.dump(results, f, indent=2)
+
+print(f"\nSTEP 4: Accepted={n_acc}/{len(results)}")
+
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    print(f"{i}. [{'✓' if i<=4 else ' '}] {s}")
+
+# Step 5: write output
+with open(out_path,"w") as f:
+    json.dump(results, f, indent=2)
+
+summary = {
+    "query": query,
+    "mindate": mindate,
+    "maxdate": maxdate,
+    "retrieved_pmids": len(pmids),
+    "parsed_articles": len(articles),
+    "accepted": n_acc,
+    "timestamp": datetime.utcnow().isoformat()+"Z"
+}
+with open(os.path.join(tmp_dir,"run_summary.json"),"w") as f:
+    json.dump(summary, f, indent=2)
+
+print(f"\nSTEP 5: wrote {out_path}")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    print(f"{i}. [✓] {s}")
+
+print("\nRun summary:", summary)
+</execute>
+<observation>NameError("name 'ET' is not defined")</observation>
+<execute>
+#!/usr/bin/env python3
+import os, json, re, subprocess, glob
+from datetime import datetime
+import xml.etree.ElementTree as ElementTree
+
+tmp_dir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/ddinter_retrieval/"
+out_path = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/ddinter_retrieval.json"
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+plan = [
+"Set up required directories and define the PubMed query with inclusion/exclusion filters and date limits.",
+"Run the initial PubMed search (ESearch) and collect all PMIDs.",
+"Fetch article metadata/abstracts in batches (EFetch) and parse titles/abstracts.",
+"Screen abstracts for Ciprofloxacin DDIs (exclude food/gene topics; include clinical/pharmacological DDI with another drug) and assign Accepted flags.",
+"Write the full PMID list with Accepted flags to the required JSON path."
+]
+print("PLAN (checklist):")
+for i,s in enumerate(plan,1):
+    print(f"{i}. [ ] {s}")
+
+query = (
+    '(ciprofloxacin[Title/Abstract] OR Ciprofloxacin[MeSH Terms]) AND '
+    '("Drug Interactions"[MeSH Terms] OR "drug-drug interaction"[Title/Abstract] OR "drug drug interaction"[Title/Abstract] OR DDI[Title/Abstract]) '
+    'NOT ("Food-Drug Interactions"[MeSH Terms] OR food[Title] OR "Pharmacogenetics"[MeSH Terms] OR gene[Title/Abstract])'
+)
+mindate="2021/01/01"
+maxdate="2021/03/01"
+
+with open(os.path.join(tmp_dir,"query.txt"),"w") as f:
+    f.write(query+"\n")
+    f.write(json.dumps({"mindate":mindate,"maxdate":maxdate,"datetype":"pdat"}, indent=2))
+
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    print(f"{i}. [{'✓' if i<=1 else ' '}] {s}")
+
+# Retrieval via bash/curl
+bash = f"""#!/usr/bin/env bash
+set -euo pipefail
+TMP="{tmp_dir}"
+QUERY={json.dumps(query)}
+MINDATE="{mindate}"
+MAXDATE="{maxdate}"
+
+ES_URL="https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+curl -sG "$ES_URL" --data-urlencode "db=pubmed" --data-urlencode "term=$QUERY" \\
+  --data-urlencode "retmax=100000" --data-urlencode "retmode=json" \\
+  --data-urlencode "mindate=$MINDATE" --data-urlencode "maxdate=$MAXDATE" --data-urlencode "datetype=pdat" \\
+  > "$TMP/esearch.json"
+
+python3 - <<'PY'
+import json, pathlib
+tmp = pathlib.Path({json.dumps(tmp_dir)})
+data = json.loads((tmp/"esearch.json").read_text())
+pmids = data["esearchresult"].get("idlist", [])
+(tmp/"pmids.txt").write_text("\\n".join(pmids))
+print("COUNT", data["esearchresult"].get("count"))
+print("PMIDS", len(pmids))
+PY
+
+EF_URL="https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+if [ -s "$TMP/pmids.txt" ]; then
+  rm -f "$TMP"/pmids_chunk_* "$TMP"/efetch_pmids_chunk_*.xml || true
+  split -l 200 "$TMP/pmids.txt" "$TMP/pmids_chunk_"
+  for f in "$TMP"/pmids_chunk_*; do
+    IDS=$(paste -sd, "$f")
+    out="$TMP/efetch_$(basename "$f").xml"
+    curl -sG "$EF_URL" --data-urlencode "db=pubmed" --data-urlencode "id=$IDS" --data-urlencode "retmode=xml" > "$out"
+  done
+fi
+"""
+script_path = os.path.join(tmp_dir,"run_pubmed.sh")
+open(script_path,"w").write(bash)
+os.chmod(script_path,0o755)
+
+res = subprocess.run(["bash", script_path], capture_output=True, text=True)
+print("\nBASH STDOUT:\n", res.stdout)
+print("BASH STDERR:\n", res.stderr)
+if res.returncode != 0:
+    raise SystemExit(f"Retrieval failed: {res.returncode}")
+
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    print(f"{i}. [{'✓' if i<=3 else ' '}] {s}")
+
+pmids_path = os.path.join(tmp_dir,"pmids.txt")
+pmids = open(pmids_path).read().strip().splitlines() if os.path.exists(pmids_path) else []
+print(f"\nLoaded PMIDs: {len(pmids)}")
+
+def parse_pubmed_file(path):
+    xml_text = open(path).read()
+    root = ElementTree.fromstring(xml_text)
+    for art in root.findall(".//PubmedArticle"):
+        pmid_el = art.find(".//MedlineCitation/PMID")
+        pmid = pmid_el.text.strip() if pmid_el is not None and pmid_el.text else None
+        if not pmid:
+            continue
+        title_el = art.find(".//Article/ArticleTitle")
+        title = "".join(title_el.itertext()).strip() if title_el is not None else ""
+        abs_parts = []
+        for abs_el in art.findall(".//Article/Abstract/AbstractText"):
+            abs_parts.append("".join(abs_el.itertext()).strip())
+        abstract = " ".join([p for p in abs_parts if p])
+        yield pmid, title, abstract
+
+articles = {}
+xml_files = sorted(glob.glob(os.path.join(tmp_dir,"efetch_pmids_chunk_*.xml")))
+if not xml_files:
+    xml_files = sorted(glob.glob(os.path.join(tmp_dir,"efetch_pmids_chunk_*"))) + sorted(glob.glob(os.path.join(tmp_dir,"efetch_pmids_chunk_*.xml")))
+# actually created names are efetch_pmids_chunk_???.xml? from bash it's efetch_pmids_chunk_xx.xml? no: efetch_pmids_chunk_?? maybe.
+# The bash output is efetch_<basename pmids_chunk_aa>.xml => efetch_pmids_chunk_aa.xml
+xml_files = sorted(glob.glob(os.path.join(tmp_dir,"efetch_pmids_chunk_*.xml")))
+print(f"XML files to parse: {len(xml_files)}")
+
+for xf in xml_files:
+    for pmid, title, abstract in parse_pubmed_file(xf):
+        articles[pmid] = {"title": title, "abstract": abstract}
+
+with open(os.path.join(tmp_dir,"parsed_articles.json"),"w") as f:
+    json.dump(articles, f, indent=2)
+print(f"Parsed articles: {len(articles)}")
+
+# Screening
+OTHER_DRUG_MARKERS = [
+"warfarin","theophylline","tizanidine","cyclosporine","clozapine","duloxetine","methotrexate",
+"metronidazole","rifampin","rifampicin","probenecid","phenytoin","digoxin",
+"clopidogrel","apixaban","rivaroxaban","dabigatran","amiodarone","fluconazole",
+"azithromycin","clarithromycin","linezolid","vancomycin","gentamicin",
+"sucralfate","antacid","iron","zinc","calcium","magnesium"
+]
+EXCLUDE_TERMS = [
+"food-drug","food drug","diet","meal","nutrition","grapefruit",
+"pharmacogen","pharmacogenetic","genetic","genotype","polymorphism",
+" gene"," genes","cyp2","cyp3","cyp1a2"
+]
+NON_DDI_FOCUS_TERMS = [
+"antimicrobial susceptibility","minimum inhibitory concentration"," mic",
+"biofilm","resistance","resistant","synergistic activity","checkerboard","time-kill"
+]
+
+def is_accepted(title, abstract):
+    text = (title + " " + abstract).lower()
+    if "ciprofloxacin" not in text:
+        return False
+    if any(t in text for t in EXCLUDE_TERMS):
+        return False
+    ddi_signal = any(k in text for k in [
+        "drug-drug","drug drug","interaction","concomitant","coadministr","co-admin",
+        "pharmacokinetic","auc","cmax","clearance","inhibit","induc","exposure","qt"
+    ])
+    if not ddi_signal:
+        return False
+    if any(t in text for t in NON_DDI_FOCUS_TERMS) and not any(k in text for k in [
+        "pharmacokinetic","auc","cmax","clearance","toxicity","bleeding",
+        "serum concentration","plasma concentration"
+    ]):
+        return False
+    other = any(m in text for m in OTHER_DRUG_MARKERS)
+    if not other and re.search(r"ciprofloxacin (and|with) [a-z0-9\-]{3,}", text):
+        other = True
+    return other
+
+results = []
+for p in pmids:
+    meta = articles.get(p, {"title":"","abstract":""})
+    results.append({"PMID": str(p), "Accepted": bool(is_accepted(meta["title"], meta["abstract"]))})
+
+n_acc = sum(1 for x in results if x["Accepted"])
+with open(os.path.join(tmp_dir,"screening_results.json"),"w") as f:
+    json.dump(results, f, indent=2)
+
+print(f"\nSTEP 4: Accepted={n_acc}/{len(results)}")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    print(f"{i}. [{'✓' if i<=4 else ' '}] {s}")
+
+with open(out_path,"w") as f:
+    json.dump(results, f, indent=2)
+
+summary = {
+    "retrieved_pmids": len(pmids),
+    "parsed_articles": len(articles),
+    "accepted": n_acc,
+    "timestamp": datetime.utcnow().isoformat()+"Z"
+}
+with open(os.path.join(tmp_dir,"run_summary.json"),"w") as f:
+    json.dump(summary, f, indent=2)
+
+print(f"\nSTEP 5: wrote {out_path}")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    print(f"{i}. [✓] {s}")
+
+print("\nRun summary:", summary)
+</execute>
+<observation>NameError("name 'ElementTree' is not defined")</observation>
+<execute>
+#!/usr/bin/env python3
+# Use only local imports inside functions to avoid any odd global name resolution issues.
+
+import os, json, re, subprocess, glob
+from datetime import datetime
+
+tmp_dir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/ddinter_retrieval/"
+out_path = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/ddinter_retrieval.json"
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+plan = [
+"Set up required directories and define the PubMed query with inclusion/exclusion filters and date limits.",
+"Run the initial PubMed search (ESearch) and collect all PMIDs.",
+"Fetch article metadata/abstracts in batches (EFetch) and parse titles/abstracts.",
+"Screen abstracts for Ciprofloxacin DDIs (exclude food/gene topics; include clinical/pharmacological DDI with another drug) and assign Accepted flags.",
+"Write the full PMID list with Accepted flags to the required JSON path."
+]
+print("PLAN (checklist):")
+for i,s in enumerate(plan,1):
+    print(f"{i}. [ ] {s}")
+
+query = (
+    '(ciprofloxacin[Title/Abstract] OR Ciprofloxacin[MeSH Terms]) AND '
+    '("Drug Interactions"[MeSH Terms] OR "drug-drug interaction"[Title/Abstract] OR "drug drug interaction"[Title/Abstract] OR DDI[Title/Abstract]) '
+    'NOT ("Food-Drug Interactions"[MeSH Terms] OR food[Title] OR "Pharmacogenetics"[MeSH Terms] OR gene[Title/Abstract])'
+)
+mindate="2021/01/01"
+maxdate="2021/03/01"
+
+with open(os.path.join(tmp_dir,"query.txt"),"w") as f:
+    f.write(query+"\n")
+    f.write(json.dumps({"mindate":mindate,"maxdate":maxdate,"datetype":"pdat"}, indent=2))
+
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    print(f"{i}. [{'✓' if i<=1 else ' '}] {s}")
+
+# Retrieval via bash/curl
+bash = f"""#!/usr/bin/env bash
+set -euo pipefail
+TMP="{tmp_dir}"
+QUERY={json.dumps(query)}
+MINDATE="{mindate}"
+MAXDATE="{maxdate}"
+
+ES_URL="https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+curl -sG "$ES_URL" --data-urlencode "db=pubmed" --data-urlencode "term=$QUERY" \\
+  --data-urlencode "retmax=100000" --data-urlencode "retmode=json" \\
+  --data-urlencode "mindate=$MINDATE" --data-urlencode "maxdate=$MAXDATE" --data-urlencode "datetype=pdat" \\
+  > "$TMP/esearch.json"
+
+python3 - <<'PY'
+import json, pathlib
+tmp = pathlib.Path({json.dumps(tmp_dir)})
+data = json.loads((tmp/"esearch.json").read_text())
+pmids = data["esearchresult"].get("idlist", [])
+(tmp/"pmids.txt").write_text("\\n".join(pmids))
+print("COUNT", data["esearchresult"].get("count"))
+print("PMIDS", len(pmids))
+PY
+
+EF_URL="https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi"
+rm -f "$TMP"/pmids_chunk_* "$TMP"/efetch_pmids_chunk_*.xml "$TMP"/efetch_pmids_chunk_*.xml 2>/dev/null || true
+if [ -s "$TMP/pmids.txt" ]; then
+  split -l 200 "$TMP/pmids.txt" "$TMP/pmids_chunk_"
+  for f in "$TMP"/pmids_chunk_*; do
+    IDS=$(paste -sd, "$f")
+    out="$TMP/efetch_$(basename "$f").xml"
+    curl -sG "$EF_URL" --data-urlencode "db=pubmed" --data-urlencode "id=$IDS" --data-urlencode "retmode=xml" > "$out"
+  done
+fi
+"""
+script_path = os.path.join(tmp_dir,"run_pubmed.sh")
+open(script_path,"w").write(bash)
+os.chmod(script_path,0o755)
+
+res = subprocess.run(["bash", script_path], capture_output=True, text=True)
+print("\nBASH STDOUT:\n", res.stdout)
+print("BASH STDERR:\n", res.stderr)
+if res.returncode != 0:
+    raise SystemExit(f"Retrieval failed: {res.returncode}")
+
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    print(f"{i}. [{'✓' if i<=3 else ' '}] {s}")
+
+pmids_path = os.path.join(tmp_dir,"pmids.txt")
+pmids = open(pmids_path).read().strip().splitlines() if os.path.exists(pmids_path) else []
+
+def parse_pubmed_file(path):
+    import xml.etree.ElementTree as ET
+    xml_text = open(path).read()
+    root = ET.fromstring(xml_text)
+    for art in root.findall(".//PubmedArticle"):
+        pmid_el = art.find(".//MedlineCitation/PMID")
+        pmid = pmid_el.text.strip() if pmid_el is not None and pmid_el.text else None
+        if not pmid:
+            continue
+        title_el = art.find(".//Article/ArticleTitle")
+        title = "".join(title_el.itertext()).strip() if title_el is not None else ""
+        abs_parts = []
+        for abs_el in art.findall(".//Article/Abstract/AbstractText"):
+            abs_parts.append("".join(abs_el.itertext()).strip())
+        abstract = " ".join([p for p in abs_parts if p])
+        yield pmid, title, abstract
+
+articles = {}
+xml_files = sorted(glob.glob(os.path.join(tmp_dir,"efetch_pmids_chunk_*.xml")))
+# actual naming: efetch_pmids_chunk_aa.xml
+xml_files = sorted(glob.glob(os.path.join(tmp_dir,"efetch_pmids_chunk_*.xml"))) + sorted(glob.glob(os.path.join(tmp_dir,"efetch_pmids_chunk_*.XML")))
+if not xml_files:
+    xml_files = sorted(glob.glob(os.path.join(tmp_dir,"efetch_pmids_chunk_*.xml")))
+if not xml_files:
+    xml_files = sorted(glob.glob(os.path.join(tmp_dir,"efetch_pmids_chunk_*.xml")))
+# simpler: match efetch_pmids_chunk_*.xml AND efetch_pmids_chunk_* (just in case)
+xml_files = sorted(set(glob.glob(os.path.join(tmp_dir,"efetch_pmids_chunk_*.xml")) + glob.glob(os.path.join(tmp_dir,"efetch_pmids_chunk_*")) + glob.glob(os.path.join(tmp_dir,"efetch_pmids_chunk_*.XML")) + glob.glob(os.path.join(tmp_dir,"efetch_pmids_chunk_*.*"))))
+xml_files = [x for x in xml_files if x.endswith(".xml") or x.endswith(".XML")]
+print(f"Loaded PMIDs: {len(pmids)}; XML files: {len(xml_files)}")
+
+for xf in xml_files:
+    for pmid, title, abstract in parse_pubmed_file(xf):
+        articles[pmid] = {"title": title, "abstract": abstract}
+
+with open(os.path.join(tmp_dir,"parsed_articles.json"),"w") as f:
+    json.dump(articles, f, indent=2)
+
+# Screening (local constants)
+OTHER_DRUG_MARKERS = [
+"warfarin","theophylline","tizanidine","cyclosporine","clozapine","duloxetine","methotrexate",
+"metronidazole","rifampin","rifampicin","probenecid","phenytoin","digoxin",
+"clopidogrel","apixaban","rivaroxaban","dabigatran","amiodarone","fluconazole",
+"azithromycin","clarithromycin","linezolid","vancomycin","gentamicin",
+"sucralfate","antacid","iron","zinc","calcium","magnesium"
+]
+EXCLUDE_TERMS = [
+"food-drug","food drug","diet","meal","nutrition","grapefruit",
+"pharmacogen","pharmacogenetic","genetic","genotype","polymorphism",
+" gene"," genes","cyp2","cyp3","cyp1a2"
+]
+NON_DDI_FOCUS_TERMS = [
+"antimicrobial susceptibility","minimum inhibitory concentration"," mic",
+"biofilm","resistance","resistant","synergistic activity","checkerboard","time-kill"
+]
+
+def is_accepted(title, abstract):
+    text = (title + " " + abstract).lower()
+    if "ciprofloxacin" not in text:
+        return False
+    if any(t in text for t in EXCLUDE_TERMS):
+        return False
+    ddi_signal = any(k in text for k in [
+        "drug-drug","drug drug","interaction","concomitant","coadministr","co-admin",
+        "pharmacokinetic","auc","cmax","clearance","inhibit","induc","exposure","qt"
+    ])
+    if not ddi_signal:
+        return False
+    if any(t in text for t in NON_DDI_FOCUS_TERMS) and not any(k in text for k in [
+        "pharmacokinetic","auc","cmax","clearance","toxicity","bleeding",
+        "serum concentration","plasma concentration"
+    ]):
+        return False
+    other = any(m in text for m in OTHER_DRUG_MARKERS)
+    if not other and re.search(r"ciprofloxacin (and|with) [a-z0-9\-]{3,}", text):
+        other = True
+    return other
+
+results = []
+for p in pmids:
+    meta = articles.get(p, {"title":"","abstract":""})
+    results.append({"PMID": str(p), "Accepted": bool(is_accepted(meta["title"], meta["abstract"]))})
+
+n_acc = sum(1 for x in results if x["Accepted"])
+
+with open(os.path.join(tmp_dir,"screening_results.json"),"w") as f:
+    json.dump(results, f, indent=2)
+
+print(f"\nSTEP 4: Accepted={n_acc}/{len(results)}")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    print(f"{i}. [{'✓' if i<=4 else ' '}] {s}")
+
+with open(out_path,"w") as f:
+    json.dump(results, f, indent=2)
+
+summary = {
+    "retrieved_pmids": len(pmids),
+    "parsed_articles": len(articles),
+    "accepted": n_acc,
+    "timestamp": datetime.utcnow().isoformat()+"Z"
+}
+with open(os.path.join(tmp_dir,"run_summary.json"),"w") as f:
+    json.dump(summary, f, indent=2)
+
+print(f"\nSTEP 5: wrote {out_path}")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    print(f"{i}. [✓] {s}")
+
+print("\nRun summary:", summary)
+</execute>
+<observation>NameError("name 'EXCLUDE_TERMS' is not defined")</observation>
+<execute>
+#!/usr/bin/env python3
+# Only do screening + output writing, with constants defined INSIDE the function to avoid any NameError.
+
+import os, json, re
+from datetime import datetime
+
+tmp_dir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/ddinter_retrieval/"
+out_path = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/ddinter_retrieval.json"
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+plan = [
+"Set up required directories and define the PubMed query with inclusion/exclusion filters and date limits.",
+"Run the initial PubMed search (ESearch) and collect all PMIDs.",
+"Fetch article metadata/abstracts in batches (EFetch) and parse titles/abstracts.",
+"Screen abstracts for Ciprofloxacin DDIs (exclude food/gene topics; include clinical/pharmacological DDI with another drug) and assign Accepted flags.",
+"Write the full PMID list with Accepted flags to the required JSON path."
+]
+print("PLAN (checklist):")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i<=3 else " "
+    print(f"{i}. [{chk}] {s}")
+
+pmids_path = os.path.join(tmp_dir,"pmids.txt")
+articles_path = os.path.join(tmp_dir,"parsed_articles.json")
+if not os.path.exists(pmids_path) or not os.path.exists(articles_path):
+    raise SystemExit("Missing pmids.txt or parsed_articles.json in tmp_dir; rerun retrieval/parsing step first.")
+
+pmids = open(pmids_path).read().strip().splitlines()
+articles = json.loads(open(articles_path).read())
+
+def is_accepted(title, abstract):
+    OTHER_DRUG_MARKERS = [
+        "warfarin","theophylline","tizanidine","cyclosporine","clozapine","duloxetine","methotrexate",
+        "metronidazole","rifampin","rifampicin","probenecid","phenytoin","digoxin",
+        "clopidogrel","apixaban","rivaroxaban","dabigatran","amiodarone","fluconazole",
+        "azithromycin","clarithromycin","linezolid","vancomycin","gentamicin",
+        "sucralfate","antacid","iron","zinc","calcium","magnesium"
+    ]
+    EXCLUDE_TERMS = [
+        "food-drug","food drug","diet","meal","nutrition","grapefruit",
+        "pharmacogen","pharmacogenetic","genetic","genotype","polymorphism",
+        " gene"," genes","cyp2","cyp3","cyp1a2"
+    ]
+    NON_DDI_FOCUS_TERMS = [
+        "antimicrobial susceptibility","minimum inhibitory concentration"," mic",
+        "biofilm","resistance","resistant","synergistic activity","checkerboard","time-kill"
+    ]
+
+    text = (title + " " + abstract).lower()
+    if "ciprofloxacin" not in text:
+        return False
+    if any(t in text for t in EXCLUDE_TERMS):
+        return False
+    ddi_signal = any(k in text for k in [
+        "drug-drug","drug drug","interaction","concomitant","coadministr","co-admin",
+        "pharmacokinetic","auc","cmax","clearance","inhibit","induc","exposure","qt"
+    ])
+    if not ddi_signal:
+        return False
+    if any(t in text for t in NON_DDI_FOCUS_TERMS) and not any(k in text for k in [
+        "pharmacokinetic","auc","cmax","clearance","toxicity","bleeding",
+        "serum concentration","plasma concentration"
+    ]):
+        return False
+    other = any(m in text for m in OTHER_DRUG_MARKERS)
+    if not other and re.search(r"ciprofloxacin (and|with) [a-z0-9\-]{3,}", text):
+        other = True
+    return other
+
+results = []
+for p in pmids:
+    meta = articles.get(p, {"title":"","abstract":""})
+    results.append({"PMID": str(p), "Accepted": bool(is_accepted(meta.get("title",""), meta.get("abstract","")))})
+
+n_acc = sum(1 for x in results if x["Accepted"])
+with open(os.path.join(tmp_dir,"screening_results.json"),"w") as f:
+    json.dump(results, f, indent=2)
+
+print(f"\nSTEP 4 complete: Accepted={n_acc}/{len(results)}")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i<=4 else " "
+    print(f"{i}. [{chk}] {s}")
+
+with open(out_path,"w") as f:
+    json.dump(results, f, indent=2)
+
+summary = {
+    "retrieved_pmids": len(pmids),
+    "parsed_articles": len(articles),
+    "accepted": n_acc,
+    "timestamp": datetime.utcnow().isoformat()+"Z"
+}
+with open(os.path.join(tmp_dir,"run_summary.json"),"w") as f:
+    json.dump(summary, f, indent=2)
+
+print(f"\nSTEP 5 complete: wrote {out_path}")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    print(f"{i}. [✓] {s}")
+
+print("\nRun summary:", summary)
+</execute>
+<observation>NameError("name 're' is not defined")</observation>
+<execute>
+#!/usr/bin/env python3
+import os, json, re
+from datetime import datetime
+
+tmp_dir = "/root/biodatalab/log/biomni_v20260209_tmp/OpenAI/Azure-GPT-5.2/ddinter_retrieval/"
+out_path = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/ddinter_retrieval.json"
+os.makedirs(tmp_dir, exist_ok=True)
+os.makedirs(os.path.dirname(out_path), exist_ok=True)
+
+plan = [
+"Set up required directories and define the PubMed query with inclusion/exclusion filters and date limits.",
+"Run the initial PubMed search (ESearch) and collect all PMIDs.",
+"Fetch article metadata/abstracts in batches (EFetch) and parse titles/abstracts.",
+"Screen abstracts for Ciprofloxacin DDIs (exclude food/gene topics; include clinical/pharmacological DDI with another drug) and assign Accepted flags.",
+"Write the full PMID list with Accepted flags to the required JSON path."
+]
+print("PLAN (checklist):")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i<=3 else " "
+    print(f"{i}. [{chk}] {s}")
+
+pmids_path = os.path.join(tmp_dir,"pmids.txt")
+articles_path = os.path.join(tmp_dir,"parsed_articles.json")
+if not os.path.exists(pmids_path) or not os.path.exists(articles_path):
+    raise SystemExit("Missing pmids.txt or parsed_articles.json in tmp_dir; rerun retrieval/parsing step first.")
+
+pmids = open(pmids_path).read().strip().splitlines()
+articles = json.loads(open(articles_path).read())
+
+def is_accepted(title, abstract):
+    import re as _re
+    OTHER_DRUG_MARKERS = [
+        "warfarin","theophylline","tizanidine","cyclosporine","clozapine","duloxetine","methotrexate",
+        "metronidazole","rifampin","rifampicin","probenecid","phenytoin","digoxin",
+        "clopidogrel","apixaban","rivaroxaban","dabigatran","amiodarone","fluconazole",
+        "azithromycin","clarithromycin","linezolid","vancomycin","gentamicin",
+        "sucralfate","antacid","iron","zinc","calcium","magnesium"
+    ]
+    EXCLUDE_TERMS = [
+        "food-drug","food drug","diet","meal","nutrition","grapefruit",
+        "pharmacogen","pharmacogenetic","genetic","genotype","polymorphism",
+        " gene"," genes","cyp2","cyp3","cyp1a2"
+    ]
+    NON_DDI_FOCUS_TERMS = [
+        "antimicrobial susceptibility","minimum inhibitory concentration"," mic",
+        "biofilm","resistance","resistant","synergistic activity","checkerboard","time-kill"
+    ]
+    text = (title + " " + abstract).lower()
+    if "ciprofloxacin" not in text:
+        return False
+    if any(t in text for t in EXCLUDE_TERMS):
+        return False
+    ddi_signal = any(k in text for k in [
+        "drug-drug","drug drug","interaction","concomitant","coadministr","co-admin",
+        "pharmacokinetic","auc","cmax","clearance","inhibit","induc","exposure","qt"
+    ])
+    if not ddi_signal:
+        return False
+    if any(t in text for t in NON_DDI_FOCUS_TERMS) and not any(k in text for k in [
+        "pharmacokinetic","auc","cmax","clearance","toxicity","bleeding",
+        "serum concentration","plasma concentration"
+    ]):
+        return False
+    other = any(m in text for m in OTHER_DRUG_MARKERS)
+    if not other and _re.search(r"ciprofloxacin (and|with) [a-z0-9\-]{3,}", text):
+        other = True
+    return other
+
+results = []
+for p in pmids:
+    meta = articles.get(p, {"title":"","abstract":""})
+    results.append({"PMID": str(p), "Accepted": bool(is_accepted(meta.get("title",""), meta.get("abstract","")))})
+
+n_acc = sum(1 for x in results if x["Accepted"])
+with open(os.path.join(tmp_dir,"screening_results.json"),"w") as f:
+    json.dump(results, f, indent=2)
+
+print(f"\nSTEP 4 complete: Accepted={n_acc}/{len(results)}")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    chk = "✓" if i<=4 else " "
+    print(f"{i}. [{chk}] {s}")
+
+with open(out_path,"w") as f:
+    json.dump(results, f, indent=2)
+
+summary = {
+    "retrieved_pmids": len(pmids),
+    "parsed_articles": len(articles),
+    "accepted": n_acc,
+    "timestamp": datetime.utcnow().isoformat()+"Z"
+}
+with open(os.path.join(tmp_dir,"run_summary.json"),"w") as f:
+    json.dump(summary, f, indent=2)
+
+print(f"\nSTEP 5 complete: wrote {out_path}")
+print("\nUPDATED PLAN:")
+for i,s in enumerate(plan,1):
+    print(f"{i}. [✓] {s}")
+
+print("\nRun summary:", summary)
+</execute>
+<observation>PLAN (checklist):
+1. [✓] Set up required directories and define the PubMed query with inclusion/exclusion filters and date limits.
+2. [✓] Run the initial PubMed search (ESearch) and collect all PMIDs.
+3. [✓] Fetch article metadata/abstracts in batches (EFetch) and parse titles/abstracts.
+4. [ ] Screen abstracts for Ciprofloxacin DDIs (exclude food/gene topics; include clinical/pharmacological DDI with another drug) and assign Accepted flags.
+5. [ ] Write the full PMID list with Accepted flags to the required JSON path.
+
+STEP 4 complete: Accepted=2/11
+
+UPDATED PLAN:
+1. [✓] Set up required directories and define the PubMed query with inclusion/exclusion filters and date limits.
+2. [✓] Run the initial PubMed search (ESearch) and collect all PMIDs.
+3. [✓] Fetch article metadata/abstracts in batches (EFetch) and parse titles/abstracts.
+4. [✓] Screen abstracts for Ciprofloxacin DDIs (exclude food/gene topics; include clinical/pharmacological DDI with another drug) and assign Accepted flags.
+5. [ ] Write the full PMID list with Accepted flags to the required JSON path.
+
+STEP 5 complete: wrote /root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/ddinter_retrieval.json
+
+UPDATED PLAN:
+1. [✓] Set up required directories and define the PubMed query with inclusion/exclusion filters and date limits.
+2. [✓] Run the initial PubMed search (ESearch) and collect all PMIDs.
+3. [✓] Fetch article metadata/abstracts in batches (EFetch) and parse titles/abstracts.
+4. [✓] Screen abstracts for Ciprofloxacin DDIs (exclude food/gene topics; include clinical/pharmacological DDI with another drug) and assign Accepted flags.
+5. [✓] Write the full PMID list with Accepted flags to the required JSON path.
+
+Run summary: {'retrieved_pmids': 11, 'parsed_articles': 11, 'accepted': 2, 'timestamp': '2026-02-08T21:35:03.962745Z'}
+</observation>
+<execute>
+#!/usr/bin/env python3
+import json, os
+
+out_path = "/root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/ddinter_retrieval.json"
+
+# Print final JSON (as required output format: JSON list of objects with PMID and Accepted)
+with open(out_path, "r") as f:
+    results = json.load(f)
+
+print("Final output JSON loaded from:", out_path)
+print(json.dumps(results, indent=2))
+print("\nCount:", len(results), "Accepted:", sum(1 for x in results if x["Accepted"]))
+</execute>
+<observation>Final output JSON loaded from: /root/biodatalab/log/biomni_v20260209_pred_results/OpenAI/Azure-GPT-5.2/ddinter_retrieval.json
+[
+  {
+    "PMID": "34268273",
+    "Accepted": true
+  },
+  {
+    "PMID": "33588861",
+    "Accepted": true
+  },
+  {
+    "PMID": "33583923",
+    "Accepted": false
+  },
+  {
+    "PMID": "33490338",
+    "Accepted": false
+  },
+  {
+    "PMID": "33406110",
+    "Accepted": false
+  },
+  {
+    "PMID": "33404754",
+    "Accepted": false
+  },
+  {
+    "PMID": "33346078",
+    "Accepted": false
+  },
+  {
+    "PMID": "32990533",
+    "Accepted": false
+  },
+  {
+    "PMID": "32810621",
+    "Accepted": false
+  },
+  {
+    "PMID": "32750918",
+    "Accepted": false
+  },
+  {
+    "PMID": "32482592",
+    "Accepted": false
+  }
+]
+
+Count: 11 Accepted: 2
+</observation>
+<solution>
+[
+  {
+    "PMID": "34268273",
+    "Accepted": true
+  },
+  {
+    "PMID": "33588861",
+    "Accepted": true
+  },
+  {
+    "PMID": "33583923",
+    "Accepted": false
+  },
+  {
+    "PMID": "33490338",
+    "Accepted": false
+  },
+  {
+    "PMID": "33406110",
+    "Accepted": false
+  },
+  {
+    "PMID": "33404754",
+    "Accepted": false
+  },
+  {
+    "PMID": "33346078",
+    "Accepted": false
+  },
+  {
+    "PMID": "32990533",
+    "Accepted": false
+  },
+  {
+    "PMID": "32810621",
+    "Accepted": false
+  },
+  {
+    "PMID": "32750918",
+    "Accepted": false
+  },
+  {
+    "PMID": "32482592",
+    "Accepted": false
+  }
+]
+</solution>
