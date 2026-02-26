@@ -19,15 +19,13 @@ BASE_URL = ""
 ```
 
 ### Basic Usage of BioDataLab
-
-```
-# evaluate on one task
+Evaluate on one task:
+```bash
 conda activate biomni_e1
 python3 run_evaluate_case_biomni.py --task_yaml=benchmark/tasks/fusionneoantigen_annotate_2.yaml
 ```
-
-```
-# run bash scirpt on all tasks
+Run bash scirpt on all tasks
+```bash
 conda activate biomni_e1
 bash evaluate_bash_scripts\run_evaluate_batch_biomni_gemini-3-flash-preview.sh
 ```
