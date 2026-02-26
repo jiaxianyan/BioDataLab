@@ -18,7 +18,7 @@ Tasks are classfied by their primary intention into 4 types: open-world data ret
 ### Benchmark Access
 A overall summary of all 100 tasks are listed in [BioDataLab](BioDataLab.csv).
 
-First, download the necessary input from [huggingface]() and unzip it as `./benchmark/dataset`.
+First, download the necessary input from [huggingface](https://huggingface.co/datasets/jiaxianustc/biodatalab/blob/main/dataset.tar.gz) and unzip it as `./benchmark/dataset`.
 
 Then, the whole benchmark directory structure should look like this:
 
