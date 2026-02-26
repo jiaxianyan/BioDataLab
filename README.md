@@ -7,9 +7,12 @@ This is the offical implement of "BioDataLab: Benchmarking LLM Agents on Real-Wo
 ![logo](visualization/intro_demo.jpg)
 
 ### Benchmark Overview
-We introduce BioDataLab, a rigorous benchmark comprising 100 tasks meticulously derived from 57 high-impact database publications, covering 9 biological domains and 7 data modalities. BioDataLab evaluates the capability of autonomous agents to transform raw, heterogeneous biological resources into structured, analysis-ready databases.
+We introduce BioDataLab, a rigorous benchmark comprising 100 tasks meticulously derived from 57 high-impact database publications, covering 9 biological domains and 7 data modalities. 
+
+BioDataLab evaluates the capability of autonomous agents to transform raw, heterogeneous biological resources into structured, analysis-ready databases.
+
 Tasks are classfied by their primary intention into 4 types: open-world data retrieval, structured data extraction, functional feature annotation, and data refinement and integration. 
-The following are 4 reprensentative examples of each type:
+
 ![logo](visualization/overview.jpg)
 
 ### Benchmark Access
@@ -54,7 +57,7 @@ BASE_URL = ""
 
 ### Basic Usage of BioDataLab
 
-If you want to evaluate on one task, for example [fusionneoantigen_annotate_2](benchmark\tasks\fusionneoantigen_annotate_2.yaml), you can run:
+If you want to evaluate on one task, for example [fusionneoantigen_annotate_2](https://github.com/jiaxianyan/BioDataLab/blob/main/benchmark/tasks/fusionneoantigen_annotate_2.yaml), you can run:
 ```bash
 conda activate biomni_e1
 python3 run_evaluate_case_biomni.py --task_yaml=benchmark/tasks/fusionneoantigen_annotate_2.yaml
@@ -67,7 +70,7 @@ bash evaluate_bash_scripts\run_evaluate_batch_biomni_gemini-3-flash-preview.sh
 ```
 
 ## Evaluation Results
-![logo](visualization/result.jpg)
+<img src="visualization/result.jpg" width="80%">
 
 ## Contributors
 **Student Contributors**: Jiaxian Yan, Xi Fang, Chenmin Wu, Jintao Zhu, Yuhang Yang, [Zaixi Zhang](https://zaixizhang.github.io/), Meijing Fang, and Chenxi Du
@@ -85,7 +88,7 @@ This project is licensed under the terms of the MIT license. See [LICENSE](LICEN
 ## Citation
 If you find our work helpful, please kindly cite:
 ```
-@article {Yan2025.04.22.648951,
+@article {Yan2026biodatalab,
 	author = {Yan, Jiaxian and Fang, Xi and Zhu, Jintao and Wu, Chenmin and Yang, Yuhang and Fang, Meijing and Du, Chenxi and Zhang, Kai and Zhang, Zaixi and Liu, Qi},
 	title = {Benchmarking LLM Agents on Real-World Biological Database Curation for Data-Driven Scientific Discovery},
 	year = {2026},
