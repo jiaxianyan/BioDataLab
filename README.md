@@ -5,6 +5,9 @@ This is the offical implement of "BioDataLab: Benchmarking LLM Agents on Real-Wo
 
 ![logo](visualization/intro_demo.jpg)
 
+## Benchmark Access
+
+
 ## Quick Start
 
 ### Install the envrironment
@@ -31,19 +34,28 @@ bash evaluate_bash_scripts\run_evaluate_batch_biomni_gemini-3-flash-preview.sh
 ```
 
 ## Evaluation Results
+![logo](visualization/result.jpg)
 
-| Model | Open-World SR | Open-World VR | Structured Info SR | Structured Info VR | Functional Feature SR | Functional Feature VR | Data Refinement SR | Data Refinement VR | Overall SR | Overall VR | Cost |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Proprietary Models** | | | | | | | | | | | |
-| GPT-5.2 | 4.5 | 86.4 | 0.0 | 87.5 | 34.5 | 82.8 | 28.0 | 84.0 | 18.0 | 85.0 | 0.22 |
-| GPT-5.1 | 0.0 | 68.2 | 0.0 | 41.7 | 10.3 | 44.8 | 12.0 | 32.0 | 6.0 | 46.0 | 0.17 |
-| Gemini-3.0-Pro | 18.2 | 95.5 | 41.7 | 100.0 | 51.7 | 96.6 | 44.0 | 100.0 | 40.0 | 98.0 | 0.19 |
-| Gemini-3.0-Flash | 18.2 | 72.7 | 16.7 | 75.0 | 44.8 | 89.6 | 44.0 | 80.0 | 32.0 | 80.0 | 0.04 |
-| Claude-4.5-Sonnet | 18.2 | 95.5 | 33.3 | 91.7 | 41.4 | 96.6 | 40.0 | 96.0 | 34.0 | 95.0 | 1.82 |
-| Claude-4.5-Haiku | 4.5 | 100.0 | 33.3 | 100.0 | 37.9 | 100.0 | 44.0 | 100.0 | 31.0 | 100.0 | 0.69 |
-| Seed-1.8 | 13.6 | 100.0 | 20.8 | 100.0 | 31.0 | 96.6 | 28.0 | 96.0 | 24.0 | 98.0 | 0.02 |
-| **Open Source Models** | | | | | | | | | | | |
-| Kimi-K2.5 | 13.6 | 40.9 | 25.0 | 20.8 | 48.3 | 55.2 | 48.0 | 44.0 | 35.0 | 41.0 | 0.18 |
-| DeepSeek-V3.2 | 4.5 | 100.0 | 16.7 | 100.0 | 51.7 | 100.0 | 44.0 | 100.0 | 31.0 | 100.0 | 0.43 |
-| Qwen-3-Max | 9.1 | 95.5 | 4.2 | 100.0 | 34.5 | 93.1 | 24.0 | 96.0 | 19.0 | 96.0 | 0.08 |
-| GLM-4.7 | 13.6 | 100.0 | 25.0 | 100.0 | 44.8 | 100.0 | 44.0 | 100.0 | 33.0 | 100.0 | 0.23 |
+## Contributors
+**Student Contributors**: Jiaxian Yan*, Xi Fang, Chenmin Wu, Jintao Zhu, Yuhang Yang, [Zaixi Zhang](https://zaixizhang.github.io/), Meijing Fang, and Chenxi Du
+
+**Supervisors**: [Qi Liu](http://staff.ustc.edu.cn/~qiliuql/), [Kai Zhang](http://home.ustc.edu.cn/~sa517494/)
+
+**Affiliation**: State Key Laboratory of Cognitive Intelligence, USTC; Peking University; Princeton University; Zhejiang University, Tsinghua University
+
+## Contact
+We welcome all forms of feedback! Please raise an issue for bugs, questions, or suggestions. This helps our team address common problems efficiently and builds a more productive community. If you encounter any issues, please reach out to jiaxianyan@mail.ustc.edu.cn.
+
+## License
+This project is licensed under the terms of the MIT license.
+
+## Citation
+If you find our work helpful, please kindly cite:
+```
+@article {Yan2025.04.22.648951,
+	author = {Yan, Jiaxian and Fang, Xi and Zhu, Jintao and Wu, Chenmin and Yang, Yuhang and Fang, Meijing and Du, Chenxi and Zhang, Kai and Zhang, Zaixi and Liu, Qi},
+	title = {Benchmarking LLM Agents on Real-World Biological Database Curation for Data-Driven Scientific Discovery},
+	year = {2026},
+	journal = {underview}
+}
+```
