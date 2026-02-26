@@ -13,6 +13,10 @@ conda create -f environment.yml
 ```
 ### LLMs API 
 Setting the LLM API_KEY and BASE_URL in `assistant\llm.py`.
+```python
+API_KEY = ""
+BASE_URL = ""
+```
 
 ### Basic Usage of BioDataLab
 
