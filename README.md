@@ -1,4 +1,4 @@
-![logo](visualization/logo.jpg)
+<!-- ![logo](visualization/logo.jpg) -->
 # BioDataLab
 This is the offical implement of "BioDataLab: Benchmarking LLM Agents on Real-World Biological Database Curation for Data-Driven Scientific Discovery".
 
