@@ -19,7 +19,6 @@ First, download the necessary input from [huggingface]() and unzip it as `./benc
 
 Then, the whole benchmark directory structure should look like this:
 
-Each task 
 ```
 |-- BioDataLab/
 |---- BioDataLab.csv
